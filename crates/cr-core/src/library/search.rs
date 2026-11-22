@@ -365,11 +365,7 @@ impl Parser<'_> {
                 "empty" | "blank" => format!("{single} IS NULL"),
                 _ => FALSE.to_string(),
             },
-            "datetime" => match value {
-                "true" => format!("{single} IS NOT NULL"),
-                "false" => format!("{single} IS NULL"),
-                _ => self.date(&single, value),
-            },
+            "datetime" => self.date(&single, value),
             "rating" => {
                 let column = format!(
                     "COALESCE((SELECT x.value FROM books_custom_column_{id}_link l \
@@ -432,6 +428,13 @@ impl Parser<'_> {
     }
 
     fn date(&mut self, column: &str, value: &str) -> String {
+        // calibre stores an unset date as the year 101.
+        let set = format!("COALESCE(substr({column}, 1, 4), '0101') > '0101'");
+        match value {
+            "true" => return set,
+            "false" => return format!("NOT {set}"),
+            _ => {}
+        }
         let (operator, rest) = split_operator(value);
         let Some((start, end)) = date_range(rest, Utc::now().date_naive()) else {
             return FALSE.to_string();
