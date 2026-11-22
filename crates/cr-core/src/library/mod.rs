@@ -721,6 +721,20 @@ impl Library {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM books_pages_link WHERE book=?1", [id])?;
         tx.execute("DELETE FROM book_storage WHERE book=?1", [id])?;
+        // Custom column values have no delete trigger.
+        let custom: Vec<(i64, bool)> = {
+            let mut stmt = tx.prepare("SELECT id, normalized FROM custom_columns")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (column, normalized) in custom {
+            let table = if normalized {
+                format!("books_custom_column_{column}_link")
+            } else {
+                format!("custom_column_{column}")
+            };
+            tx.execute(&format!("DELETE FROM {table} WHERE book=?1"), [id])?;
+        }
         let changed = tx.execute("DELETE FROM books WHERE id=?1", [id])?;
         if changed == 0 {
             return Err(Error::BookNotFound(id));
