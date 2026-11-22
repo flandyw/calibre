@@ -310,7 +310,9 @@ impl Library {
         if meta.authors.len() > 1 && meta.author_sort == first {
             meta.author_sort = None;
         }
-        let files: Vec<(String, PathBuf)> = format_files(folder)
+        let stem =
+            text::format_file_stem(&meta.title, meta.authors.first().map_or("", String::as_str));
+        let mut files: Vec<(String, PathBuf)> = format_files(folder)
             .into_iter()
             .filter(|(format, file)| {
                 let base = format.strip_prefix("ORIGINAL_").unwrap_or(format);
@@ -320,6 +322,15 @@ impl Library {
                         .is_some_and(|name| name.to_string_lossy().starts_with('.'))
             })
             .collect();
+        // One file per format: the one under the library's own name when
+        // there are several, so an extra copy never replaces it.
+        files.sort_by_key(|(format, file)| {
+            let canonical = file
+                .file_stem()
+                .is_some_and(|name| name.to_string_lossy() == stem);
+            (format.clone(), !canonical)
+        });
+        files.dedup_by(|next, kept| next.0 == kept.0);
         let restored = self.insert_book(
             meta,
             &files,
