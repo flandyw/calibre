@@ -11,7 +11,7 @@ use gpui_kit::*;
 
 use super::widgets::{section_label, tool_button};
 use crate::actions::*;
-use crate::app::{default_library_path, CalibreApp, Screen, Tone};
+use crate::app::{default_library_path, CalibreApp, RunningJob, Screen, Tone};
 use crate::settings::{ThemePreference, ViewMode};
 
 pub fn title_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
@@ -390,6 +390,23 @@ fn crop_bar() -> AnyElement {
         .into_any_element()
 }
 
+fn job_text(job: &RunningJob) -> String {
+    let progress = &job.progress;
+    if progress.total == 0 {
+        return format!("{}…", job.label);
+    }
+    let percent = (progress.fraction() * 100.0).round() as u32;
+    let mut text = format!(
+        "{} — {} of {} ({percent}%)",
+        job.label, progress.done, progress.total
+    );
+    if !progress.message.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&progress.message);
+    }
+    text
+}
+
 pub fn status_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     let theme = cx.theme().clone();
     let (icon, color) = match app.status_tone {
@@ -424,16 +441,27 @@ pub fn status_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement 
         .border_color(theme.status_bar_border)
         .text_xs()
         .text_color(theme.muted_foreground)
-        .when(!app.status.is_empty(), |this| {
+        .when(app.job.is_none() && !app.status.is_empty(), |this| {
             this.child(Icon::new(icon).xsmall().text_color(color))
         })
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(app.status.clone()),
-        )
+        .child(div().flex_1().min_w_0().truncate().child(match &app.job {
+            Some(job) => job_text(job),
+            None => app.status.clone(),
+        }))
+        .when_some(app.job.as_ref(), |this, job| {
+            this.child(
+                Button::new("cancel-job")
+                    .ghost()
+                    .xsmall()
+                    .label(if job.cancelling {
+                        "Stopping…"
+                    } else {
+                        "Cancel"
+                    })
+                    .disabled(job.cancelling)
+                    .on_click(cx.listener(|app, _, _, cx| app.cancel_job(cx))),
+            )
+        })
         .when(!devices.is_empty(), |this| {
             this.child(
                 h_flex()

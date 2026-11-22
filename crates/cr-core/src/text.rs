@@ -170,9 +170,10 @@ pub fn sanitize_component(input: &str) -> String {
     out
 }
 
-/// Book directory relative to the library root: `Author Sort/Title (id)`.
-pub fn book_dir_name(id: i64, title: &str, author_sort_value: &str) -> String {
-    let author = truncate_component(&ascii_filename(author_sort_value), 100);
+/// Book directory relative to the library root, as calibre names it:
+/// `First Author/Title (id)`.
+pub fn book_dir_name(id: i64, title: &str, first_author: &str) -> String {
+    let author = truncate_component(&ascii_filename(first_author.trim()), 100);
     let author = if author.is_empty() {
         "Unknown".to_string()
     } else {
@@ -485,8 +486,8 @@ mod tests {
     #[test]
     fn builds_calibre_paths() {
         assert_eq!(
-            book_dir_name(42, "The Hobbit", "Tolkien, J. R. R."),
-            "Tolkien, J. R. R/The Hobbit (42)"
+            book_dir_name(42, "The Hobbit", "J. R. R. Tolkien"),
+            "J. R. R. Tolkien/The Hobbit (42)"
         );
         assert_eq!(
             format_file_stem("The Hobbit", "J. R. R. Tolkien"),

@@ -45,7 +45,7 @@ benchmark is on the roadmap.
 - Add books, remove books (optionally deleting files), list, search, and show
   library statistics.
 - Export books with a path template.
-- Book directories use calibre's layout: `Author Sort/Title (id)/`.
+- Book directories use calibre's layout: `First Author/Title (id)/`.
 - Each book gets `metadata.opf` and, when available, `cover.jpg`.
 - Format files use calibre's `Title - Author.ext` naming.
 

@@ -180,8 +180,8 @@ fn full_library_lifecycle() {
     assert_eq!(summary.authors, vec!["J. R. R. Tolkien"]);
 
     let book_dir = library_path.join(&added.path);
-    // Path components are ASCII-sanitized, which strips the trailing period.
-    assert_eq!(added.path, "Tolkien, J. R. R/The Hobbit (1)");
+    // calibre names the directory after the first author.
+    assert_eq!(added.path, "J. R. R. Tolkien/The Hobbit (1)");
     assert!(book_dir.join("metadata.opf").is_file());
     assert!(book_dir.join("cover.jpg").is_file());
     assert!(book_dir

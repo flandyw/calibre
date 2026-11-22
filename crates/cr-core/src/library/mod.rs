@@ -1,5 +1,5 @@
 //! The library engine: a calibre-compatible `metadata.db` plus the on-disk
-//! book directory layout (`Author Sort/Title (id)/...`).
+//! book directory layout (`First Author/Title (id)/...`).
 //!
 //! The schema is calibre's own (version 28), including its triggers. Custom
 //! SQLite functions (`title_sort`, `uuid4`, ...) are registered on every
@@ -13,10 +13,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{Error, Result};
 use crate::formats::{self, BookText};
+use crate::jobs::{self, ItemResult, JobContext};
 use crate::metadata::{format_datetime, now, parse_datetime, BookSummary, Metadata};
 use crate::opf;
 use crate::text;
@@ -25,6 +26,31 @@ pub const DB_FILE: &str = "metadata.db";
 pub const METADATA_FILE: &str = "metadata.opf";
 pub const COVER_FILE: &str = "cover.jpg";
 const SCHEMA: &str = include_str!("schema.sql");
+/// The `PRAGMA user_version` this engine reads and writes.
+pub const SCHEMA_VERSION: i64 = 28;
+/// Tables every usable calibre database has.
+const REQUIRED_TABLES: [&str; 8] = [
+    "books",
+    "data",
+    "authors",
+    "books_authors_link",
+    "tags",
+    "series",
+    "identifiers",
+    "library_id",
+];
+/// Formats `read_book` can turn into text, best first.
+pub const READABLE_FORMATS: [&str; 9] = [
+    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "TXT",
+];
+
+/// Test hook: where an injected failure interrupts a mutation.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// After files were written or renamed, before the database commit.
+    BeforeCommit,
+}
 
 /// Result of adding a book.
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +139,8 @@ pub struct ListOptions {
 pub struct Library {
     root: PathBuf,
     conn: Connection,
+    read_only: Option<String>,
+    fault: Option<Fault>,
 }
 
 impl Library {
@@ -127,7 +155,7 @@ impl Library {
             )));
         }
         let conn = Connection::open(&db_path)?;
-        configure_connection(&conn)?;
+        configure_connection(&conn, true)?;
         conn.execute_batch(SCHEMA)?;
         conn.execute(
             "INSERT INTO library_id (uuid) VALUES (?1)",
@@ -140,27 +168,64 @@ impl Library {
         Ok(Self {
             root: root.to_path_buf(),
             conn,
+            read_only: None,
+            fault: None,
         })
     }
 
-    /// Open an existing library.
+    /// Open an existing library. A database whose schema this engine does not
+    /// write (older or newer than [`SCHEMA_VERSION`]) opens read-only; see
+    /// [`Library::read_only_reason`].
     pub fn open(root: &Path) -> Result<Self> {
         let db_path = root.join(DB_FILE);
         if !db_path.is_file() {
             return Err(Error::InvalidLibrary(root.display().to_string()));
         }
-        let conn = Connection::open(&db_path)?;
-        configure_connection(&conn)?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let probe = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let version: i64 = probe
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|_| not_calibre(&db_path))?;
         if version == 0 {
-            return Err(Error::InvalidLibrary(format!(
-                "{} is not a calibre database",
-                db_path.display()
-            )));
+            return Err(not_calibre(&db_path));
         }
+        for table in REQUIRED_TABLES {
+            let found: Option<i64> = probe
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if found.is_none() {
+                return Err(Error::InvalidLibrary(format!(
+                    "{} is missing the `{table}` table; restore it from a backup or rebuild it in calibre",
+                    db_path.display()
+                )));
+            }
+        }
+        let read_only = match version.cmp(&SCHEMA_VERSION) {
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => Some(format!(
+                "this library uses database schema {version}, newer than the supported {SCHEMA_VERSION}; \
+                 it is open read-only. Update calibre-rust to change it."
+            )),
+            std::cmp::Ordering::Less => Some(format!(
+                "this library uses database schema {version}, older than the supported {SCHEMA_VERSION}; \
+                 it is open read-only. Open it once in calibre to upgrade it."
+            )),
+        };
+        let conn = if read_only.is_some() {
+            probe
+        } else {
+            drop(probe);
+            Connection::open(&db_path)?
+        };
+        configure_connection(&conn, read_only.is_none())?;
         Ok(Self {
             root: root.to_path_buf(),
             conn,
+            read_only,
+            fault: None,
         })
     }
 
@@ -174,6 +239,31 @@ impl Library {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Why this library cannot be changed, if it was opened read-only.
+    pub fn read_only_reason(&self) -> Option<&str> {
+        self.read_only.as_deref()
+    }
+
+    fn writable(&self) -> Result<()> {
+        match &self.read_only {
+            Some(reason) => Err(Error::ReadOnly(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn inject_fault(&mut self, fault: Option<Fault>) {
+        self.fault = fault;
+    }
+
+    fn fail_point(&mut self, point: Fault) -> Result<()> {
+        if self.fault == Some(point) {
+            self.fault = None;
+            return Err(Error::Other(format!("injected fault: {point:?}")));
+        }
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -193,6 +283,8 @@ impl Library {
     /// Add a file to the library, copying it into a calibre book directory and
     /// writing `metadata.opf` / `cover.jpg`.
     pub fn add_book(&mut self, source: &Path) -> Result<AddResult> {
+        self.writable()?;
+        let fault = self.fault.take();
         let imported = formats::import(source)?;
         let format = imported.format.clone();
         let mut meta = imported.metadata;
@@ -217,18 +309,19 @@ impl Library {
             ],
         )?;
         let id = tx.last_insert_rowid();
-        let relative = text::book_dir_name(id, &meta.title, &author_sort);
+        let relative = text::book_dir_name(id, &meta.title, meta.first_author());
         let directory = safe_join(&self.root, &relative)?;
-        let _cleanup = DirGuard::new(directory.clone());
+        let mut cleanup = DirGuard::new(directory.clone());
         fs::create_dir_all(&directory)?;
 
         let stem = text::format_file_stem(&meta.title, meta.first_author());
         let extension = format.to_ascii_lowercase();
         let destination = directory.join(format!("{stem}.{extension}"));
         if source != destination {
-            fs::copy(source, &destination)?;
+            cleanup.track(&destination);
+            copy_atomic(source, &destination)?;
         }
-        let size = fs::metadata(&destination).map(|m| m.len()).unwrap_or(0);
+        let size = fs::metadata(&destination)?.len();
         tx.execute(
             "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
             params![id, format, size as i64, stem],
@@ -239,21 +332,29 @@ impl Library {
         meta.uuid = uuid;
 
         let has_cover = if let Some(cover) = &meta.cover {
-            fs::write(directory.join(COVER_FILE), cover)?;
+            cleanup.track(&directory.join(COVER_FILE));
+            write_atomic(&directory.join(COVER_FILE), cover)?;
             true
         } else {
             false
         };
 
         replace_links(&tx, id, &meta)?;
-        fs::write(directory.join(METADATA_FILE), opf::metadata_to_opf(&meta))?;
+        cleanup.track(&directory.join(METADATA_FILE));
+        write_atomic(
+            &directory.join(METADATA_FILE),
+            opf::metadata_to_opf(&meta).as_bytes(),
+        )?;
         tx.execute(
             "UPDATE books SET path=?1, has_cover=?2 WHERE id=?3",
             params![relative, has_cover as i64, id],
         )?;
+        if fault == Some(Fault::BeforeCommit) {
+            return Err(Error::Other("injected fault: BeforeCommit".into()));
+        }
         tx.commit()?;
         // The book is committed; keep the directory.
-        _cleanup.disarm();
+        cleanup.disarm();
 
         Ok(AddResult {
             id,
@@ -262,6 +363,21 @@ impl Library {
             formats: vec![format],
             path: relative,
         })
+    }
+
+    /// Add many files as one job. A file that fails is reported in its own
+    /// result and does not stop the rest; cancellation keeps what was added.
+    pub fn add_books(
+        &mut self,
+        sources: &[PathBuf],
+        context: &JobContext,
+    ) -> Vec<ItemResult<PathBuf, AddResult>> {
+        jobs::for_each(
+            context,
+            sources.iter().cloned(),
+            |path| format!("Adding {}", file_label(path)),
+            |path| self.add_book(path),
+        )
     }
 
     /// Full metadata for one book.
@@ -390,6 +506,16 @@ impl Library {
     /// Update metadata, renaming the book directory and format files if the
     /// author/title changed, then rewriting `metadata.opf`.
     pub fn update_book(&mut self, id: i64, patch: &BookUpdate) -> Result<()> {
+        self.writable()?;
+        let mut undo = FsUndo::default();
+        let result = self.update_book_inner(id, patch, &mut undo);
+        if result.is_err() {
+            undo.roll_back();
+        }
+        result
+    }
+
+    fn update_book_inner(&mut self, id: i64, patch: &BookUpdate, undo: &mut FsUndo) -> Result<()> {
         let mut meta = self.get_metadata(id)?;
         let old_relative = self.book_path(id)?;
         let authors_changed = patch.authors.is_some();
@@ -438,7 +564,7 @@ impl Library {
         let author_sort = meta.computed_author_sort();
         meta.author_sort = Some(author_sort.clone());
 
-        let new_relative = text::book_dir_name(id, &meta.title, &author_sort);
+        let new_relative = text::book_dir_name(id, &meta.title, meta.first_author());
         let old_directory = safe_join(&self.root, &old_relative)?;
         let new_directory = safe_join(&self.root, &new_relative)?;
         if old_relative != new_relative {
@@ -453,6 +579,8 @@ impl Library {
                     )));
                 }
                 fs::rename(&old_directory, &new_directory)?;
+                undo.renamed(&old_directory, &new_directory);
+                remove_empty_parent(&old_directory);
             } else {
                 fs::create_dir_all(&new_directory)?;
             }
@@ -469,7 +597,14 @@ impl Library {
                     .unwrap_or_else(|| new_directory.join(format!("{old_name}.{extension}")));
             let new_file = new_directory.join(format!("{new_stem}.{extension}"));
             if old_file != new_file && old_file.is_file() {
+                if new_file.exists() && !same_file_ignore_case(&old_file, &new_file) {
+                    return Err(Error::Other(format!(
+                        "cannot rename format file: {} already exists",
+                        new_file.display()
+                    )));
+                }
                 fs::rename(&old_file, &new_file)?;
+                undo.renamed(&old_file, &new_file);
             }
         }
 
@@ -478,6 +613,7 @@ impl Library {
             Some(None) => {
                 let cover_path = new_directory.join(COVER_FILE);
                 if cover_path.exists() {
+                    undo.snapshot(&cover_path)?;
                     fs::remove_file(cover_path)?;
                 }
                 meta.cover = None;
@@ -486,15 +622,18 @@ impl Library {
                 let normalized = formats::normalize_cover(bytes).ok_or_else(|| {
                     Error::InvalidMetadata("unsupported cover image format".into())
                 })?;
-                fs::write(new_directory.join(COVER_FILE), &normalized)?;
+                undo.snapshot(&new_directory.join(COVER_FILE))?;
+                write_atomic(&new_directory.join(COVER_FILE), &normalized)?;
                 meta.cover = Some(normalized);
             }
         }
         let has_cover = new_directory.join(COVER_FILE).is_file();
-        fs::write(
-            new_directory.join(METADATA_FILE),
-            opf::metadata_to_opf(&meta),
+        undo.snapshot(&new_directory.join(METADATA_FILE))?;
+        write_atomic(
+            &new_directory.join(METADATA_FILE),
+            opf::metadata_to_opf(&meta).as_bytes(),
         )?;
+        self.fail_point(Fault::BeforeCommit)?;
 
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -530,6 +669,7 @@ impl Library {
     }
 
     pub fn remove_book(&mut self, id: i64, delete_files: bool) -> Result<()> {
+        self.writable()?;
         let relative = self.book_path(id)?;
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM books_pages_link WHERE book=?1", [id])?;
@@ -542,7 +682,8 @@ impl Library {
         if delete_files && !relative.is_empty() {
             let directory = safe_join(&self.root, &relative)?;
             if directory.is_dir() {
-                fs::remove_dir_all(directory)?;
+                fs::remove_dir_all(&directory)?;
+                remove_empty_parent(&directory);
             }
         }
         Ok(())
@@ -596,16 +737,31 @@ impl Library {
     pub fn read_book(&self, id: i64, format: Option<&str>) -> Result<BookText> {
         let format = match format {
             Some(format) => format.to_ascii_uppercase(),
-            None => self
-                .formats(id)?
-                .into_iter()
-                .next()
-                .ok_or_else(|| Error::Other(format!("book {id} has no formats")))?,
+            None => self.preferred_readable_format(id)?,
         };
         let path = self
             .format_path(id, &format)?
             .ok_or_else(|| Error::Other(format!("book {id} has no {format} file")))?;
         formats::extract_text(&path, Some(&format))
+    }
+
+    /// The best format of a book that can be read as text.
+    pub fn preferred_readable_format(&self, id: i64) -> Result<String> {
+        let formats = self.formats(id)?;
+        if formats.is_empty() {
+            return Err(Error::Other(format!("book {id} has no formats")));
+        }
+        READABLE_FORMATS
+            .iter()
+            .find(|wanted| formats.iter().any(|f| f.eq_ignore_ascii_case(wanted)))
+            .map(|f| f.to_string())
+            .ok_or_else(|| {
+                Error::UnsupportedFormat(format!(
+                    "book {id} only has {}; reading needs one of {}",
+                    formats.join(", "),
+                    READABLE_FORMATS.join(", ")
+                ))
+            })
     }
 
     pub fn cover(&self, id: i64) -> Result<Option<Vec<u8>>> {
@@ -630,6 +786,7 @@ impl Library {
 
     /// Replace (or add) a format file from an edited copy.
     pub fn replace_format(&mut self, id: i64, format: &str, source: &Path) -> Result<()> {
+        self.writable()?;
         let format = format.to_ascii_uppercase();
         let relative = self.book_path(id)?;
         let directory = safe_join(&self.root, &relative)?;
@@ -644,13 +801,9 @@ impl Library {
         let destination = directory.join(format!("{stem}.{extension}"));
         let source = source.canonicalize()?;
         if destination.canonicalize().ok().as_ref() != Some(&source) {
-            let temporary = tempfile::NamedTempFile::new_in(&directory)?;
-            fs::copy(source, temporary.path())?;
-            temporary
-                .persist(&destination)
-                .map_err(|error| error.error)?;
+            copy_atomic(&source, &destination)?;
         }
-        let size = fs::metadata(&destination).map(|m| m.len()).unwrap_or(0) as i64;
+        let size = fs::metadata(&destination)?.len() as i64;
         self.conn.execute(
             "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(book, format) DO UPDATE SET uncompressed_size=excluded.uncompressed_size,
@@ -701,21 +854,41 @@ impl Library {
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                fs::copy(&source, &target)?;
+                copy_atomic(&source, &target)?;
                 written.push(target);
             }
         }
         Ok(written)
     }
 
+    /// [`Library::export_books`] as a job with per-book results.
+    pub fn export_each(
+        &self,
+        ids: &[i64],
+        destination: &Path,
+        template: &str,
+        format: Option<&str>,
+        context: &JobContext,
+    ) -> Vec<ItemResult<i64, Vec<PathBuf>>> {
+        jobs::for_each(
+            context,
+            ids.iter().copied(),
+            |id| format!("Exporting book {id}"),
+            |id| self.export_books(&[*id], destination, template, format),
+        )
+    }
+
     /// Rewrite `metadata.opf` for one book.
     pub fn sync_book(&mut self, id: i64) -> Result<()> {
+        self.writable()?;
         let meta = self.get_metadata(id)?;
         let relative = self.book_path(id)?;
         let directory = safe_join(&self.root, &relative)?;
         fs::create_dir_all(&directory)?;
-        fs::write(directory.join(METADATA_FILE), opf::metadata_to_opf(&meta))?;
-        Ok(())
+        write_atomic(
+            &directory.join(METADATA_FILE),
+            opf::metadata_to_opf(&meta).as_bytes(),
+        )
     }
 
     /// Rewrite every book's `metadata.opf` (e.g. after copying a library).
@@ -980,9 +1153,26 @@ struct SummaryRow {
     publisher: Option<String>,
 }
 
-fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn not_calibre(db_path: &Path) -> Error {
+    Error::InvalidLibrary(format!("{} is not a calibre database", db_path.display()))
+}
+
+fn configure_connection(conn: &Connection, writable: bool) -> rusqlite::Result<()> {
     conn.busy_timeout(Duration::from_secs(10))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+    if writable {
+        // calibre uses SQLite's rollback journal and reports `-wal`/`-shm`
+        // files as library damage, so never leave a database in WAL mode.
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            let _: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        }
+    }
 
     conn.create_scalar_function(
         "title_sort",
@@ -1126,15 +1316,29 @@ fn replace_links(conn: &Connection, id: i64, meta: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Removes what a failed `add_book` left behind: the files it wrote and the
+/// directories it created, never anything that was already there.
 #[derive(Debug)]
 struct DirGuard {
     path: PathBuf,
+    files: Vec<PathBuf>,
     armed: bool,
 }
 
 impl DirGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+        Self {
+            path,
+            files: Vec::new(),
+            armed: true,
+        }
+    }
+
+    /// Mark a file as created by this operation. Call before writing it.
+    fn track(&mut self, file: &Path) {
+        if !file.exists() {
+            self.files.push(file.to_path_buf());
+        }
     }
 
     fn disarm(mut self) {
@@ -1144,15 +1348,147 @@ impl DirGuard {
 
 impl Drop for DirGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Ok(mut entries) = fs::read_dir(&self.path) {
-                // Only remove directories this call created and left empty,
-                // never a pre-existing book directory.
-                if entries.next().is_none() {
-                    let _ = fs::remove_dir(&self.path);
+        if !self.armed {
+            return;
+        }
+        for file in &self.files {
+            let _ = fs::remove_file(file);
+        }
+        // `remove_dir` only succeeds on empty directories.
+        if fs::remove_dir(&self.path).is_ok() {
+            if let Some(parent) = self.path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+}
+
+/// File changes made by a mutation, reversed if its database commit fails.
+#[derive(Debug, Default)]
+struct FsUndo {
+    steps: Vec<UndoStep>,
+}
+
+#[derive(Debug)]
+enum UndoStep {
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Restore {
+        path: PathBuf,
+        previous: Option<Vec<u8>>,
+    },
+}
+
+impl FsUndo {
+    fn renamed(&mut self, from: &Path, to: &Path) {
+        self.steps.push(UndoStep::Rename {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        });
+    }
+
+    /// Remember a file's current content (or absence) before overwriting it.
+    fn snapshot(&mut self, path: &Path) -> Result<()> {
+        let previous = match fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        self.steps.push(UndoStep::Restore {
+            path: path.to_path_buf(),
+            previous,
+        });
+        Ok(())
+    }
+
+    fn roll_back(&mut self) {
+        while let Some(step) = self.steps.pop() {
+            match step {
+                UndoStep::Rename { from, to } => {
+                    if let Some(parent) = from.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::rename(&to, &from);
+                    if let Some(parent) = to.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+                UndoStep::Restore {
+                    path,
+                    previous: Some(bytes),
+                } => {
+                    let _ = write_atomic(&path, &bytes);
+                }
+                UndoStep::Restore {
+                    path,
+                    previous: None,
+                } => {
+                    let _ = fs::remove_file(&path);
                 }
             }
         }
+    }
+}
+
+/// Write a file so readers see either the old or the new content, never a
+/// partial one.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let directory = path.parent().unwrap_or(Path::new("."));
+    let mut temporary = shared_temporary(directory)?;
+    // Match the replaced file's mode before any content is written.
+    if let Ok(existing) = fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(existing.permissions())?;
+    }
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// A temporary file with ordinary (umask-governed) permissions rather than
+/// the owner-only default, so shared libraries stay readable by others.
+fn shared_temporary(directory: &Path) -> Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    Ok(builder.tempfile_in(directory)?)
+}
+
+pub(crate) fn copy_atomic(source: &Path, destination: &Path) -> Result<()> {
+    let directory = destination.parent().unwrap_or(Path::new("."));
+    let temporary = tempfile::NamedTempFile::new_in(directory)?;
+    fs::copy(source, temporary.path())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)?;
+    Ok(())
+}
+
+/// Drop the author directory once its last book moved out or was deleted;
+/// calibre's library check reports empty ones.
+fn remove_empty_parent(book_directory: &Path) {
+    if let Some(parent) = book_directory.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
+/// True when two paths in one directory differ only by case and name the same
+/// file (case-insensitive filesystems).
+fn same_file_ignore_case(a: &Path, b: &Path) -> bool {
+    match (a.file_name(), b.file_name()) {
+        (Some(x), Some(y)) => {
+            x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+        }
+        _ => false,
     }
 }
 
