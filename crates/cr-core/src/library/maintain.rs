@@ -125,6 +125,7 @@ impl Library {
                 rows.collect::<rusqlite::Result<_>>()?
             };
             let mut tracked = HashSet::new();
+            let mut present = HashSet::new();
             for (format, _, size) in &recorded {
                 match self.format_path(id, format)? {
                     Some(file) => {
@@ -137,6 +138,7 @@ impl Library {
                             });
                         }
                         tracked.insert(file);
+                        present.insert(format.to_ascii_uppercase());
                     }
                     None => problems.push(Problem::MissingFormat {
                         id,
@@ -154,9 +156,8 @@ impl Library {
                 if !tracked.contains(&file)
                     && !name.starts_with('.')
                     && BOOK_FORMATS.contains(&base)
-                    && !recorded
-                        .iter()
-                        .any(|(known, _, _)| known.eq_ignore_ascii_case(&format))
+                    // A record whose own file is missing does not cover it.
+                    && !present.contains(&format)
                 {
                     problems.push(Problem::UntrackedFormat { id, file: name });
                 }
