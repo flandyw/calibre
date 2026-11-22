@@ -249,3 +249,167 @@ fn library_saves_keep_the_original_and_refuse_broken_books() {
     assert!(text.chapters.iter().any(|c| c.text.contains("Second")));
     assert!(library.restore_original(id, "EPUB").is_err());
 }
+
+#[test]
+fn edits_keep_what_they_do_not_own() {
+    let temp = tempdir().unwrap();
+    let book = unpacked(temp.path());
+    let first = book.spine()[0].path.clone();
+    let image = book
+        .items()
+        .into_iter()
+        .find(|item| item.media_type == "image/png")
+        .unwrap();
+    let opf = book.root().join(book.opf_path());
+
+    // Unquoted attributes are not XML.
+    let path = book.root().join(&first);
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace("<p>", "<p class=broken>")).unwrap();
+    assert!(book
+        .check()
+        .iter()
+        .any(|issue| issue.message.contains("well-formed") && issue.line.is_some()));
+    fs::write(&path, &text).unwrap();
+
+    // A remote resource is not a missing file, and fix leaves it alone.
+    let package = fs::read_to_string(&opf).unwrap();
+    let remote =
+        "<item id=\"remote\" href=\"https://example.com/a.mp3\" media-type=\"audio/mpeg\"/>";
+    fs::write(
+        &opf,
+        package.replace("</manifest>", &format!("{remote}</manifest>")),
+    )
+    .unwrap();
+    let mut book = EpubDir::open(book.root()).unwrap();
+    assert_eq!(book.check(), []);
+    book.fix().unwrap();
+    assert!(fs::read_to_string(&opf).unwrap().contains(remote));
+
+    // Inline styles, quoted imports and guide references follow a rename.
+    let image_href = image.path.rsplit_once("OEBPS/").unwrap().1.to_string();
+    let styled = text.replace(
+        "</body>",
+        &format!("<p style=\"background: url({image_href})\">x</p></body>"),
+    );
+    fs::write(&path, styled).unwrap();
+    let css = temp.path().join("extra.css");
+    fs::write(
+        &css,
+        format!("@import \"other.css\";\np {{ background: url('{image_href}') }}"),
+    )
+    .unwrap();
+    let other = temp.path().join("other.css");
+    fs::write(&other, "p { margin: 0 }").unwrap();
+    let directory = first.rsplit_once('/').unwrap().0.to_string();
+    book.add_file(&css, &format!("{directory}/extra.css"))
+        .unwrap();
+    book.add_file(&other, &format!("{directory}/other.css"))
+        .unwrap();
+    let package = fs::read_to_string(&opf).unwrap();
+    let chapter_href = first.rsplit('/').next().unwrap();
+    fs::write(
+        &opf,
+        package.replace(
+            "</package>",
+            &format!("<guide><reference type=\"text\" title=\"Start\" href=\"{chapter_href}\"/></guide></package>"),
+        ),
+    )
+    .unwrap();
+    let mut book = EpubDir::open(book.root()).unwrap();
+    book.rename_file(&image.path, &format!("{directory}/art/new.png"))
+        .unwrap();
+    book.rename_file(
+        &format!("{directory}/other.css"),
+        &format!("{directory}/css/base.css"),
+    )
+    .unwrap();
+    let moved = format!("{directory}/text/start.xhtml");
+    book.rename_file(&first, &moved).unwrap();
+    assert!(fs::read_to_string(book.root().join(&moved))
+        .unwrap()
+        .contains("url(../art/new.png)"));
+    let css = fs::read_to_string(book.root().join(format!("{directory}/extra.css"))).unwrap();
+    assert!(css.contains("@import \"css/base.css\""));
+    assert!(css.contains("url('art/new.png')"));
+    let package = fs::read_to_string(&opf).unwrap();
+    assert!(
+        package.contains("href=\"text/start.xhtml\"/></guide>"),
+        "{package}"
+    );
+    assert_eq!(book.check(), []);
+
+    // Regenerating the contents keeps the rest of the navigation document.
+    if let Some(nav) = book
+        .items()
+        .into_iter()
+        .find(|item| item.properties.contains("nav"))
+    {
+        let path = book.root().join(&nav.path);
+        let text = fs::read_to_string(&path).unwrap();
+        let landmarks = "<nav epub:type=\"landmarks\"><ol><li><a epub:type=\"bodymatter\" href=\"text/start.xhtml\">Start</a></li></ol></nav>";
+        fs::write(
+            &path,
+            text.replace("</body>", &format!("{landmarks}</body>")),
+        )
+        .unwrap();
+        book.generate_toc(2).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains(landmarks));
+        assert_eq!(text.matches("epub:type=\"toc\"").count(), 1);
+        assert_eq!(book.toc().unwrap().len(), 3);
+    } else {
+        panic!("converted books have a navigation document");
+    }
+}
+
+#[test]
+fn prefixed_packages_and_other_encodings_stay_valid() {
+    let temp = tempdir().unwrap();
+    let mut book = unpacked(temp.path());
+    let opf = book.root().join(book.opf_path());
+    let package = fs::read_to_string(&opf).unwrap();
+    let prefixed =
+        regex::Regex::new(r"<(/?)(package|metadata|manifest|spine|item|itemref|guide|reference)\b")
+            .unwrap()
+            .replace_all(&package, "<${1}opf:$2")
+            .replace(
+                "xmlns=\"http://www.idpf.org/2007/opf\"",
+                "xmlns:opf=\"http://www.idpf.org/2007/opf\"",
+            );
+    fs::write(&opf, prefixed).unwrap();
+    let mut prefixed = EpubDir::open(book.root()).unwrap();
+    let extra = temp.path().join("extra.xhtml");
+    fs::write(&extra, "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>x</title></head><body><p>x</p></body></html>").unwrap();
+    let directory = prefixed.spine()[0]
+        .path
+        .rsplit_once('/')
+        .unwrap()
+        .0
+        .to_string();
+    prefixed
+        .add_file(&extra, &format!("{directory}/extra.xhtml"))
+        .unwrap();
+    let text = fs::read_to_string(&opf).unwrap();
+    assert!(text.contains("<opf:item id=\"extra_xhtml\""), "{text}");
+    assert!(text.contains("<opf:itemref idref=\"extra_xhtml\""));
+    fs::write(&opf, package).unwrap();
+    book = EpubDir::open(book.root()).unwrap();
+
+    // A UTF-16 chapter is rewritten as UTF-8 and says so.
+    let first = book.spine()[0].path.clone();
+    let path = book.root().join(&first);
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replacen("utf-8", "utf-16", 1)
+        .replacen("UTF-8", "utf-16", 1);
+    assert!(text.contains("encoding=\"utf-16\""));
+    let mut bytes = vec![0xff, 0xfe];
+    bytes.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(&path, bytes).unwrap();
+    book.replace("First", "Erste", &SearchOptions::default())
+        .unwrap();
+    let written = fs::read_to_string(&path).unwrap();
+    assert!(written.contains("Erste"));
+    assert!(written.contains("encoding=\"utf-8\""));
+}

@@ -25,6 +25,15 @@ static ITEM: LazyLock<Regex> = LazyLock::new(|| {
 static ITEMREF: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"<(?:\w+:)?itemref\b[^<>]*>(?:\s*</(?:\w+:)?itemref>)?[ \t]*\r?\n?").unwrap()
 });
+static XML_ENCODING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^(\s*<\?xml\b[^>]*?\bencoding\s*=\s*["'])[^"']*(["'])"#).unwrap()
+});
+static CSS_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"@import\s+["']([^"']+)["']"#).unwrap());
+static NAV_TOC: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<nav\b[^>]*\bepub:type\s*=\s*["'][^"']*\btoc\b[^"']*["'][^>]*>.*?</nav\s*>"#)
+        .unwrap()
+});
 static CSS_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"url\(\s*["']?([^"')]+)["']?\s*\)"#).unwrap());
 static HEADING: LazyLock<Regex> =
@@ -117,7 +126,10 @@ fn attribute(tag: &str, name: &str) -> Option<String> {
 }
 
 fn escape(text: &str) -> String {
-    html_escape::encode_safe(text).to_string()
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn directory_of(path: &str) -> &str {
@@ -281,7 +293,9 @@ impl EpubDir {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        Ok(fs::write(path, text)?)
+        // Text is always written as UTF-8, so the declaration must say so.
+        let text = XML_ENCODING.replace(text, "${1}utf-8${2}");
+        Ok(fs::write(path, text.as_bytes())?)
     }
 
     fn save_opf(&self) -> Result<()> {
@@ -303,6 +317,10 @@ impl EpubDir {
                 let tag = tag.as_str();
                 let id = attribute(tag, "id").unwrap_or_default();
                 let href = attribute(tag, "href")?;
+                // Remote resources are not files of the book.
+                if is_external(&href) {
+                    return None;
+                }
                 Some(Item {
                     path: resolve_href(self.opf_directory(), &href),
                     media_type: attribute(tag, "media-type").unwrap_or_default(),
@@ -759,6 +777,16 @@ impl EpubDir {
         id
     }
 
+    /// The namespace prefix the package uses on an element, with its colon.
+    fn prefix_of(&self, element: &str) -> String {
+        Regex::new(&format!(r"<(\w+:)?{element}\b"))
+            .unwrap()
+            .captures(&self.opf)
+            .and_then(|found| found.get(1))
+            .map(|prefix| prefix.as_str().to_string())
+            .unwrap_or_default()
+    }
+
     /// Add a file on disk to the manifest; returns its id.
     fn list(&mut self, path: &str, properties: &str) -> String {
         let id = self.unused_id(path);
@@ -767,8 +795,9 @@ impl EpubDir {
         } else {
             format!(" properties=\"{properties}\"")
         };
+        let prefix = self.prefix_of("manifest");
         let tag = format!(
-            "    <item id=\"{id}\" href=\"{}\" media-type=\"{}\"{properties}/>\n  ",
+            "    <{prefix}item id=\"{id}\" href=\"{}\" media-type=\"{}\"{properties}/>\n  ",
             escape(&relative_href(self.opf_directory(), path)),
             media_type_for(path)
         );
@@ -785,7 +814,8 @@ impl EpubDir {
     }
 
     fn append_itemref(&mut self, id: &str, position: Option<usize>) {
-        let tag = format!("    <itemref idref=\"{id}\"/>\n");
+        let prefix = self.prefix_of("spine");
+        let tag = format!("    <{prefix}itemref idref=\"{id}\"/>\n");
         let existing: Vec<Range<usize>> = ITEMREF
             .find_iter(&self.opf)
             .map(|tag| tag.range())
@@ -874,53 +904,17 @@ impl EpubDir {
             // References are resolved from where the file was when written.
             let old_base = directory_of(if moved { from } else { &other.path });
             let new_base = directory_of(&other.path);
-            let rewrite = |reference: &str| -> Option<String> {
-                if reference.is_empty() || is_external(reference) || reference.starts_with('#') {
-                    return None;
-                }
-                let (file, fragment) = reference.split_once('#').unwrap_or((reference, ""));
-                let resolved = resolve_href(old_base, file);
-                let resolved = if resolved == from { to } else { &resolved };
-                if resolved != to && !moved {
-                    return None;
-                }
-                let mut updated = relative_href(new_base, resolved);
-                if !fragment.is_empty() {
-                    updated = format!("{updated}#{fragment}");
-                }
-                (updated != reference).then_some(updated)
-            };
-            let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-            if other.media_type == "text/css" {
-                for found in CSS_URL.captures_iter(&text) {
-                    let reference = found.get(1).unwrap();
-                    if let Some(updated) = rewrite(reference.as_str()) {
-                        edits.push((reference.range(), updated));
-                    }
-                }
-            } else {
-                for tag in TAG.find_iter(&text) {
-                    for (name, value, range) in attributes(tag.as_str()) {
-                        if matches!(name.as_str(), "href" | "src" | "xlink:href" | "poster") {
-                            if let Some(updated) = rewrite(&value) {
-                                edits.push((
-                                    tag.start() + range.start..tag.start() + range.end,
-                                    escape(&updated),
-                                ));
-                            }
-                        }
-                    }
-                }
+            let markup = other.media_type != "text/css";
+            if let Some(text) = retarget(&text, markup, old_base, new_base, from, to, moved) {
+                self.write(&other.path, &text)?;
+                changed += 1;
             }
-            if edits.is_empty() {
-                continue;
-            }
-            let mut text = text;
-            for (range, updated) in edits.into_iter().rev() {
-                text.replace_range(range, &updated);
-            }
-            self.write(&other.path, &text)?;
-            changed += 1;
+        }
+        // Guide references in the package document.
+        let base = self.opf_directory().to_string();
+        if let Some(opf) = retarget(&self.opf, true, &base, &base, from, to, false) {
+            self.opf = opf;
+            self.save_opf()?;
         }
         Ok(changed)
     }
@@ -1233,6 +1227,20 @@ impl EpubDir {
             let document = format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<html xmlns=\"http://www.w3.org/1999/xhtml\" xmlns:epub=\"http://www.idpf.org/2007/ops\">\n<head><title>{title}</title></head>\n<body>\n<nav epub:type=\"toc\" id=\"toc\">\n<h1>Contents</h1>\n{list}</nav>\n</body>\n</html>\n"
             );
+            // Keep landmarks, page lists and any text of an existing document.
+            let kept = existing_nav
+                .as_ref()
+                .and_then(|_| self.read(&path).ok())
+                .filter(|text| NAV_TOC.is_match(text));
+            let document = match kept {
+                Some(text) => {
+                    let nav = format!(
+                        "<nav epub:type=\"toc\" id=\"toc\">\n<h1>Contents</h1>\n{list}</nav>"
+                    );
+                    NAV_TOC.replace(&text, regex::NoExpand(&nav)).into_owned()
+                }
+                None => document,
+            };
             self.write(&path, &document)?;
             if existing_nav.is_none() {
                 self.list(&path, "nav");
@@ -1368,6 +1376,71 @@ fn target_of(base: &str, href: &str) -> String {
     }
 }
 
+/// Rewrite the references in a file after `from` was renamed to `to`.
+/// `moved` is set for the renamed file itself, whose own relative
+/// references all change. Returns the new text when anything changed.
+fn retarget(
+    text: &str,
+    markup: bool,
+    old_base: &str,
+    new_base: &str,
+    from: &str,
+    to: &str,
+    moved: bool,
+) -> Option<String> {
+    let rewrite = |reference: &str| -> Option<String> {
+        if reference.is_empty() || is_external(reference) || reference.starts_with('#') {
+            return None;
+        }
+        let (file, fragment) = reference.split_once('#').unwrap_or((reference, ""));
+        let resolved = resolve_href(old_base, file);
+        let resolved = if resolved == from { to } else { &resolved };
+        if resolved != to && !moved {
+            return None;
+        }
+        let mut updated = relative_href(new_base, resolved);
+        if !fragment.is_empty() {
+            updated = format!("{updated}#{fragment}");
+        }
+        (updated != reference).then_some(updated)
+    };
+    let mut edits: Vec<(Range<usize>, String)> = Vec::new();
+    // Stylesheets, and styles inside markup (style attributes and elements).
+    for found in CSS_URL
+        .captures_iter(text)
+        .chain(CSS_IMPORT.captures_iter(text))
+    {
+        let reference = found.get(1).unwrap();
+        if let Some(updated) = rewrite(reference.as_str()) {
+            edits.push((reference.range(), updated));
+        }
+    }
+    if markup {
+        for tag in TAG.find_iter(text) {
+            for (name, value, range) in attributes(tag.as_str()) {
+                if matches!(name.as_str(), "href" | "src" | "xlink:href" | "poster") {
+                    if let Some(updated) = rewrite(&value) {
+                        edits.push((
+                            tag.start() + range.start..tag.start() + range.end,
+                            escape(&updated),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    edits.dedup_by_key(|(range, _)| range.start);
+    let mut text = text.to_string();
+    for (range, updated) in edits.into_iter().rev() {
+        text.replace_range(range, &updated);
+    }
+    Some(text)
+}
+
 fn href_to(base: &str, target: &str) -> String {
     let (path, fragment) = target.split_once('#').unwrap_or((target, ""));
     let href = relative_href(base, path);
@@ -1385,6 +1458,12 @@ fn malformed(text: &str) -> Option<(usize, String)> {
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Eof) => return None,
+            Ok(quick_xml::events::Event::Start(tag) | quick_xml::events::Event::Empty(tag)) => {
+                if let Some(Err(err)) = tag.attributes().find(|attribute| attribute.is_err()) {
+                    let offset = (reader.buffer_position() as usize).saturating_sub(1);
+                    return Some((line_of(text, offset), err.to_string()));
+                }
+            }
             Ok(_) => {}
             Err(err) => {
                 let offset = reader.error_position() as usize;
