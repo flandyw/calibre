@@ -158,6 +158,14 @@ enum Command {
         #[arg(long = "choice")]
         choices: Vec<String>,
     },
+    /// Search inside books: `cr fts index`, then `cr fts search WORDS`
+    Fts {
+        /// index or search
+        action: String,
+        query: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Set a book's value in a custom column (an empty value clears it)
     SetCustom {
         id: i64,
@@ -783,6 +791,54 @@ fn run(cli: Cli) -> Result<()> {
                     println!("Removed column #{}", label.trim_start_matches('#'));
                 }
                 other => bail!("unknown action `{other}` (use list, add or rm)"),
+            }
+        }
+        Command::Fts {
+            action,
+            query,
+            limit,
+        } => {
+            let library = Library::open(&library_path)?;
+            match action.as_str() {
+                "index" => {
+                    let report = library.fts_index(&JobContext::detached())?;
+                    println!(
+                        "Indexed {} book(s), {} unchanged, {} removed",
+                        report.indexed, report.unchanged, report.removed
+                    );
+                    for (id, reason) in &report.failed {
+                        eprintln!("#{id}: {reason}");
+                    }
+                }
+                "search" => {
+                    if !library.has_fts_index() {
+                        bail!("no full-text index yet; run `cr fts index` first");
+                    }
+                    let hits = library.fts_search(&query.join(" "), limit)?;
+                    if cli.json {
+                        let hits: Vec<Value> = hits
+                            .iter()
+                            .map(|hit| {
+                                json!({
+                                    "book": hit.book,
+                                    "title": hit.title,
+                                    "chapter": hit.chapter,
+                                    "chapter_title": hit.chapter_title,
+                                    "snippet": hit.snippet,
+                                })
+                            })
+                            .collect();
+                        print_json(&json!(hits))?;
+                    } else {
+                        for hit in hits {
+                            println!(
+                                "#{} {} — ch. {} {}\n    {}",
+                                hit.book, hit.title, hit.chapter, hit.chapter_title, hit.snippet
+                            );
+                        }
+                    }
+                }
+                other => bail!("unknown action `{other}` (use index or search)"),
             }
         }
         Command::SetCustom { id, label, value } => {

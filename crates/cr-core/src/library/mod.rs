@@ -23,9 +23,11 @@ use crate::metadata::{format_datetime, now, parse_datetime, BookSummary, Metadat
 use crate::opf;
 use crate::text;
 
+mod fts;
 mod manage;
 mod organize;
 mod search;
+pub use fts::*;
 pub use manage::*;
 pub use organize::*;
 

@@ -200,3 +200,60 @@ fn categories_count_rename_and_merge() {
     library.set_saved_search("a", None).unwrap();
     assert!(library.saved_searches().unwrap().is_empty());
 }
+
+#[test]
+fn full_text_index_finds_passages_and_tracks_changes() {
+    use cr_core::jobs::JobContext;
+
+    let temp = tempdir().unwrap();
+    let mut library = Library::create(&temp.path().join("library")).unwrap();
+    let add = |library: &mut Library, name: &str, text: &str| {
+        let path = temp.path().join(name);
+        fs::write(&path, text).unwrap();
+        library.add_book(&path).unwrap().id
+    };
+    let dune = add(
+        &mut library,
+        "Dune.txt",
+        "The spice must flow.\n\nFear is the mind-killer.",
+    );
+    let emma = add(
+        &mut library,
+        "Emma.txt",
+        "Emma Woodhouse, handsome, clever, and rich.",
+    );
+    assert!(library.fts_search("spice", 10).unwrap().is_empty());
+
+    let context = JobContext::detached();
+    let report = library.fts_index(&context).unwrap();
+    assert_eq!((report.indexed, report.unchanged), (2, 0));
+    let hits = library.fts_search("spice", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].book, hits[0].title.as_str()), (dune, "Dune"));
+    assert!(hits[0].snippet.contains("[spice]"), "{}", hits[0].snippet);
+    assert_eq!(
+        library.fts_search("handsome clever", 10).unwrap()[0].book,
+        emma
+    );
+    assert_eq!(library.fts_search("\"mind killer\"", 10).unwrap().len(), 1);
+    // Not FTS syntax, still a search.
+    assert_eq!(library.fts_search("mind-killer (", 10).unwrap().len(), 1);
+    assert!(library.fts_search("absent", 10).unwrap().is_empty());
+
+    let again = library.fts_index(&context).unwrap();
+    assert_eq!((again.indexed, again.unchanged), (0, 2));
+
+    let replacement = temp.path().join("new.txt");
+    fs::write(
+        &replacement,
+        "A much longer replacement text about sandworms.",
+    )
+    .unwrap();
+    library.replace_format(dune, "TXT", &replacement).unwrap();
+    library.remove_book(emma, true).unwrap();
+    let updated = library.fts_index(&context).unwrap();
+    assert_eq!((updated.indexed, updated.removed), (1, 1));
+    assert!(library.fts_search("spice", 10).unwrap().is_empty());
+    assert_eq!(library.fts_search("sandworms", 10).unwrap()[0].book, dune);
+    assert!(library.fts_search("handsome", 10).unwrap().is_empty());
+}
