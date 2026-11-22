@@ -216,8 +216,18 @@ pub fn remove(device: &Device, paths: &[String]) -> Result<Vec<String>> {
         let file = device.root.join(path);
         fs::remove_file(&file)?;
         // The Kindle keeps a book's position and notes in a folder beside it.
+        // Another format of the same book shares that folder.
         let sidecar = file.with_extension("sdr");
-        if sidecar.is_dir() {
+        let shared = file
+            .parent()
+            .and_then(|folder| fs::read_dir(folder).ok())
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    let other = entry.path();
+                    other.is_file() && other.file_stem() == file.file_stem()
+                })
+            });
+        if sidecar.is_dir() && !shared {
             let _ = fs::remove_dir_all(sidecar);
         }
         // Folders a file name template made, once they are empty.
