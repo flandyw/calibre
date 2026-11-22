@@ -528,7 +528,11 @@ impl Library {
         duplicates: DuplicatePolicy,
     ) -> Result<AddOutcome> {
         target.writable()?;
-        if self.root == target.root {
+        let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        };
+        if same(&self.root, &target.root) {
             return Err(Error::Other(
                 "source and target library are the same".into(),
             ));
