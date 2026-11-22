@@ -306,16 +306,21 @@ impl Library {
             let meta = self.get_metadata(id)?;
             let label = serde_json::json!({"title": meta.title, "authors": meta.authors});
             write_atomic(&trash.join(TRASH_LABEL), label.to_string().as_bytes())?;
-            let target = trash.join(format.to_ascii_lowercase());
-            copy_atomic(&path, &target)?;
-            moved = Some((path, target));
+            // Staged under another name so an older trashed copy of this
+            // format survives if the record cannot be removed.
+            let staged = trash.join(format!("{}.incoming", format.to_ascii_lowercase()));
+            copy_atomic(&path, &staged)?;
+            moved = Some((path, staged));
         }
         let deleted = self.conn.execute(
             "DELETE FROM data WHERE book=?1 AND format=?2 COLLATE NOCASE",
             params![id, format],
         );
         match (deleted, moved) {
-            (Ok(_), Some((path, _))) => fs::remove_file(&path)?,
+            (Ok(_), Some((path, staged))) => {
+                fs::rename(&staged, staged.with_extension(""))?;
+                fs::remove_file(&path)?;
+            }
             (Ok(_), None) => {}
             (Err(error), moved) => {
                 if let Some((_, target)) = moved {
