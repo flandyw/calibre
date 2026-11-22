@@ -291,26 +291,35 @@ impl Library {
     pub fn remove_format(&mut self, id: i64, format: &str) -> Result<()> {
         self.writable()?;
         let format = format.to_ascii_uppercase();
-        let path = self.format_path(id, &format)?;
-        let changed = self.conn.execute(
-            "DELETE FROM data WHERE book=?1 AND format=?2 COLLATE NOCASE",
-            params![id, format],
-        )?;
-        if changed == 0 {
-            self.ensure_exists(id)?;
+        self.ensure_exists(id)?;
+        if !self.formats(id)?.iter().any(|have| *have == format) {
             return Err(Error::Other(format!("book {id} has no {format} format")));
         }
-        if let Some(path) = path {
+        // The file reaches the trash before the record goes, so a failure
+        // never leaves a file the library no longer knows about.
+        let mut moved = None;
+        if let Some(path) = self.format_path(id, &format)? {
             let trash = self.trash_dir('f', id);
             fs::create_dir_all(&trash)?;
+            let meta = self.get_metadata(id)?;
+            let label = serde_json::json!({"title": meta.title, "authors": meta.authors});
+            write_atomic(&trash.join(TRASH_LABEL), label.to_string().as_bytes())?;
             let target = trash.join(format.to_ascii_lowercase());
-            if fs::rename(&path, &target).is_err() {
-                copy_atomic(&path, &target)?;
-                fs::remove_file(&path)?;
-            }
-            if let Ok(meta) = self.get_metadata(id) {
-                let label = serde_json::json!({"title": meta.title, "authors": meta.authors});
-                write_atomic(&trash.join(TRASH_LABEL), label.to_string().as_bytes())?;
+            copy_atomic(&path, &target)?;
+            moved = Some((path, target));
+        }
+        let deleted = self.conn.execute(
+            "DELETE FROM data WHERE book=?1 AND format=?2 COLLATE NOCASE",
+            params![id, format],
+        );
+        match (deleted, moved) {
+            (Ok(_), Some((path, _))) => fs::remove_file(&path)?,
+            (Ok(_), None) => {}
+            (Err(error), moved) => {
+                if let Some((_, target)) = moved {
+                    let _ = fs::remove_file(target);
+                }
+                return Err(error.into());
             }
         }
         self.sync_book(id)
