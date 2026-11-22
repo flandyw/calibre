@@ -2055,9 +2055,20 @@ impl CalibreApp {
             }
         };
         // Annotations follow their text if the file changed since.
-        let _ = library.relocate_annotations(id, &book);
-        self.reader_annotations = library.annotations(Some(id)).unwrap_or_default();
-        let position = library.reading_position(id, &book).ok().flatten();
+        let mut problem = None;
+        if library.read_only_reason().is_none() {
+            if let Err(err) = library.relocate_annotations(id, &book) {
+                problem = Some(format!("Could not update your notes: {err}"));
+            }
+        }
+        self.reader_annotations = library.annotations(Some(id)).unwrap_or_else(|err| {
+            problem = Some(format!("Could not load your notes: {err}"));
+            Vec::new()
+        });
+        let position = library.reading_position(id, &book).unwrap_or_else(|err| {
+            problem = Some(format!("Could not load your place: {err}"));
+            None
+        });
         self.reader_images = book
             .images
             .iter()
@@ -2067,6 +2078,7 @@ impl CalibreApp {
                     [0x89, b'P', ..] => ImageFormat::Png,
                     [b'G', b'I', b'F', ..] => ImageFormat::Gif,
                     [b'R', b'I', b'F', b'F', ..] => ImageFormat::Webp,
+                    _ if image.name.to_ascii_lowercase().ends_with(".svg") => ImageFormat::Svg,
                     _ => return None,
                 };
                 Some(std::sync::Arc::new(Image::from_bytes(
@@ -2089,13 +2101,16 @@ impl CalibreApp {
             cx,
         );
         window.focus(&self.reader_focus, cx);
-        self.set_status(
-            match position {
-                Some(position) => format!("Resumed at {:.0}%.", position.fraction * 100.0),
-                None => format!("Reading {sections} section(s)."),
-            },
-            Tone::Info,
-        );
+        match problem {
+            Some(problem) => self.set_status(problem, Tone::Error),
+            None => self.set_status(
+                match position {
+                    Some(position) => format!("Resumed at {:.0}%.", position.fraction * 100.0),
+                    None => format!("Reading {sections} section(s)."),
+                },
+                Tone::Info,
+            ),
+        }
         self.sync_window_chrome(window);
         cx.notify();
     }
@@ -2114,12 +2129,21 @@ impl CalibreApp {
         }
     }
 
-    fn save_reading_position(&self) {
-        if let (Some(library), Some(book)) = (self.library.as_ref(), self.book.as_ref()) {
-            if library.read_only_reason().is_none() {
-                let _ =
-                    library.set_reading_position(self.reader_book_id, book, self.reader_locator());
-            }
+    fn save_reading_position(&mut self) {
+        if self.screen == Screen::Reader {
+            self.save_reading_position_at(self.reader_locator());
+        }
+    }
+
+    fn save_reading_position_at(&mut self, locator: Locator) {
+        let (Some(library), Some(book)) = (self.library.as_ref(), self.book.as_ref()) else {
+            return;
+        };
+        if library.read_only_reason().is_some() {
+            return;
+        }
+        if let Err(err) = library.set_reading_position(self.reader_book_id, book, locator) {
+            self.set_status(format!("Could not save your place: {err}"), Tone::Error);
         }
     }
 
@@ -2157,14 +2181,6 @@ impl CalibreApp {
             .set((locator.block > 0).then_some(locator.block));
         self.save_reading_position_at(locator);
         cx.notify();
-    }
-
-    fn save_reading_position_at(&self, locator: Locator) {
-        if let (Some(library), Some(book)) = (self.library.as_ref(), self.book.as_ref()) {
-            if library.read_only_reason().is_none() {
-                let _ = library.set_reading_position(self.reader_book_id, book, locator);
-            }
-        }
     }
 
     pub fn step_chapter(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -2278,10 +2294,13 @@ impl CalibreApp {
 
     pub fn remove_annotation(&mut self, id: i64, cx: &mut Context<Self>) {
         if let Some(library) = self.library.as_ref() {
-            let _ = library.remove_annotation(id);
+            let result = library.remove_annotation(id);
             self.reader_annotations = library
                 .annotations(Some(self.reader_book_id))
                 .unwrap_or_default();
+            if let Err(err) = result {
+                self.set_status(format!("Could not remove it: {err}"), Tone::Error);
+            }
         }
         cx.notify();
     }
@@ -2907,6 +2926,7 @@ impl CalibreApp {
             self.resolve_unsaved(AfterResolve::CloseWindow, window, cx);
             return false;
         }
+        self.save_reading_position();
         self.persist_window_state(window);
         self.cleanup_temp_files();
         true
@@ -2998,6 +3018,7 @@ impl CalibreApp {
     /// Last chance to save state when the OS quits the app directly (Dock
     /// "Quit", logout, AppleScript), bypassing the Quit action.
     pub fn prepare_for_quit(&mut self, window: &Window) {
+        self.save_reading_position();
         self.persist_window_state(window);
         self.cleanup_temp_files();
     }
