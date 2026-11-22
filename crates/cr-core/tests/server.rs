@@ -227,6 +227,9 @@ fn check_repair_and_rebuild() {
     let second_dir = root.join(library.book_path(second).unwrap());
     let epub = library.format_path(first, "EPUB").unwrap().unwrap();
     fs::remove_file(&epub).unwrap();
+    // The second book's file was renamed by hand and a copy left beside it.
+    let second_epub = library.format_path(second, "EPUB").unwrap().unwrap();
+    let second_bytes = fs::read(&second_epub).unwrap();
     fs::write(first_dir.join("Stray.pdf"), "pdf").unwrap();
     fs::write(first_dir.join("notes.json"), "{}").unwrap();
     fs::remove_file(second_dir.join("metadata.opf")).unwrap();
@@ -248,8 +251,23 @@ fn check_repair_and_rebuild() {
         path: "Nobody/Lost (99)".into()
     }));
     assert_eq!(problems.len(), 5);
+    let renamed = second_dir.join("Renamed.epub");
+    fs::rename(&second_epub, &renamed).unwrap();
+    let problems = library.check().unwrap();
+    assert!(problems.contains(&Problem::UntrackedFormat {
+        id: second,
+        file: "Renamed.epub".into()
+    }));
+    assert_eq!(library.repair(&problems).unwrap(), 6);
+    assert_eq!(
+        library.format_path(second, "EPUB").unwrap().unwrap(),
+        renamed
+    );
+    fs::rename(&renamed, &second_epub).unwrap();
+    fs::write(second_dir.join("A copy.epub"), "copy").unwrap();
+    let problems = library.check().unwrap();
 
-    assert_eq!(library.repair(&problems).unwrap(), 4);
+    library.repair(&problems).unwrap();
     assert_eq!(library.formats(first).unwrap(), ["PDF"]);
     assert_eq!(
         fs::read(library.format_path(first, "PDF").unwrap().unwrap()).unwrap(),
@@ -290,6 +308,11 @@ fn check_repair_and_rebuild() {
     assert_eq!(rebuilt.get_metadata(first).unwrap().uuid, uuid);
     assert_eq!(rebuilt.formats(first).unwrap(), ["PDF"]);
     assert_eq!(rebuilt.formats(second).unwrap(), ["EPUB"]);
+    assert_eq!(
+        fs::read(rebuilt.format_path(second, "EPUB").unwrap().unwrap()).unwrap(),
+        second_bytes
+    );
+    assert_eq!(fs::read(second_dir.join("A copy.epub")).unwrap(), b"copy");
     assert!(rebuilt
         .format_path(second, "EPUB")
         .unwrap()
@@ -304,6 +327,15 @@ fn check_repair_and_rebuild() {
     );
     drop(rebuilt);
     assert!(Library::open(&root).is_ok());
+
+    // A second rebuild keeps the first backup.
+    let (_, again) = Library::rebuild(&root).unwrap();
+    assert_eq!(again.restored, 2);
+    assert_eq!(
+        fs::read(root.join("metadata_pre_restore.db")).unwrap(),
+        b"damaged"
+    );
+    assert!(root.join("metadata_pre_restore_1.db").is_file());
 
     // Nothing to rebuild from is an error that leaves the folder alone.
     let empty = temp.path().join("empty");

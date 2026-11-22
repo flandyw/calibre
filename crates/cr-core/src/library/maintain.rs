@@ -14,9 +14,9 @@ use crate::opf;
 use crate::text;
 
 /// File types recorded as a book format when found untracked in a book folder.
-const BOOK_FORMATS: [&str; 20] = [
-    "EPUB", "KEPUB", "AZW3", "AZW", "MOBI", "PRC", "KFX", "PDF", "TXT", "FB2", "RTF", "DOCX",
-    "HTMLZ", "HTML", "CBZ", "CBR", "DJVU", "LIT", "ODT", "ZIP",
+const BOOK_FORMATS: [&str; 21] = [
+    "KF8", "EPUB", "KEPUB", "AZW3", "AZW", "MOBI", "PRC", "KFX", "PDF", "TXT", "FB2", "RTF",
+    "DOCX", "HTMLZ", "HTML", "CBZ", "CBR", "DJVU", "LIT", "ODT", "ZIP",
 ];
 
 /// Something in the library that does not agree with its database.
@@ -303,7 +303,7 @@ impl Library {
                     .push((relative, format!("another folder already has id {id}")));
                 continue;
             }
-            match library.restore_folder(id, &relative, &folder) {
+            match library.restore_folder(id, &folder) {
                 Ok(()) => report.restored += 1,
                 Err(error) => report.failed.push((relative, error.to_string())),
             }
@@ -311,7 +311,7 @@ impl Library {
         Ok((library, report))
     }
 
-    fn restore_folder(&mut self, id: i64, relative: &str, folder: &Path) -> Result<()> {
+    fn restore_folder(&mut self, id: i64, folder: &Path) -> Result<()> {
         let mut meta = opf::parse_opf(&fs::read(folder.join(METADATA_FILE))?)?;
         meta.cover = fs::read(folder.join(COVER_FILE)).ok();
         // As when restoring from the trash: the OPF holds one sort key per author.
