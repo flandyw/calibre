@@ -427,6 +427,12 @@ impl Library {
         }
         let mut meta = opf::parse_opf(&fs::read(trash.join(METADATA_FILE))?)?;
         meta.cover = fs::read(trash.join(COVER_FILE)).ok();
+        // Our OPF stores one sort key per author, so with several authors the
+        // parsed value is only the first author's: rebuild the combined one.
+        let first = meta.authors.first().map(|author| text::author_sort(author));
+        if meta.authors.len() > 1 && meta.author_sort == first {
+            meta.author_sort = None;
+        }
         let files = format_files(&trash);
         let options = NewBook {
             id: self.ensure_exists(id).is_err().then_some(id),
