@@ -486,6 +486,9 @@ fn pdf_info_dictionary(data: &[u8]) -> Option<&[u8]> {
             let start = at + header.len();
             if let Some(end) = find(data, b"endobj", start) {
                 newest = Some(&data[start..end]);
+                // Text inside the object that looks like a header is not one.
+                from = end;
+                continue;
             }
         }
         from = at + 1;
@@ -608,5 +611,11 @@ mod tests {
         );
         let info = pdf_info_dictionary(&updated).unwrap();
         assert_eq!(pdf_string(info, "/Title").unwrap(), "Revised");
+
+        let quoting =
+            b"1 0 obj\n<< /Title (Syntax) /Subject (Explains 1 0 obj syntax) >>\nendobj\n\
+            trailer\n<< /Info 1 0 R >>";
+        let info = pdf_info_dictionary(quoting).unwrap();
+        assert_eq!(pdf_string(info, "/Title").unwrap(), "Syntax");
     }
 }
