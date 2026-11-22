@@ -647,7 +647,9 @@ fn run(cli: Cli) -> Result<()> {
                 {
                     bail!("no virtual library named `{name}`");
                 }
-                query.insert(0, format!("\"vl:{name}\""));
+                // Parenthesised, so an `or` in the query stays inside the library.
+                let name = name.replace('"', "\\\"");
+                query = vec![format!("\"vl:{name}\" ({})", query.join(" "))];
             }
             let sort = match sort {
                 Some(value) => Some(
