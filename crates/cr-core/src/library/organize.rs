@@ -424,7 +424,8 @@ impl Library {
     }
 
     /// A book's custom values by column label. Multi-valued columns list
-    /// every value; a series carries its index as `Name [2]`.
+    /// every value; a series carries its index as `Name [2]`; ratings are in
+    /// stars.
     pub fn custom_values(&self, book: i64) -> Result<BTreeMap<String, Vec<String>>> {
         let mut values = BTreeMap::new();
         for column in self.custom_columns()? {
@@ -450,7 +451,14 @@ impl Library {
                     None => value,
                 })
             })?;
-            let found: Vec<String> = rows.collect::<rusqlite::Result<_>>()?;
+            let mut found: Vec<String> = rows.collect::<rusqlite::Result<_>>()?;
+            if column.datatype == "rating" {
+                // Stored doubled; shown in stars.
+                for value in &mut found {
+                    let stars = value.parse::<f64>().unwrap_or_default() / 2.0;
+                    *value = stars.to_string();
+                }
+            }
             if !found.is_empty() {
                 values.insert(column.label, found);
             }

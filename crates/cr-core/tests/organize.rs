@@ -150,7 +150,7 @@ fn custom_columns_validate_and_round_trip() {
     let values = library.custom_values(1).unwrap();
     assert_eq!(values["medium"], ["Paper"]);
     assert_eq!(values["saga"], ["Arrakis [3]"]);
-    assert_eq!(values["mine"], ["9"]);
+    assert_eq!(values["mine"], ["4.5"]);
     assert_eq!(titles(&library, "#mine:>4"), ["Dune"]);
 
     library.set_custom_value(1, "saga", "").unwrap();
