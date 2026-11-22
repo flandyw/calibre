@@ -292,7 +292,8 @@ fn full_library_lifecycle() {
         serde_json::from_slice(&fs::read(device.catalog_path()).unwrap()).unwrap();
     assert_eq!(catalog[0]["title"], "The Hobbit (Revised)");
     assert_eq!(catalog[0]["authors"][0], "J. R. R. Tolkien");
-    assert_eq!(catalog[0]["format"], "EPUB");
+    // A Kindle cannot read EPUB, so the copy is converted for the send.
+    assert_eq!(catalog[0]["format"], "AZW3");
 
     // Remove and delete the book folder.
     let last_dir = library_path.join(library.book_path(added.id).unwrap());

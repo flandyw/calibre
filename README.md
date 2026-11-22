@@ -209,9 +209,22 @@ beginning of the "Edit book" workflow; calibre's full editor UI is not there yet
 - Detects MTP Kindles, including recent Paperwhite, Scribe and Colorsoft models,
   over USB on macOS and Linux. Enable USB file transfer on the Kindle, then
   click **Devices** in the desktop app or run `cr devices`.
-- Sends books to the device without overwriting existing files. MTP Kindle USB
-  transfers use existing AZW3, AZW, MOBI, PRC, PDF or TXT files. For an EPUB-only
-  book, run `cr convert ID book.azw3 --add` before sending.
+- Sends books to the device without overwriting existing files. A Kindle gets
+  AZW3, AZW, MOBI, PRC, PDF or TXT; other readers prefer EPUB. A book with no
+  format the device reads is converted for the send (EPUB to AZW3 for a
+  Kindle), read back to check it, and only then copied; the library is not
+  changed. `--no-convert` skips such books instead.
+- Mounted devices: free space is checked before anything is written, each file
+  is copied under a temporary name and renamed once its size is verified, and
+  `--template "{author}/{title}"` sets folders and file names (`{series}`,
+  `{series_index}` and `{id}` also work).
+- `cr device books` lists what is on the device, matched to the library, as
+  in sync, changed (the library file differs), other format (a converted copy)
+  or not in library. `cr device rm PATH...` deletes device copies, with a
+  Kindle's `.sdr` sidecar folder.
+- `cr device status` reads progress and highlights the device records: Kobo's
+  database (read from a copy, never opened in place) or a mounted Kindle's
+  `My Clippings.txt`. A Kindle over MTP does not expose these.
 - Updates mounted devices' `metadata.calibre` catalog with title, authors, series,
   tags, rating, identifiers, dates, format and size.
 - `--dry-run` previews without writing.
@@ -359,6 +372,9 @@ cr edit 12 --pack ./book-12 --output ./book-12.epub
 cr export 12 --to ~/exports --format epub --cover --opf --collision skip
 cr devices
 cr send 12 --device /media/$USER/Kindle
+cr device books
+cr device rm "documents/Old Book - Author.azw3"
+cr device status
 # With one connected device, the mount path or MTP identifier is optional.
 cr send 12
 
