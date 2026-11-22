@@ -466,6 +466,19 @@ impl Library {
         Ok(values)
     }
 
+    /// Give a book the values another copy of it had (see
+    /// [`Library::custom_values`]). Columns this library lacks, or that no
+    /// longer accept a value, are left out.
+    pub(crate) fn apply_custom_values(
+        &mut self,
+        book: i64,
+        values: &BTreeMap<String, Vec<String>>,
+    ) {
+        for (label, values) in values {
+            let _ = self.set_custom_value(book, label, &values.join(","));
+        }
+    }
+
     /// Set a book's value in a custom column; an empty value clears it.
     /// Multi-valued columns take a comma-separated list.
     pub fn set_custom_value(&mut self, book: i64, label: &str, value: &str) -> Result<()> {

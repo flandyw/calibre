@@ -157,8 +157,27 @@ fn custom_columns_validate_and_round_trip() {
     assert!(!library.custom_values(1).unwrap().contains_key("saga"));
     library.delete_custom_column("medium").unwrap();
     assert_eq!(library.custom_columns().unwrap().len(), 2);
-    // Removing a book with custom values still works.
+    // Custom values survive the trash and a copy to another library.
+    library.set_custom_value(1, "saga", "Arrakis [3]").unwrap();
     library.trash_book(1).unwrap();
+    library.restore_book(1).unwrap();
+    let values = library.custom_values(1).unwrap();
+    assert_eq!(values["saga"], ["Arrakis [3]"]);
+    assert_eq!(values["mine"], ["4.5"]);
+
+    let mut other = Library::create(&_temp.path().join("other")).unwrap();
+    other
+        .create_custom_column("saga", "Saga", "series", false, &[])
+        .unwrap();
+    let copied = library
+        .copy_book_to(1, &mut other, cr_core::library::DuplicatePolicy::Add)
+        .unwrap();
+    let cr_core::library::AddOutcome::Added(copied) = copied else {
+        panic!("not added");
+    };
+    let values = other.custom_values(copied.id).unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values["saga"], ["Arrakis [3]"]);
 }
 
 #[test]

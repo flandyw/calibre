@@ -372,9 +372,22 @@ impl Library {
         if let Some(parent) = trash.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(&directory, &trash)?;
-        if let Err(error) = self.remove_book(id, false) {
-            let _ = fs::rename(&trash, &directory);
+        // The OPF does not carry custom column values; keep them beside it.
+        let custom = self.custom_values(id)?;
+        let sidecar = directory.join(CUSTOM_VALUES_FILE);
+        if !custom.is_empty() {
+            let text = serde_json::to_vec(&custom).map_err(|e| Error::Other(e.to_string()))?;
+            fs::write(&sidecar, text)?;
+        }
+        let moved = fs::rename(&directory, &trash)
+            .map_err(Error::from)
+            .and_then(|()| {
+                self.remove_book(id, false).inspect_err(|_| {
+                    let _ = fs::rename(&trash, &directory);
+                })
+            });
+        if let Err(error) = moved {
+            let _ = fs::remove_file(&sidecar);
             return Err(error);
         }
         super::remove_empty_parent(&directory);
@@ -461,6 +474,12 @@ impl Library {
             keep_uuid: true,
         };
         let restored = self.insert_book(meta, &files, options)?;
+        let custom = fs::read(trash.join(CUSTOM_VALUES_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        if let Some(custom) = custom {
+            self.apply_custom_values(restored.id, &custom);
+        }
         let extras = trash.join(DATA_DIR);
         if extras.is_dir() {
             let target = safe_join(&self.root, &restored.path)?.join(DATA_DIR);
@@ -618,6 +637,7 @@ impl Library {
             keep_uuid: true,
         };
         let copied = target.insert_book(meta, &files, options)?;
+        target.apply_custom_values(copied.id, &self.custom_values(id)?);
         let extras = safe_join(&self.root, &self.book_path(id)?)?.join(DATA_DIR);
         if extras.is_dir() {
             copy_tree(
@@ -889,6 +909,9 @@ fn format_files(directory: &Path) -> Vec<(String, PathBuf)> {
 }
 
 const TRASH_LABEL: &str = "metadata.json";
+/// Custom column values of a trashed book. The name has no extension, so
+/// neither program takes it for a format.
+const CUSTOM_VALUES_FILE: &str = ".cr-custom";
 
 /// Formats in a `.caltrash/f/<id>/` directory: each file is named after its
 /// format.
