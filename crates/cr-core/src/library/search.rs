@@ -56,6 +56,7 @@ pub(crate) fn compile(query: &str, context: &SearchContext) -> ParsedQuery {
         sort: None,
         descending: false,
         depth: 0,
+        literal: false,
     };
     let where_sql = parser.expression();
     ParsedQuery {
@@ -135,6 +136,8 @@ struct Parser<'a> {
     sort: Option<BookSort>,
     descending: bool,
     depth: usize,
+    /// Set while compiling free text, where values have no special forms.
+    literal: bool,
 }
 
 impl Parser<'_> {
@@ -248,10 +251,13 @@ impl Parser<'_> {
     }
 
     fn free_text(&mut self, value: &str) -> String {
+        // Free text is searched for as written: `true` is a word here.
+        self.literal = true;
         let parts: Vec<String> = ["title", "authors", "tags", "series", "publisher"]
             .iter()
             .filter_map(|field| self.field(field, value))
             .collect();
+        self.literal = false;
         format!("({})", parts.join(" OR "))
     }
 
@@ -391,6 +397,10 @@ impl Parser<'_> {
             Some(source) => format!("EXISTS (SELECT 1 FROM {source} AND {test})"),
             None => test.to_string(),
         };
+        if self.literal {
+            self.params.push(like_pattern(value));
+            return exists(&format!("{column} LIKE ? ESCAPE '\\'"));
+        }
         match value {
             "true" => return exists(&format!("COALESCE({column}, '') <> ''")),
             "false" => return format!("NOT {}", exists(&format!("COALESCE({column}, '') <> ''"))),
