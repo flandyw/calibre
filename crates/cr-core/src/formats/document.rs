@@ -818,8 +818,8 @@ struct Docx<'a> {
     targets: HashMap<String, String>,
     archive: zip::ZipArchive<File>,
     images: &'a mut Images,
-    /// Number of note references seen, for their markers.
-    notes: usize,
+    /// Referenced notes as (kind, id), in the order of their markers.
+    notes: Vec<(&'static str, String)>,
 }
 
 impl Docx<'_> {
@@ -861,13 +861,24 @@ impl Docx<'_> {
                 "t" => out.push_str(&escape(&child.text)),
                 "footnoteReference" | "endnoteReference" => {
                     if let Some(id) = docx_attr(child, "id") {
-                        self.notes += 1;
-                        let kind = child.name.trim_end_matches("Reference");
+                        let kind = if child.name == "footnoteReference" {
+                            "footnote"
+                        } else {
+                            "endnote"
+                        };
+                        let known = self
+                            .notes
+                            .iter()
+                            .position(|(seen, note)| *seen == kind && note == id);
+                        let number = known.unwrap_or(self.notes.len()) + 1;
+                        let mut anchor = String::new();
+                        if known.is_none() {
+                            self.notes.push((kind, id.to_string()));
+                            anchor = format!(" id=\"cr-{kind}-ref-{}\"", escape_attribute(id));
+                        }
                         out.push_str(&format!(
-                            "<sup><a id=\"cr-{kind}-ref-{id}\" href=\"#cr-{kind}-{id}\">{}</a></sup>",
-                            self.notes,
-                            kind = kind,
-                            id = escape_attribute(id),
+                            "<sup><a{anchor} href=\"#cr-{kind}-{}\">{number}</a></sup>",
+                            escape_attribute(id),
                         ));
                     }
                 }
@@ -993,14 +1004,13 @@ impl Docx<'_> {
     }
 }
 
-fn read_docx(path: &Path, split: bool, document: &mut Document) -> Result<()> {
-    let mut archive = documents::open_zip(path)?;
-    let data = documents::zip_entry(&mut archive, "word/document.xml")
-        .ok_or_else(|| Error::InvalidMetadata("not a DOCX file: no document.xml".into()))?;
-    let root = xml::parse(&data)?;
+/// Relationship targets of a DOCX part, by relationship id.
+fn docx_targets(
+    archive: &mut zip::ZipArchive<File>,
+    entry: &str,
+) -> Result<HashMap<String, String>> {
     let mut targets = HashMap::new();
-    if let Some(relationships) = documents::zip_entry(&mut archive, "word/_rels/document.xml.rels")
-    {
+    if let Some(relationships) = documents::zip_entry(archive, entry) {
         for relationship in xml::parse(&relationships)?.descendants("Relationship") {
             if let (Some(id), Some(target)) = (relationship.attr("Id"), relationship.attr("Target"))
             {
@@ -1008,42 +1018,75 @@ fn read_docx(path: &Path, split: bool, document: &mut Document) -> Result<()> {
             }
         }
     }
+    Ok(targets)
+}
+
+fn read_docx(path: &Path, split: bool, document: &mut Document) -> Result<()> {
+    let mut archive = documents::open_zip(path)?;
+    let data = documents::zip_entry(&mut archive, "word/document.xml")
+        .ok_or_else(|| Error::InvalidMetadata("not a DOCX file: no document.xml".into()))?;
+    let root = xml::parse(&data)?;
+    let targets = docx_targets(&mut archive, "word/_rels/document.xml.rels")?;
     let mut images = Images::default();
     let mut docx = Docx {
         targets,
         archive,
         images: &mut images,
-        notes: 0,
+        notes: Vec::new(),
     };
     let mut sections = vec![String::new()];
     let body = root.child("body").unwrap_or(&root);
     docx.blocks(body, split, &mut sections);
-    if docx.notes > 0 {
-        let mut notes = String::new();
-        for (kind, entry) in [
-            ("footnote", "word/footnotes.xml"),
-            ("endnote", "word/endnotes.xml"),
-        ] {
-            let Some(data) = documents::zip_entry(&mut docx.archive, entry) else {
+    let referenced = std::mem::take(&mut docx.notes);
+    let mut notes = String::new();
+    for (kind, entry, relationships) in [
+        (
+            "footnote",
+            "word/footnotes.xml",
+            "word/_rels/footnotes.xml.rels",
+        ),
+        (
+            "endnote",
+            "word/endnotes.xml",
+            "word/_rels/endnotes.xml.rels",
+        ),
+    ] {
+        if !referenced.iter().any(|(seen, _)| *seen == kind) {
+            continue;
+        }
+        let Some(data) = documents::zip_entry(&mut docx.archive, entry) else {
+            continue;
+        };
+        // A notes part has its own relationships.
+        docx.targets = docx_targets(&mut docx.archive, relationships)?;
+        let root = xml::parse(&data)?;
+        let bodies: HashMap<&str, &Node> = root
+            .descendants(kind)
+            .into_iter()
+            // Separators are layout, not notes.
+            .filter(|note| matches!(docx_attr(note, "type"), None | Some("normal")))
+            .filter_map(|note| Some((docx_attr(note, "id")?, note)))
+            .collect();
+        for (number, (_, id)) in referenced
+            .iter()
+            .enumerate()
+            .filter(|(_, (seen, _))| *seen == kind)
+        {
+            let Some(note) = bodies.get(id.as_str()) else {
                 continue;
             };
-            for note in xml::parse(&data)?.descendants(kind) {
-                // Separators are layout, not notes.
-                let (Some(id), None) = (docx_attr(note, "id"), docx_attr(note, "type")) else {
-                    continue;
-                };
-                let mut content = vec![String::new()];
-                docx.blocks(note, false, &mut content);
-                let id = escape_attribute(id);
-                notes.push_str(&format!(
-                    "<div id=\"cr-{kind}-{id}\">{}<p><a href=\"#cr-{kind}-ref-{id}\">\u{21a9}</a></p></div>\n",
-                    content.concat()
-                ));
-            }
+            let mut content = vec![String::new()];
+            docx.blocks(note, false, &mut content);
+            let id = escape_attribute(id);
+            notes.push_str(&format!(
+                "<div id=\"cr-{kind}-{id}\"><p><a href=\"#cr-{kind}-ref-{id}\">{}.</a></p>{}</div>\n",
+                number + 1,
+                content.concat()
+            ));
         }
-        if !notes.is_empty() {
-            sections.push(format!("<h2>Notes</h2>\n{notes}"));
-        }
+    }
+    if !notes.is_empty() {
+        sections.push(format!("<h2>Notes</h2>\n{notes}"));
     }
     for html in sections {
         if !html.trim().is_empty() {

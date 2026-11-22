@@ -463,11 +463,19 @@ fn docx_notes_are_kept_and_linked() {
         &[
             (
                 "word/document.xml",
-                r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>Claim</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p></w:body></w:document>"#,
+                r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>Claim</w:t></w:r><w:r><w:footnoteReference w:id="3"/></w:r><w:r><w:t>Other</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p></w:body></w:document>"#,
+            ),
+            (
+                "word/_rels/document.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="https://wrong.example/"/></Relationships>"#,
+            ),
+            (
+                "word/_rels/footnotes.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="https://right.example/"/></Relationships>"#,
             ),
             (
                 "word/footnotes.xml",
-                r#"<w:footnotes xmlns:w="w"><w:footnote w:type="separator" w:id="0"><w:p><w:r><w:t>sep</w:t></w:r></w:p></w:footnote><w:footnote w:id="2"><w:p><w:r><w:footnoteRef/><w:t>The source.</w:t></w:r></w:p></w:footnote></w:footnotes>"#,
+                r#"<w:footnotes xmlns:w="w" xmlns:r="r"><w:footnote w:type="separator" w:id="0"><w:p><w:r><w:t>sep</w:t></w:r></w:p></w:footnote><w:footnote w:id="2"><w:p><w:r><w:footnoteRef/><w:t>Second.</w:t></w:r></w:p></w:footnote><w:footnote w:type="normal" w:id="3"><w:p><w:hyperlink r:id="rId1"><w:r><w:t>First.</w:t></w:r></w:hyperlink></w:p></w:footnote></w:footnotes>"#,
             ),
         ],
     );
@@ -476,10 +484,18 @@ fn docx_notes_are_kept_and_linked() {
     assert_well_formed(&epub);
     let first = entry(&epub, "OEBPS/section0001.xhtml");
     assert!(first.contains(
-        r##"Claim<sup><a id="cr-footnote-ref-2" href="section0002.xhtml#cr-footnote-2">1</a></sup>"##
+        r##"Claim<sup><a id="cr-footnote-ref-3" href="section0002.xhtml#cr-footnote-3">1</a></sup>"##
     ));
     let notes = entry(&epub, "OEBPS/section0002.xhtml");
-    assert!(notes.contains(r#"<div id="cr-footnote-2"><p>The source.</p>"#));
-    assert!(notes.contains(r##"href="section0001.xhtml#cr-footnote-ref-2""##));
+    assert!(notes.contains(r#"<div id="cr-footnote-2"><p><a href="section0001.xhtml#cr-footnote-ref-2">2.</a></p><p>Second.</p>"#));
+    assert!(notes.contains(r#"<a href="https://right.example/">First.</a>"#));
     assert!(!notes.contains("sep"));
+
+    // Notes are numbered and in the order of their markers in plain text.
+    let text = temp.path().join("notes.txt");
+    convert(&source, &text).unwrap();
+    let text = fs::read_to_string(text).unwrap();
+    let (one, two) = (text.find("1.").unwrap(), text.find("2.").unwrap());
+    assert!(one < text.find("First.").unwrap() && text.find("First.").unwrap() < two);
+    assert!(two < text.find("Second.").unwrap());
 }
