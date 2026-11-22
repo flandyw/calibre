@@ -1,0 +1,39 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  release:
+    name: Release ${{ matrix.name }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+          - name: macos-arm64
+            os: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release binaries (${{ matrix.name }})
+        run: cargo build --release --workspace
+
+      - name: Write run summary
+        run: |
+          binary_size=$(ls -lh target/release/cr | awk '{print $5}')
+          rust_version=$(rustc --version)
+          {
+            echo "### Release build: ${{ matrix.name }}"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Platform | \`${{ matrix.name }}\` |"
+            echo "| Runner | \`${{ matrix.os }}\` |"
+            echo "| Binary | \`target/release/cr\` (${binary_size}) |"
+            echo "| Toolchain | \`${rust_version}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
