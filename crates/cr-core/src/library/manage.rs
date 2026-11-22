@@ -22,7 +22,9 @@ use crate::opf;
 use crate::text;
 
 /// Where removed books and formats wait until they are purged. The layout
-/// (`.caltrash/b/<id>/`, `.caltrash/f/<id>/`) is calibre's.
+/// is calibre's: `.caltrash/b/<id>/` holds a removed book's folder, and
+/// `.caltrash/f/<id>/` holds removed formats, each in a file named after the
+/// format, next to a `metadata.json` with the book's title and authors.
 pub const TRASH_DIR: &str = ".caltrash";
 /// Per-book directory for extra files, as calibre names it.
 pub const DATA_DIR: &str = "data";
@@ -301,10 +303,14 @@ impl Library {
         if let Some(path) = path {
             let trash = self.trash_dir('f', id);
             fs::create_dir_all(&trash)?;
-            let target = trash.join(format!("{}.{}", id, format.to_ascii_lowercase()));
+            let target = trash.join(format.to_ascii_lowercase());
             if fs::rename(&path, &target).is_err() {
                 copy_atomic(&path, &target)?;
                 fs::remove_file(&path)?;
+            }
+            if let Ok(meta) = self.get_metadata(id) {
+                let label = serde_json::json!({"title": meta.title, "authors": meta.authors});
+                write_atomic(&trash.join(TRASH_LABEL), label.to_string().as_bytes())?;
             }
         }
         self.sync_book(id)
@@ -360,21 +366,31 @@ impl Library {
                 if !path.is_dir() {
                     continue;
                 }
-                let meta = fs::read(path.join(METADATA_FILE))
-                    .ok()
-                    .and_then(|bytes| opf::parse_opf(&bytes).ok());
-                let (title, authors) = match meta {
-                    Some(meta) => (meta.title, meta.authors),
-                    None if is_book => ("Unknown".to_string(), Vec::new()),
-                    None => match self.get_metadata(id) {
-                        Ok(meta) => (meta.title, meta.authors),
-                        Err(_) => ("Unknown".to_string(), Vec::new()),
-                    },
+                let (title, authors, formats): (String, Vec<String>, Vec<String>) = if is_book {
+                    let meta = fs::read(path.join(METADATA_FILE))
+                        .ok()
+                        .and_then(|bytes| opf::parse_opf(&bytes).ok());
+                    let formats = format_files(&path).into_iter().map(|file| file.0);
+                    match meta {
+                        Some(meta) => (meta.title, meta.authors, formats.collect()),
+                        None => ("Unknown".to_string(), Vec::new(), formats.collect()),
+                    }
+                } else {
+                    let label: serde_json::Value = fs::read(path.join(TRASH_LABEL))
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        .unwrap_or_default();
+                    let authors = label["authors"]
+                        .as_array()
+                        .map(|names| {
+                            let names = names.iter().filter_map(|name| name.as_str());
+                            names.map(str::to_string).collect()
+                        })
+                        .unwrap_or_default();
+                    let title = label["title"].as_str().unwrap_or("Unknown").to_string();
+                    let formats = trashed_formats(&path).into_iter().map(|file| file.0);
+                    (title, authors, formats.collect())
                 };
-                let formats: Vec<String> = format_files(&path)
-                    .into_iter()
-                    .map(|(format, _)| format)
-                    .collect();
                 if !is_book && formats.is_empty() {
                     continue;
                 }
@@ -423,14 +439,16 @@ impl Library {
     pub fn restore_format(&mut self, id: i64, format: &str) -> Result<()> {
         self.writable()?;
         let trash = self.trash_dir('f', id);
-        let file = format_files(&trash)
+        let file = trashed_formats(&trash)
             .into_iter()
             .find(|(have, _)| have.eq_ignore_ascii_case(format))
             .map(|(_, path)| path)
             .ok_or_else(|| Error::Other(format!("no {format} of book {id} in the trash")))?;
         self.replace_format(id, &format.to_ascii_uppercase(), &file)?;
         fs::remove_file(&file)?;
-        let _ = fs::remove_dir(&trash);
+        if trashed_formats(&trash).is_empty() {
+            let _ = fs::remove_dir_all(&trash);
+        }
         Ok(())
     }
 
@@ -810,6 +828,26 @@ fn format_files(directory: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(|path| {
             let extension = path.extension()?.to_str()?.to_ascii_uppercase();
             Some((extension, path))
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+const TRASH_LABEL: &str = "metadata.json";
+
+/// Formats in a `.caltrash/f/<id>/` directory: each file is named after its
+/// format.
+fn trashed_formats(directory: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(children) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, PathBuf)> = children
+        .filter_map(|child| child.ok())
+        .filter(|child| child.file_name() != TRASH_LABEL && child.path().is_file())
+        .map(|child| {
+            let name = child.file_name().to_string_lossy().to_ascii_uppercase();
+            (name, child.path())
         })
         .collect();
     files.sort();

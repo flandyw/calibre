@@ -81,6 +81,9 @@ enum Command {
         action: String,
         /// Books to restore, or to delete permanently with `empty`
         ids: Vec<i64>,
+        /// With `restore`: put this removed format back on the book
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Apply one metadata change to many books
     Bulk(BulkArgs),
@@ -460,7 +463,11 @@ fn run(cli: Cli) -> Result<()> {
             library.remove_format(id, &format)?;
             println!("Removed {} from #{id}", format.to_ascii_uppercase());
         }
-        Command::Trash { action, ids } => {
+        Command::Trash {
+            action,
+            ids,
+            format,
+        } => {
             let mut library = Library::open(&library_path)?;
             match action.as_str() {
                 "list" => {
@@ -496,6 +503,11 @@ fn run(cli: Cli) -> Result<()> {
                         bail!("no book ids given");
                     }
                     for id in ids {
+                        if let Some(format) = &format {
+                            library.restore_format(id, format)?;
+                            println!("Restored {} of #{id}", format.to_ascii_uppercase());
+                            continue;
+                        }
                         let restored = library.restore_book(id)?;
                         println!("Restored #{}\t{}", restored.id, restored.title);
                     }
