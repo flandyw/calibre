@@ -10,7 +10,7 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::error::{Error, Result};
-use crate::formats::{decode_markup, html, BookText, Chapter};
+use crate::formats::{decode_markup, html, BookText};
 use crate::metadata::Metadata;
 use crate::opf;
 use crate::xml;
@@ -55,15 +55,9 @@ pub fn text(path: &Path) -> Result<BookText> {
             Err(_) => continue,
         };
         let markup = decode_markup(&data);
-        let body = html::html_to_text(&markup);
-        if body.trim().is_empty() {
-            continue;
+        if let Some(chapter) = html::chapter(&markup, chapters.len() + 1) {
+            chapters.push(chapter);
         }
-        let title = html::first_heading(&markup)
-            .or_else(|| html::document_title(&markup))
-            .unwrap_or_else(|| format!("Chapter {}", chapters.len() + 1));
-        let body = remove_leading_heading(&body, &title);
-        chapters.push(Chapter { title, text: body });
     }
 
     Ok(BookText { chapters })
@@ -156,17 +150,8 @@ fn read_package(path: &Path) -> Result<Package> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
-    let container_data = read_entry(&mut archive, "META-INF/container.xml")
-        .map_err(|_| Error::InvalidEpub("missing META-INF/container.xml".into()))?;
-    let container = xml::parse(&container_data)?;
-    let rootfile = container
-        .descendant("rootfile")
-        .ok_or_else(|| Error::InvalidEpub("container.xml has no rootfile".into()))?;
-    let opf_path = rootfile
-        .attr("full-path")
-        .ok_or_else(|| Error::InvalidEpub("rootfile has no full-path".into()))?
-        .trim_start_matches('/')
-        .to_string();
+    let container_data = read_entry(&mut archive, "META-INF/container.xml")?;
+    let opf_path = package_path(&container_data)?;
     let opf_data = read_entry(&mut archive, &opf_path)
         .map_err(|_| Error::InvalidEpub(format!("missing OPF at {opf_path}")))?;
 
@@ -257,16 +242,15 @@ fn read_package(path: &Path) -> Result<Package> {
     })
 }
 
-/// Chapter headings are already reported as the chapter title; drop a
-/// duplicate heading at the start of the body text.
-fn remove_leading_heading(body: &str, title: &str) -> String {
-    let mut lines = body.lines();
-    if let Some(first) = lines.next() {
-        if first.trim().eq_ignore_ascii_case(title.trim()) {
-            return lines.collect::<Vec<_>>().join("\n").trim().to_string();
-        }
-    }
-    body.to_string()
+pub(super) fn package_path(container: &[u8]) -> Result<String> {
+    let container = xml::parse(container)?;
+    let rootfile = container
+        .descendant("rootfile")
+        .ok_or_else(|| Error::InvalidEpub("container.xml has no rootfile".into()))?;
+    rootfile
+        .attr("full-path")
+        .map(|path| path.trim_start_matches('/').to_string())
+        .ok_or_else(|| Error::InvalidEpub("rootfile has no full-path".into()))
 }
 
 fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {

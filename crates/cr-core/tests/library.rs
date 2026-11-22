@@ -77,6 +77,72 @@ fn build_epub(path: &Path) {
 }
 
 #[test]
+fn kindle_round_trip_preserves_chapters_and_cover() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source.epub");
+    build_epub(&source);
+    let expected = formats::extract_text(&source, None).unwrap();
+    let mut library = Library::create(&temp.path().join("library")).unwrap();
+
+    for extension in ["azw3", "mobi"] {
+        let kindle = temp.path().join(format!("book.{extension}"));
+        formats::convert(&source, &kindle).unwrap();
+        let extensionless = temp.path().join("unnamed");
+        fs::copy(&kindle, &extensionless).unwrap();
+        assert_eq!(
+            formats::detect_format(&extensionless),
+            extension.to_uppercase()
+        );
+
+        let added = library.add_book(&kindle).unwrap();
+        assert_eq!(added.title, "The Hobbit");
+        assert_eq!(added.authors, ["J. R. R. Tolkien"]);
+        assert_eq!(added.formats, [extension.to_uppercase()]);
+        assert!(library.cover(added.id).unwrap().is_some());
+        assert_eq!(library.read_book(added.id, None).unwrap(), expected);
+
+        let recovered = temp.path().join(format!("recovered-{extension}.epub"));
+        formats::convert(&kindle, &recovered).unwrap();
+        assert_eq!(formats::extract_text(&recovered, None).unwrap(), expected);
+        assert!(formats::import(&recovered)
+            .unwrap()
+            .metadata
+            .cover
+            .is_some());
+
+        let plain = temp.path().join(format!("recovered-{extension}.txt"));
+        formats::convert(&kindle, &plain).unwrap();
+        let text = fs::read_to_string(&plain).unwrap();
+        assert!(text.contains("An Unexpected Party\n\nIn a hole"));
+        assert!(text.contains("Roast Mutton\n\nThere and back again."));
+    }
+}
+
+#[test]
+fn kindle_conversion_keeps_existing_output_and_rejects_drm() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source.epub");
+    let kindle = temp.path().join("book.azw3");
+    build_epub(&source);
+    formats::convert(&source, &kindle).unwrap();
+    let original = fs::read(&kindle).unwrap();
+    assert!(formats::convert(&source, &kindle).is_err());
+    assert_eq!(fs::read(&kindle).unwrap(), original);
+
+    let mut encrypted = original;
+    let offset = u32::from_be_bytes(encrypted[78..82].try_into().unwrap()) as usize;
+    encrypted[offset + 12..offset + 14].copy_from_slice(&2_u16.to_be_bytes());
+    fs::write(&kindle, encrypted).unwrap();
+    assert!(formats::extract_text(&kindle, None)
+        .unwrap_err()
+        .to_string()
+        .contains("DRM-protected"));
+    let destination = temp.path().join("recovered.epub");
+    assert!(formats::convert(&kindle, &destination).is_err());
+    assert!(!destination.exists());
+}
+
+#[test]
 fn full_library_lifecycle() {
     let temp = tempdir().unwrap();
     let library_path = temp.path().join("library");

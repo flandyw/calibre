@@ -642,8 +642,13 @@ impl Library {
             .unwrap_or_else(|| text::format_file_stem(&meta.title, meta.first_author()));
         let extension = format.to_ascii_lowercase();
         let destination = directory.join(format!("{stem}.{extension}"));
-        if source != destination {
-            fs::copy(source, &destination)?;
+        let source = source.canonicalize()?;
+        if destination.canonicalize().ok().as_ref() != Some(&source) {
+            let temporary = tempfile::NamedTempFile::new_in(&directory)?;
+            fs::copy(source, temporary.path())?;
+            temporary
+                .persist(&destination)
+                .map_err(|error| error.error)?;
         }
         let size = fs::metadata(&destination).map(|m| m.len()).unwrap_or(0) as i64;
         self.conn.execute(

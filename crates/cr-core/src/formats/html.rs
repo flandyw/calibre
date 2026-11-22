@@ -1,6 +1,28 @@
 //! Minimal HTML/XHTML handling: enough to read EPUB chapters and HTML files
 //! without a full browser engine.
 
+use super::Chapter;
+
+pub(super) fn chapter(markup: &str, number: usize) -> Option<Chapter> {
+    let body = html_to_text(markup);
+    if body.trim().is_empty() {
+        return None;
+    }
+    let title = first_heading(markup)
+        .or_else(|| document_title(markup))
+        .unwrap_or_else(|| format!("Chapter {number}"));
+    let mut lines = body.lines();
+    let text = if lines
+        .next()
+        .is_some_and(|first| first.trim().eq_ignore_ascii_case(title.trim()))
+    {
+        lines.collect::<Vec<_>>().join("\n").trim().to_string()
+    } else {
+        body
+    };
+    Some(Chapter { title, text })
+}
+
 /// Tags that start a new paragraph when converting HTML to text.
 const BLOCK_TAGS: [&str; 26] = [
     "address",

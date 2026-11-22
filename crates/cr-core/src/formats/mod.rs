@@ -1,9 +1,13 @@
 //! Ebook format detection, metadata import and text extraction.
 
+mod conversion;
 pub mod epub;
 pub mod fb2;
 pub mod html;
+mod mobi;
 pub mod txt;
+
+pub use conversion::convert;
 
 use std::fs::File;
 use std::io::Read;
@@ -55,7 +59,6 @@ pub fn detect_format(path: &Path) -> String {
         let upper = ext.trim().to_ascii_uppercase();
         return match upper.as_str() {
             "HTM" | "XHTML" | "XHT" => "HTML".to_string(),
-            "AZW" | "AZW3" | "MOBI" | "PRC" => "MOBI".to_string(),
             other if !other.is_empty() => other.to_string(),
             _ => sniff_format(path).unwrap_or_else(|| "UNKNOWN".to_string()),
         };
@@ -65,9 +68,8 @@ pub fn detect_format(path: &Path) -> String {
 
 fn sniff_format(path: &Path) -> Option<String> {
     let mut file = File::open(path).ok()?;
-    let mut magic = [0u8; 8];
-    let read = file.read(&mut magic).ok()?;
-    let magic = &magic[..read];
+    let mut magic = Vec::new();
+    file.by_ref().take(68).read_to_end(&mut magic).ok()?;
     if magic.starts_with(b"%PDF-") {
         return Some("PDF".to_string());
     }
@@ -87,8 +89,8 @@ fn sniff_format(path: &Path) -> Option<String> {
             }
         };
     }
-    if magic.starts_with(b"BOOKMOBI") || magic.starts_with(b"TEXtREAd") {
-        return Some("MOBI".to_string());
+    if let Some(kind) = mobi::sniff(&mut file, &magic) {
+        return Some(kind.to_string());
     }
     None
 }
@@ -104,6 +106,9 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
         "FB2" => fb2::read(path)?,
         "TXT" => (txt::metadata(path), None),
         "HTML" => (html_metadata(path)?, None),
+        "AZW3" | "AZW" | "MOBI" | "PRC" => {
+            mobi::metadata(path).unwrap_or_else(|_| (txt::filename_metadata(path), None))
+        }
         _ => (txt::filename_metadata(path), None),
     };
     metadata.format = Some(format.clone());
@@ -124,13 +129,14 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
 /// Extract readable text from a book in its own format.
 pub fn extract_text(path: &Path, format: Option<&str>) -> Result<BookText> {
     let format = format
-        .map(str::to_string)
+        .map(str::to_ascii_uppercase)
         .unwrap_or_else(|| detect_format(path));
     match format.as_str() {
         "EPUB" => epub::text(path),
         "FB2" => fb2::text(path),
         "TXT" => txt::text(path),
         "HTML" => txt::html_text(path),
+        "AZW3" | "AZW" | "MOBI" | "PRC" => mobi::text(path),
         other => Err(Error::UnsupportedFormat(format!(
             "{other} text extraction is not implemented yet"
         ))),
@@ -199,7 +205,9 @@ mod tests {
     fn detects_formats() {
         assert_eq!(detect_format(Path::new("book.epub")), "EPUB");
         assert_eq!(detect_format(Path::new("book.xhtml")), "HTML");
-        assert_eq!(detect_format(Path::new("book.azw3")), "MOBI");
+        assert_eq!(detect_format(Path::new("book.azw3")), "AZW3");
+        assert_eq!(detect_format(Path::new("book.azw")), "AZW");
+        assert_eq!(detect_format(Path::new("book.prc")), "PRC");
         assert_eq!(detect_format(Path::new("book.unknownext")), "UNKNOWNEXT");
     }
 

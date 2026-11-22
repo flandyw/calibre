@@ -25,16 +25,16 @@ Clone the Python source along with this project using
 
 `cr` is one native binary. There is no Python runtime, no Qt, no external
 converter process and no background service. The only data store is SQLite
-(compiled in), and books are read directly from their EPUB/FB2/TXT/HTML files.
+(compiled in), and books are read directly from their EPUB, Kindle, FB2, TXT or
+HTML files.
 
 | Measurement | Result |
 |---|---|
 | Release binary (Linux x86-64, LTO + strip) | **4.3 MB** |
 | `cr info` startup / peak RSS (`/usr/bin/time`) | **< 10 ms** / **5.5 MB** |
 
-These are local measurements of `cr`, not a benchmark against calibre (which is
-not installed in this environment). A proper large-library benchmark is on the
-roadmap.
+These local measurements predate Kindle conversion support. A large-library
+benchmark is on the roadmap.
 
 ## What works
 
@@ -60,6 +60,7 @@ triggers work unchanged.
 Import from:
 
 - **EPUB** — OPF metadata, cover images, series, tags, identifiers, languages.
+- **AZW3, AZW, MOBI and PRC** — embedded metadata and cover images when available.
 - **FB2** — title/author/series/genre/annotation, embedded cover.
 - **TXT** — filename-derived metadata.
 - **HTML/XHTML** — `<title>`, author/language/keywords meta tags.
@@ -79,12 +80,26 @@ rewrites `metadata.opf`, exactly as calibre expects.
 `cr read` converts a book to terminal text:
 
 - EPUB in **spine order** (XHTML → text, chapter headings detected).
+- AZW3, AZW, MOBI and PRC, including KF8 chapters in reading order.
 - FB2 sections.
 - TXT with chapter-heading heuristics.
 - HTML.
 
 `--list` shows chapters and word counts, `--chapter N` reads one, `--all` reads
 everything, and `--width` controls wrapping.
+
+### Conversion
+
+`cr convert INPUT OUTPUT` selects the target by the output extension. It uses
+[Kindling](https://github.com/ciscoriordan/kindling) to convert EPUB to AZW3 or
+dual-format MOBI, and bundled [libmobi](https://github.com/bfabiszewski/libmobi)
+to convert AZW3, AZW, MOBI or PRC to EPUB or plain text. Kindle reading and
+conversion require DRM-free files.
+
+`INPUT` can be a filename or a library book ID. With a book ID, use
+`--from FORMAT` to choose the source format and `--add` to store the result on
+the same book. The output path must be new. `--add` replaces the stored copy of
+the target format if the book already has one.
 
 ### Editing
 
@@ -97,9 +112,13 @@ beginning of the "Edit book" workflow; calibre's full editor UI is not there yet
 
 - Detects Kindle (`system/` + `documents/`), Kobo (`.kobo`) and generic USB
   readers with a `documents/` directory under common mount points.
-- Sends the preferred format (EPUB, AZW3, MOBI, PDF, HTML, TXT, FB2) or a chosen
-  one, avoiding filename collisions.
-- Updates the device's `metadata.calibre` catalog with title, authors, series,
+- Detects MTP Kindles, including recent Paperwhite, Scribe and Colorsoft models,
+  over USB on macOS and Linux. Enable USB file transfer on the Kindle, then
+  click **Devices** in the desktop app or run `cr devices`.
+- Sends books to the device without overwriting existing files. MTP Kindle USB
+  transfers use existing AZW3, AZW, MOBI, PRC, PDF or TXT files. For an EPUB-only
+  book, run `cr convert ID book.azw3 --add` before sending.
+- Updates mounted devices' `metadata.calibre` catalog with title, authors, series,
   tags, rating, identifiers, dates, format and size.
 - `--dry-run` previews without writing.
 
@@ -119,7 +138,9 @@ beginning of the "Edit book" workflow; calibre's full editor UI is not there yet
   picker using the same path template as `cr export`;
 - a basic EPUB source editor: unpack, edit XHTML/CSS/OPF files, save changes
   and repack into the library, with a save/discard prompt when closing;
-- a chapter-by-chapter reader for EPUB, FB2, TXT and HTML;
+- a chapter-by-chapter reader for EPUB, Kindle books, FB2, TXT and HTML;
+- EPUB-to-AZW3 and Kindle-to-EPUB conversion from the selected book's Formats
+  row, with a save dialog;
 - device discovery and one-click send;
 - light/dark theme switching.
 
@@ -129,7 +150,8 @@ only builds and tests the engine and CLI.
 
 ## Build and install
 
-Requires a recent stable Rust toolchain (1.80+). SQLite is bundled.
+Requires a recent stable Rust toolchain (1.90+) and a C compiler. SQLite and
+libmobi are bundled.
 
 ```bash
 cargo test --workspace
@@ -155,8 +177,24 @@ cd crates/cr-gui
 cargo run
 ```
 
-The window opens with `~/Calibre Library` if it exists. Open another library
-with the path field, `Browse...`, or create one with `New`.
+The window reopens the last library you used, or `~/Calibre Library` if it
+exists. Use File → Open Library (⇧⌘O) or New Library (⇧⌘N) for others, or
+drop a library folder onto the window. Press ⌘/ for every keyboard shortcut.
+
+### macOS app bundle
+
+```bash
+crates/cr-gui/packaging/macos/bundle.sh          # release build
+crates/cr-gui/packaging/macos/bundle.sh --open   # build, then launch
+```
+
+This writes `crates/cr-gui/target/release/bundle/calibre-rust.app`, with the
+app icon and file associations ("Open With" for ebooks, and for folders so a
+calibre library can be opened from Finder). It is signed ad hoc, which is
+enough to run it on the Mac that built it; copy it to `/Applications` to keep
+it. Sharing it with other Macs needs a Developer ID signature and
+notarization. The icon is drawn by `packaging/macos/make-icon.swift`; pass
+`--redraw-icon` to regenerate `icon-1024.png` after editing it.
 
 ## Quick start
 
@@ -181,6 +219,11 @@ cr set 12 --author "Ursula K. Le Guin" --tag "Fantasy,Classic" \
 cr read 12 --list
 cr read 12 --chapter 3 --width 88
 
+# Convert and optionally store the result on an existing library book
+cr convert book.epub book.azw3
+cr convert book.azw3 book.txt
+cr convert 12 book-for-kindle.azw3 --add
+
 # Edit an EPUB
 cr edit 12 --extract ./book-12
 # ... edit ./book-12/OEBPS/... ...
@@ -190,6 +233,8 @@ cr edit 12 --pack ./book-12 --output ./book-12.epub
 cr export 12 --to ~/exports
 cr devices
 cr send 12 --device /media/$USER/Kindle
+# With one connected device, the mount path or MTP identifier is optional.
+cr send 12
 
 # JSON for scripts
 cr --json list
@@ -233,8 +278,9 @@ cr-cli  (clap)
         │   ├── epub   OPF + cover + spine text + unpack/repack
         │   ├── fb2    FictionBook metadata, cover, sections
         │   ├── html   HTML → text, headings, meta tags
+        │   ├── mobi   Kindle metadata, cover, and chapter reconstruction
         │   └── txt    encoding detection, chapter heuristics
-        └── device     mount detection, copy + metadata.calibre
+        └── device     mount and Kindle MTP detection, book transfer
 ```
 
 The engine API is usable independently of the CLI:
@@ -252,11 +298,12 @@ for summary in library.list_books(&ListOptions::default())? {
 
 ## Tests
 
-`cargo test --workspace` runs **43 tests**:
+`cargo test --workspace` covers:
 
 - sorting, filenames and path conventions;
 - XML/OPF parsing and round-tripping;
-- EPUB, FB2, TXT and HTML metadata/text;
+- EPUB, Kindle, FB2, TXT and HTML metadata/text, plus Kindle conversion
+  round trips;
 - a full library lifecycle: create a calibre v28 DB, import an EPUB with a PNG
   cover, search, edit metadata (directory + OPF rename), unpack/edit/repack the
   EPUB, export, send to a fake Kindle and remove;
@@ -271,9 +318,8 @@ Currently missing:
 
 - **GUI polish** — the GPUI front end has a basic text-based EPUB editor, but
   no visual editor, bulk metadata actions or cover-generation tools yet.
-- **Format conversion** (EPUB ↔ AZW3/MOBI, PDF, DOCX, ...).
-- PDF/MOBI/AZW3 metadata and text extraction (they can be stored and sent, but
-  import falls back to filename metadata).
+- Format conversion outside the EPUB and Kindle paths above.
+- PDF metadata and text extraction.
 - calibre's plugin system, content server/OPDS, annotations, full-text search,
   custom columns, virtual libraries, saved searches and the complete search
   language.
@@ -285,7 +331,7 @@ Currently missing:
 
 1. Polish the GPUI app: visual EPUB editing, bulk actions and a richer crop
    surface with drag handles.
-2. Native EPUB ↔ AZW3/MOBI conversion and PDF/DOCX text extraction.
+2. PDF/DOCX text extraction.
 3. Calibre custom columns and saved searches.
 4. OPDS/content server and annotation sync.
 5. Benchmarks against calibre on a 10k-book library, with a compatibility test

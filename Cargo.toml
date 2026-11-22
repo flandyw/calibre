@@ -8,7 +8,7 @@ exclude = ["crates/cr-gui"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.90"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/calibre-rust/calibre-rust"
 description = "A small, fast, Rust reimplementation of calibre's core ebook management"

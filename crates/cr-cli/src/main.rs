@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -91,6 +91,19 @@ enum Command {
         #[arg(long, default_value_t = 80)]
         width: usize,
     },
+    /// Convert EPUB to AZW3/MOBI or Kindle files to EPUB/TXT
+    Convert {
+        /// Input file or library book ID
+        input: PathBuf,
+        /// New output file (.azw3, .mobi, .epub or .txt)
+        output: PathBuf,
+        /// Source format to use for a library book
+        #[arg(long)]
+        from: Option<String>,
+        /// Store the converted file on the same library book, replacing that format if present
+        #[arg(long)]
+        add: bool,
+    },
     /// Save a book's cover image
     Cover {
         id: i64,
@@ -134,7 +147,7 @@ enum Command {
     /// Send books to a connected e-reader
     Send {
         ids: Vec<i64>,
-        /// Device mount point (auto-detected when omitted)
+        /// Mount path or MTP identifier from `cr devices` (auto-detected when omitted)
         #[arg(long)]
         device: Option<PathBuf>,
         /// Format to send (default: preferred available format)
@@ -371,6 +384,14 @@ fn run(cli: Cli) -> Result<()> {
             all,
             width,
         } => read_book(&library_path, id, format, chapter, list, all, width)?,
+        Command::Convert {
+            input,
+            output,
+            from,
+            add,
+        } => {
+            convert_book(&library_path, input, output, from, add, cli.json)?;
+        }
         Command::Cover { id, output } => {
             let library = Library::open(&library_path)?;
             let data = library
@@ -415,7 +436,7 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Devices => {
-            let devices = device::discover();
+            let devices = device::discover()?;
             if cli.json {
                 print_json(&json!(devices
                     .iter()
@@ -479,11 +500,13 @@ fn run(cli: Cli) -> Result<()> {
                 for (id, reason) in &report.skipped {
                     eprintln!("skipped #{id}: {reason}");
                 }
-                println!(
-                    "Catalog: {}{}",
-                    report.catalog.display(),
-                    if dry_run { " (not written)" } else { "" }
-                );
+                if let Some(catalog) = &report.catalog {
+                    println!(
+                        "Catalog: {}{}",
+                        catalog.display(),
+                        if dry_run { " (not written)" } else { "" }
+                    );
+                }
             }
         }
         Command::Info => {
@@ -648,6 +671,60 @@ fn edit_metadata(library: &mut Library, args: SetArgs, json: bool) -> Result<()>
     Ok(())
 }
 
+fn convert_book(
+    library_path: &Path,
+    input: PathBuf,
+    output: PathBuf,
+    from: Option<String>,
+    add: bool,
+    json: bool,
+) -> Result<()> {
+    let id = input
+        .to_str()
+        .filter(|_| !input.exists())
+        .and_then(|input| input.parse::<i64>().ok());
+    let target = text::format_from_path(&output)
+        .ok_or_else(|| anyhow!("give the output a .azw3, .mobi, .epub or .txt extension"))?;
+    if let Some(id) = id {
+        let mut library = Library::open(library_path)?;
+        let kindle_formats = ["AZW3", "AZW", "MOBI", "PRC"];
+        let from = from.as_deref();
+        let candidates = if from.is_some() {
+            from.as_slice()
+        } else {
+            match target.as_str() {
+                "AZW3" | "MOBI" => &["EPUB"][..],
+                "EPUB" | "TXT" => &kindle_formats[..],
+                _ => bail!("unsupported conversion target {target}"),
+            }
+        };
+        let mut source = None;
+        for format in candidates {
+            if let Some(path) = library.format_path(id, format)? {
+                source = Some(path);
+                break;
+            }
+        }
+        let source = source
+            .ok_or_else(|| anyhow!("book {id} has no input file in {}", candidates.join(", ")))?;
+        cr_core::formats::convert(&source, &output)?;
+        if add {
+            library.replace_format(id, &target, &output)?;
+        }
+    } else {
+        if add || from.is_some() {
+            bail!("--add and --from require a library book ID");
+        }
+        cr_core::formats::convert(&input, &output)?;
+    }
+    if json {
+        print_json(&json!({"path": output, "format": target, "book_id": id, "added": add}))?;
+    } else {
+        println!("{}", output.display());
+    }
+    Ok(())
+}
+
 fn read_book(
     library_path: &PathBuf,
     id: i64,
@@ -728,6 +805,17 @@ fn edit_book(
 
 fn resolve_device(path: Option<PathBuf>) -> Result<Device> {
     match path {
+        Some(path) if path.to_str().is_some_and(|id| id.starts_with("mtp:")) && !path.is_dir() => {
+            device::discover()?
+                .into_iter()
+                .find(|device| device.is_mtp() && device.root == path)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no Kindle connected at {}. Run cr devices to rescan.",
+                        path.display()
+                    )
+                })
+        }
         Some(path) => Device::detect_at(&path).ok_or_else(|| {
             anyhow!(
                 "no e-reader detected at {} (expected documents/ or system/)",
@@ -735,17 +823,17 @@ fn resolve_device(path: Option<PathBuf>) -> Result<Device> {
             )
         }),
         None => {
-            let devices = device::discover();
+            let devices = device::discover()?;
             match devices.len() {
                 1 => Ok(devices.into_iter().next().expect("length checked")),
-                0 => bail!("no e-reader detected; connect one or pass --device PATH"),
+                0 => bail!("no e-reader detected. Connect one in USB file-transfer mode or pass --device PATH"),
                 _ => {
                     let list = devices
                         .iter()
                         .map(|device| format!("{} ({})", device.name, device.root.display()))
                         .collect::<Vec<_>>()
                         .join(", ");
-                    bail!("multiple e-readers detected: {list}; pass --device PATH")
+                    bail!("multiple e-readers detected: {list}. Pass --device with a mount path or MTP identifier.")
                 }
             }
         }

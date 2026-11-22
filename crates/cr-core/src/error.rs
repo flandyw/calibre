@@ -21,6 +21,9 @@ pub enum Error {
     #[error("invalid EPUB: {0}")]
     InvalidEpub(String),
 
+    #[error("Kindle ebook: {0}")]
+    Kindle(String),
+
     #[error("invalid OPF: {0}")]
     InvalidOpf(String),
 

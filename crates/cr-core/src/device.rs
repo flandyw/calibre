@@ -1,5 +1,4 @@
-//! Send books to mounted e-readers (Kindle, Kobo and generic USB storage),
-//! maintaining calibre's `metadata.calibre` catalog file.
+//! Discover USB e-readers and send books to them.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,8 +7,11 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 use crate::library::Library;
-use crate::metadata::format_datetime;
+use crate::metadata::{format_datetime, Metadata};
 use crate::text;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod mtp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
@@ -30,9 +32,18 @@ impl DeviceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
+    /// Mount point or an `mtp:…` identifier for a USB Kindle.
     pub root: PathBuf,
     pub name: String,
     pub kind: DeviceKind,
+    transport: Transport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Transport {
+    Mounted,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Mtp(mtp::Kindle),
 }
 
 impl Device {
@@ -59,7 +70,12 @@ impl Device {
             root: root.to_path_buf(),
             name,
             kind,
+            transport: Transport::Mounted,
         })
+    }
+
+    pub fn is_mtp(&self) -> bool {
+        !matches!(self.transport, Transport::Mounted)
     }
 
     /// Where books should be copied. Kindle and most readers use `documents`.
@@ -84,8 +100,8 @@ impl Device {
     }
 }
 
-/// Scan common mount points for connected e-readers.
-pub fn discover() -> Vec<Device> {
+/// Scan common mount points and USB for connected e-readers.
+pub fn discover() -> Result<Vec<Device>> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Some(roots) = std::env::var_os("CR_DEVICE_ROOTS") {
@@ -142,9 +158,11 @@ pub fn discover() -> Vec<Device> {
         .iter()
         .filter_map(|path| Device::detect_at(path))
         .collect();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    devices.extend(mtp::discover()?);
     devices.sort_by(|a, b| a.root.cmp(&b.root));
     devices.dedup_by(|a, b| a.root == b.root);
-    devices
+    Ok(devices)
 }
 
 fn has_kobo_marker(root: &Path) -> bool {
@@ -179,84 +197,51 @@ pub struct SentBook {
 pub struct SendReport {
     pub sent: Vec<SentBook>,
     pub skipped: Vec<(i64, String)>,
-    pub catalog: PathBuf,
+    pub catalog: Option<PathBuf>,
     pub dry_run: bool,
 }
 
-/// Copy books to a device and update `metadata.calibre`.
+/// Send books to a device. Mounted devices also get a `metadata.calibre` catalog.
 pub fn send(
     library: &Library,
     device: &Device,
     ids: &[i64],
     options: &SendOptions,
 ) -> Result<SendReport> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Transport::Mtp(kindle) = &device.transport {
+        return mtp::send(library, device, kindle, ids, options);
+    }
+
     let documents = device.documents_dir();
     if !options.dry_run {
         fs::create_dir_all(&documents)?;
     }
 
     let mut report = SendReport {
-        catalog: device.catalog_path(),
+        catalog: Some(device.catalog_path()),
         dry_run: options.dry_run,
         ..Default::default()
     };
     let mut catalog = read_catalog(&device.catalog_path());
 
     for &id in ids {
-        let available = match library.formats(id) {
-            Ok(formats) => formats,
-            Err(err) => {
-                report.skipped.push((id, err.to_string()));
-                continue;
-            }
+        let Some(book) = prepare_book(library, device, id, options, &mut report)? else {
+            continue;
         };
-        let format = match &options.format {
-            Some(wanted) => {
-                let wanted = wanted.to_ascii_uppercase();
-                match available.iter().find(|f| f.eq_ignore_ascii_case(&wanted)) {
-                    Some(found) => found.clone(),
-                    None => {
-                        report.skipped.push((
-                            id,
-                            format!("no {wanted} file (available: {})", available.join(", ")),
-                        ));
-                        continue;
-                    }
-                }
-            }
-            None => match preferred_format(&available) {
-                Some(found) => found,
-                None => {
-                    report.skipped.push((id, "no formats".to_string()));
-                    continue;
-                }
-            },
-        };
-
-        let source = match library.format_path(id, &format)? {
-            Some(path) => path,
-            None => {
-                report
-                    .skipped
-                    .push((id, format!("{format} file missing from library")));
-                continue;
-            }
-        };
-        let meta = library.get_metadata(id)?;
-        let extension = format.to_ascii_lowercase();
-        let stem = text::format_file_stem(&meta.title, meta.first_author());
-        let mut file_name = text::sanitize_component(&format!("{stem}.{extension}"));
-        if file_name.starts_with('.') {
-            file_name = format!("_{file_name}");
-        }
-        let mut target = documents.join(&file_name);
+        let mut target = documents.join(book.file_name(1, None));
         let mut counter = 2;
         while target.exists() && !options.dry_run {
-            let candidate = format!("{stem} ({counter}).{extension}");
-            target = documents.join(text::sanitize_component(&candidate));
+            target = documents.join(book.file_name(counter, None));
             counter += 1;
         }
 
+        let PreparedBook {
+            source,
+            meta,
+            format,
+            ..
+        } = book;
         let size = fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
         if !options.dry_run {
             fs::copy(&source, &target)?;
@@ -315,6 +300,103 @@ pub fn send(
     Ok(report)
 }
 
+struct PreparedBook {
+    source: PathBuf,
+    meta: Metadata,
+    format: String,
+    stem: String,
+}
+
+impl PreparedBook {
+    fn file_name(&self, counter: usize, max_stem_bytes: Option<usize>) -> String {
+        let suffix = if counter == 1 {
+            String::new()
+        } else {
+            format!(" ({counter})")
+        };
+        let mut stem = self.stem.as_str();
+        if let Some(max) = max_stem_bytes {
+            let mut end = stem.len().min(max);
+            while !stem.is_char_boundary(end) {
+                end -= 1;
+            }
+            stem = &stem[..end];
+        }
+        let extension = self.format.to_ascii_lowercase();
+        let mut name = text::sanitize_component(&format!("{stem}{suffix}.{extension}"));
+        if name.starts_with('.') {
+            name.insert(0, '_');
+        }
+        name
+    }
+}
+
+fn prepare_book(
+    library: &Library,
+    device: &Device,
+    id: i64,
+    options: &SendOptions,
+    report: &mut SendReport,
+) -> Result<Option<PreparedBook>> {
+    let mut skip = |reason| {
+        report.skipped.push((id, reason));
+        Ok(None)
+    };
+    let available = match library.formats(id) {
+        Ok(formats) => formats,
+        Err(err) => return skip(err.to_string()),
+    };
+    let format = match select_format(&available, options.format.as_deref(), device.is_mtp()) {
+        Ok(format) => format,
+        Err(reason) => return skip(reason),
+    };
+    let Some(source) = library.format_path(id, &format)? else {
+        return skip(format!("{format} file missing from library"));
+    };
+    let meta = library.get_metadata(id)?;
+    let stem = text::format_file_stem(&meta.title, meta.first_author());
+    Ok(Some(PreparedBook {
+        source,
+        meta,
+        format,
+        stem,
+    }))
+}
+
+fn select_format(
+    available: &[String],
+    requested: Option<&str>,
+    mtp_kindle: bool,
+) -> std::result::Result<String, String> {
+    const KINDLE_FORMATS: [&str; 6] = ["AZW3", "AZW", "MOBI", "PRC", "PDF", "TXT"];
+    if let Some(requested) = requested {
+        let wanted = requested.to_ascii_uppercase();
+        if mtp_kindle && !KINDLE_FORMATS.contains(&wanted.as_str()) {
+            return Err(format!(
+                "{wanted} cannot be read on a Kindle over USB. Use AZW3 or PDF."
+            ));
+        }
+        return available
+            .iter()
+            .find(|format| format.eq_ignore_ascii_case(&wanted))
+            .cloned()
+            .ok_or_else(|| format!("no {wanted} file (available: {})", available.join(", ")));
+    }
+    if mtp_kindle {
+        return KINDLE_FORMATS
+            .iter()
+            .find_map(|wanted| available.iter().find(|f| f.eq_ignore_ascii_case(wanted)))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "No Kindle-compatible format for USB transfer (available: {}). Add an AZW3 or PDF copy.",
+                    available.join(", ")
+                )
+            });
+    }
+    preferred_format(available).ok_or_else(|| "no formats".to_string())
+}
+
 fn read_catalog(path: &Path) -> Vec<Value> {
     fs::read(path)
         .ok()
@@ -369,5 +451,14 @@ mod tests {
     fn prefers_epub() {
         let formats = vec!["MOBI".to_string(), "EPUB".to_string()];
         assert_eq!(preferred_format(&formats).as_deref(), Some("EPUB"));
+    }
+
+    #[test]
+    fn mtp_kindle_selects_a_format_it_can_read_over_usb() {
+        let formats = ["EPUB".to_string(), "AZW3".to_string(), "PDF".to_string()];
+        assert_eq!(select_format(&formats, None, true).unwrap(), "AZW3");
+        assert_eq!(select_format(&formats, Some("pdf"), true).unwrap(), "PDF");
+        assert!(select_format(&formats, Some("EPUB"), true).is_err());
+        assert!(select_format(&formats[..1], None, true).is_err());
     }
 }

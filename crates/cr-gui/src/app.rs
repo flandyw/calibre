@@ -1,36 +1,137 @@
-//! The calibre-rust desktop interface, built with GPUI and gpui-kit.
+//! The calibre-rust main window: state, library operations and action handlers.
+//! Rendering lives in [`crate::ui`].
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cr_core::device::{self, Device, SendOptions};
-use cr_core::formats::{epub as epub_formats, html};
-use cr_core::library::{BookUpdate, Library, ListOptions};
+use cr_core::formats::epub as epub_formats;
+use cr_core::library::{BookSort, BookUpdate, Library, ListOptions};
 use cr_core::metadata::{htmlize_comments, parse_user_date, BookSummary, Metadata};
 use cr_core::text::{self, split_authors};
 use cr_core::Chapter;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::label::Label;
+use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
 use gpui_kit::*;
 use image::DynamicImage;
 
+use crate::actions::*;
+use crate::files;
+use crate::settings::{
+    SavedBounds, Settings, ThemePreference, ViewMode, DEFAULT_READER_FONT_SIZE,
+    MAX_READER_FONT_SIZE, MIN_READER_FONT_SIZE,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Screen {
+pub enum Screen {
     Library,
     Reader,
     Epub,
+    Crop,
+}
+
+/// A sidebar entry that narrows the book list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Shelf {
+    All,
+    RecentlyAdded,
+    Author(String),
+    Series(String),
+    Tag(String),
+    Format(String),
+}
+
+impl Shelf {
+    pub fn title(&self) -> String {
+        match self {
+            Shelf::All => "All Books".to_string(),
+            Shelf::RecentlyAdded => "Recently Added".to_string(),
+            Shelf::Author(name) | Shelf::Series(name) | Shelf::Tag(name) | Shelf::Format(name) => {
+                name.clone()
+            }
+        }
+    }
+
+    fn matches(&self, book: &BookSummary) -> bool {
+        match self {
+            Shelf::All | Shelf::RecentlyAdded => true,
+            Shelf::Author(name) => book.authors.iter().any(|author| author == name),
+            Shelf::Series(name) => book.series.as_deref() == Some(name.as_str()),
+            Shelf::Tag(name) => book.tags.iter().any(|tag| tag == name),
+            Shelf::Format(name) => book.formats.iter().any(|format| format == name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShelfSection {
+    Authors,
+    Series,
+    Tags,
+    Formats,
+}
+
+/// Category counts shown in the sidebar, derived from the whole library.
+#[derive(Default)]
+pub struct Categories {
+    pub authors: Vec<(String, usize)>,
+    pub series: Vec<(String, usize)>,
+    pub tags: Vec<(String, usize)>,
+    pub formats: Vec<(String, usize)>,
+}
+
+impl Categories {
+    fn from_books(books: &[BookSummary]) -> Self {
+        let mut authors = BTreeMap::<String, usize>::new();
+        let mut series = BTreeMap::<String, usize>::new();
+        let mut tags = BTreeMap::<String, usize>::new();
+        let mut formats = BTreeMap::<String, usize>::new();
+        for book in books {
+            for author in &book.authors {
+                *authors.entry(author.clone()).or_default() += 1;
+            }
+            if let Some(name) = &book.series {
+                *series.entry(name.clone()).or_default() += 1;
+            }
+            for tag in &book.tags {
+                *tags.entry(tag.clone()).or_default() += 1;
+            }
+            for format in &book.formats {
+                *formats.entry(format.clone()).or_default() += 1;
+            }
+        }
+        let sorted = |map: BTreeMap<String, usize>| {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by_key(|(name, _)| name.to_lowercase());
+            entries
+        };
+        Self {
+            authors: sorted(authors),
+            series: sorted(series),
+            tags: sorted(tags),
+            formats: sorted(formats),
+        }
+    }
+
+    pub fn entries(&self, section: ShelfSection) -> &[(String, usize)] {
+        match section {
+            ShelfSection::Authors => &self.authors,
+            ShelfSection::Series => &self.series,
+            ShelfSection::Tags => &self.tags,
+            ShelfSection::Formats => &self.formats,
+        }
+    }
 }
 
 #[derive(Clone)]
-struct EpubFile {
-    relative: String,
-    path: PathBuf,
-    size: u64,
+pub struct EpubFile {
+    pub relative: String,
+    pub path: PathBuf,
+    pub size: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,120 +160,174 @@ struct CropDrag {
     height: f32,
 }
 
+/// What to do once unsaved changes have been saved or discarded.
+#[derive(Clone, Copy)]
+enum AfterResolve {
+    CloseWindow,
+    Quit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Info,
+    Success,
+    Error,
+}
+
 const EXPORT_TEMPLATE: &str = "{author_sort}/{title} ({id})/{title} - {author}";
+const RECENTLY_ADDED_LIMIT: usize = 50;
+/// Formats tried first when opening or dragging a book out of the app.
+const PREFERRED_FORMATS: &[&str] = &["EPUB", "PDF", "AZW3", "MOBI", "FB2", "TXT"];
 
 pub struct CalibreApp {
-    library: Option<Library>,
-    devices: Vec<Device>,
-    books: Vec<BookSummary>,
-    selected: Option<i64>,
-    metadata: Option<Metadata>,
-    cover_path: Option<PathBuf>,
-    selected_formats: Vec<String>,
-    selected_path: Option<String>,
-    chapters: Vec<Chapter>,
-    chapter_index: usize,
-    reader_title: String,
-    screen: Screen,
-    editing: bool,
-    confirm_remove: bool,
-    dark: bool,
-    status: String,
-    query: String,
+    pub settings: Settings,
+    pub library: Option<Library>,
+    pub devices: Vec<Device>,
+    pub scanning_devices: bool,
+    pub sending_to_device: bool,
+    /// Every book in the library, for the sidebar categories.
+    pub all_books: Vec<BookSummary>,
+    pub categories: Categories,
+    /// Books currently shown: the shelf and search applied.
+    pub books: Vec<BookSummary>,
+    pub shelf: Shelf,
+    pub expanded_sections: HashSet<ShelfSection>,
+    pub selected: Option<i64>,
+    pub metadata: Option<Metadata>,
+    pub cover_path: Option<PathBuf>,
+    pub selected_formats: Vec<String>,
+    pub selected_path: Option<String>,
+    pub chapters: Vec<Chapter>,
+    pub chapter_index: usize,
+    pub reader_title: String,
+    pub chapter_list_visible: bool,
+    pub screen: Screen,
+    pub editing: bool,
+    pub status: String,
+    pub status_tone: Tone,
+    pub query: String,
+    pub show_shortcuts: bool,
 
     // Cover crop state.
-    cropping: bool,
-    crop_book_id: Option<i64>,
-    crop_source: Option<DynamicImage>,
-    crop_preview_path: Option<PathBuf>,
+    pub crop_book_id: Option<i64>,
+    pub crop_source: Option<DynamicImage>,
+    pub crop_preview_path: Option<PathBuf>,
     crop_preview_counter: u64,
     crop_drag: Option<CropDrag>,
 
     // EPUB editor state.
-    epub_book_id: Option<i64>,
+    pub epub_book_id: Option<i64>,
     epub_dir: Option<PathBuf>,
-    epub_files: Vec<EpubFile>,
-    epub_selected: Option<usize>,
-    epub_dirty: bool,
+    pub epub_files: Vec<EpubFile>,
+    pub epub_selected: Option<usize>,
+    pub epub_dirty: bool,
 
-    library_path: Entity<InputState>,
-    search: Entity<InputState>,
-    title_input: Entity<InputState>,
-    authors_input: Entity<InputState>,
-    series_input: Entity<InputState>,
-    series_index_input: Entity<InputState>,
-    publisher_input: Entity<InputState>,
-    tags_input: Entity<InputState>,
-    rating_input: Entity<InputState>,
-    languages_input: Entity<InputState>,
-    identifiers_input: Entity<InputState>,
-    pubdate_input: Entity<InputState>,
-    comments_input: Entity<TextareaState>,
-    epub_editor: Entity<TextareaState>,
-    crop_left: Entity<InputState>,
-    crop_top: Entity<InputState>,
-    crop_width: Entity<InputState>,
-    crop_height: Entity<InputState>,
+    pub focus_handle: FocusHandle,
+    pub list_focus: FocusHandle,
+    pub reader_focus: FocusHandle,
+    pub list_scroll: UniformListScrollHandle,
+    pub grid_scroll: ScrollHandle,
+    pub reader_scroll: ScrollHandle,
+    /// Width of the cover grid from the last layout, for keyboard navigation.
+    pub grid_width: Rc<Cell<f32>>,
+    last_window_title: String,
+
+    pub search: Entity<InputState>,
+    pub title_input: Entity<InputState>,
+    pub authors_input: Entity<InputState>,
+    pub series_input: Entity<InputState>,
+    pub series_index_input: Entity<InputState>,
+    pub publisher_input: Entity<InputState>,
+    pub tags_input: Entity<InputState>,
+    pub rating_input: Entity<InputState>,
+    pub languages_input: Entity<InputState>,
+    pub identifiers_input: Entity<InputState>,
+    pub pubdate_input: Entity<InputState>,
+    pub comments_input: Entity<TextareaState>,
+    pub epub_editor: Entity<TextareaState>,
+    pub crop_left: Entity<InputState>,
+    pub crop_top: Entity<InputState>,
+    pub crop_width: Entity<InputState>,
+    pub crop_height: Entity<InputState>,
 
     _subscriptions: Vec<Subscription>,
 }
 
 impl CalibreApp {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let library_path = text_input("Path to calibre library", window, cx);
-        let search = text_input("Search title, author, tag or series", window, cx);
+    pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let search = text_input("Search", window, cx);
         let title_input = text_input("Title", window, cx);
         let authors_input = text_input("Authors, separated by &", window, cx);
         let series_input = text_input("Series", window, cx);
-        let series_index_input = text_input("Series index", window, cx);
+        let series_index_input = text_input("1", window, cx);
         let publisher_input = text_input("Publisher", window, cx);
         let tags_input = text_input("Tags, comma separated", window, cx);
-        let rating_input = text_input("Rating 0-10", window, cx);
-        let languages_input = text_input("Languages, comma separated", window, cx);
-        let identifiers_input = text_input("isbn=..., asin=...", window, cx);
-        let pubdate_input = text_input("Publication date (YYYY-MM-DD)", window, cx);
-        let comments_input = text_area("Comments / description", 6, window, cx);
+        let rating_input = text_input("0–10", window, cx);
+        let languages_input = text_input("eng, fra", window, cx);
+        let identifiers_input = text_input("isbn=…, asin=…", window, cx);
+        let pubdate_input = text_input("YYYY-MM-DD", window, cx);
+        let comments_input = text_area("Description", 8, window, cx);
         let epub_editor = text_area("EPUB source", 20, window, cx);
         let crop_left = text_input("Left %", window, cx);
         let crop_top = text_input("Top %", window, cx);
         let crop_width = text_input("Width %", window, cx);
         let crop_height = text_input("Height %", window, cx);
 
-        let mut subscriptions = Vec::new();
-        subscriptions.push(
-            cx.subscribe_in(&search, window, |this, state, event, _window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.query = state.read(cx).value().to_string();
-                    this.reload(cx);
+        let subscriptions = vec![
+            cx.subscribe_in(&search, window, |this, state, event, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        this.query = state.read(cx).value().to_string();
+                        this.reload();
+                        this.ensure_selection(window, cx);
+                        cx.notify();
+                    }
+                    InputEvent::PressEnter { .. } => {
+                        // Return in the search field jumps to the results.
+                        window.focus(&this.list_focus, cx);
+                        if this.selected.is_none() {
+                            this.select_index(0, window, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }),
+            cx.subscribe_in(&epub_editor, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::Change) && !this.epub_dirty {
+                    this.epub_dirty = true;
+                    window.set_window_edited(true);
                     cx.notify();
                 }
             }),
-        );
-        subscriptions.push(cx.subscribe_in(
-            &library_path,
-            window,
-            |this, _state, event, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    let path = PathBuf::from(this.library_path.read(cx).value().to_string());
-                    this.open_library(path, window, cx);
+            // Follow the OS light/dark appearance when asked to.
+            cx.observe_window_appearance(window, |this, window, cx| {
+                if this.settings.theme == ThemePreference::System {
+                    Theme::sync_system_appearance(Some(window), cx);
                 }
-            },
-        ));
-        subscriptions.push(cx.subscribe_in(
-            &epub_editor,
-            window,
-            |this, _state, event, _window, cx| {
-                if matches!(event, InputEvent::Change) {
-                    this.epub_dirty = true;
-                    cx.notify();
-                }
-            },
-        ));
+            }),
+        ];
+
+        let weak = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            weak.update(cx, |app, cx| app.window_should_close(window, cx))
+                .unwrap_or(true)
+        });
+
+        let focus_handle = cx.focus_handle();
+        let list_focus = cx.focus_handle();
+        let reader_focus = cx.focus_handle();
 
         let mut app = Self {
+            settings,
             library: None,
             devices: Vec::new(),
+            scanning_devices: false,
+            sending_to_device: false,
+            all_books: Vec::new(),
+            categories: Categories::default(),
             books: Vec::new(),
+            shelf: Shelf::All,
+            expanded_sections: HashSet::new(),
             selected: None,
             metadata: None,
             cover_path: None,
@@ -181,13 +336,13 @@ impl CalibreApp {
             chapters: Vec::new(),
             chapter_index: 0,
             reader_title: String::new(),
+            chapter_list_visible: true,
             screen: Screen::Library,
             editing: false,
-            confirm_remove: false,
-            dark: false,
-            status: "Open a library or create a new one.".to_string(),
+            status: String::new(),
+            status_tone: Tone::Info,
             query: String::new(),
-            cropping: false,
+            show_shortcuts: false,
             crop_book_id: None,
             crop_source: None,
             crop_preview_path: None,
@@ -198,7 +353,14 @@ impl CalibreApp {
             epub_files: Vec::new(),
             epub_selected: None,
             epub_dirty: false,
-            library_path,
+            focus_handle,
+            list_focus,
+            reader_focus,
+            list_scroll: UniformListScrollHandle::new(),
+            grid_scroll: ScrollHandle::new(),
+            reader_scroll: ScrollHandle::new(),
+            grid_width: Rc::new(Cell::new(0.0)),
+            last_window_title: String::new(),
             search,
             title_input,
             authors_input,
@@ -219,62 +381,302 @@ impl CalibreApp {
             _subscriptions: subscriptions,
         };
 
-        let default_path = default_library_path();
-        set_input(
-            &app.library_path,
-            default_path.to_string_lossy().to_string(),
-            window,
-            cx,
-        );
-        app.devices = device::discover();
+        app.apply_theme(window, cx);
 
-        if default_path.join("metadata.db").is_file() {
-            if let Ok(library) = Library::open(&default_path) {
-                app.library = Some(library);
-                app.reload(cx);
-                if let Some(id) = app.books.first().map(|book| book.id) {
-                    app.load_book(id, window, cx);
-                }
-                app.status = format!(
-                    "Opened {} ({} books, {} device(s))",
-                    default_path.display(),
-                    app.books.len(),
-                    app.devices.len()
+        let startup_library = app
+            .settings
+            .last_library
+            .clone()
+            .filter(|path| files::is_library(path))
+            .or_else(|| Some(default_library_path()).filter(|path| files::is_library(path)));
+        match startup_library {
+            Some(path) => app.open_library(path, window, cx),
+            None => {
+                app.set_status(
+                    "Open a library or create a new one to get started.",
+                    Tone::Info,
                 );
+                app.scan_devices(window, cx);
             }
         }
+        window.focus(&app.list_focus, cx);
         app
     }
 
-    fn reload(&mut self, _cx: &mut Context<Self>) {
+    // ---------------------------------------------------------------------
+    // Shared helpers
+    // ---------------------------------------------------------------------
+
+    pub fn set_status(&mut self, message: impl Into<String>, tone: Tone) {
+        self.status = message.into();
+        self.status_tone = tone;
+    }
+
+    /// Shows a message in the status bar and as a toast.
+    fn announce(
+        &mut self,
+        message: impl Into<String>,
+        tone: Tone,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let message = message.into();
+        let note = match tone {
+            Tone::Info => Notification::info(message.clone()),
+            Tone::Success => Notification::success(message.clone()),
+            Tone::Error => Notification::error(message.clone()),
+        };
+        window.push_notification(note, cx);
+        self.set_status(message, tone);
+    }
+
+    /// Moves focus into the main view when nothing in it has focus, so window
+    /// actions and shortcuts reach this view.
+    pub fn focus_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.focus_handle.contains_focused(window, cx) {
+            let target = match self.screen {
+                Screen::Reader => self.reader_focus.clone(),
+                Screen::Library => self.list_focus.clone(),
+                Screen::Epub | Screen::Crop => self.focus_handle.clone(),
+            };
+            window.focus(&target, cx);
+        }
+        true
+    }
+
+    fn save_settings(&mut self) {
+        if let Err(err) = self.settings.save() {
+            self.set_status(err, Tone::Error);
+        }
+    }
+
+    /// Persists settings and rebuilds the menu bar to match them.
+    fn settings_changed(&mut self, cx: &mut Context<Self>) {
+        self.save_settings();
+        cx.set_menus(app_menus(&self.settings));
+        cx.notify();
+    }
+
+    fn apply_theme(&self, window: &mut Window, cx: &mut App) {
+        match self.settings.theme {
+            ThemePreference::System => Theme::sync_system_appearance(Some(window), cx),
+            ThemePreference::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+            ThemePreference::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+        }
+    }
+
+    pub fn set_theme(
+        &mut self,
+        theme: ThemePreference,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.theme = theme;
+        self.apply_theme(window, cx);
+        self.settings_changed(cx);
+    }
+
+    /// Keeps the OS window title, proxy icon and "edited" dot in sync.
+    pub fn sync_window_chrome(&mut self, window: &mut Window) {
+        let library = self.library_name();
+        let title = match self.screen {
+            Screen::Reader if !self.reader_title.is_empty() => {
+                format!("{} — calibre-rust", self.reader_title)
+            }
+            _ if !library.is_empty() => format!("{library} — calibre-rust"),
+            _ => "calibre-rust".to_string(),
+        };
+        if title != self.last_window_title {
+            window.set_window_title(&title);
+            window.set_document_path(self.library.as_ref().map(|library| library.root()));
+            self.last_window_title = title;
+        }
+        window.set_window_edited(self.has_unsaved_changes());
+    }
+
+    pub fn library_name(&self) -> String {
+        self.library
+            .as_ref()
+            .and_then(|library| library.root().file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.editing || self.epub_dirty
+    }
+
+    pub fn selected_index(&self) -> Option<usize> {
+        let id = self.selected?;
+        self.books.iter().position(|book| book.id == id)
+    }
+
+    pub fn selected_title(&self) -> String {
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.title.clone())
+            .unwrap_or_else(|| "this book".to_string())
+    }
+
+    pub fn cover_for(&self, book: &BookSummary) -> Option<PathBuf> {
+        if !book.has_cover {
+            return None;
+        }
+        let library = self.library.as_ref()?;
+        Some(library.root().join(&book.path).join("cover.jpg"))
+    }
+
+    /// The file of the preferred format of a book, used for opening it with
+    /// another app or dragging it out of the window.
+    pub fn preferred_format_path(&self, id: i64, formats: &[String]) -> Option<PathBuf> {
+        let library = self.library.as_ref()?;
+        let format = PREFERRED_FORMATS
+            .iter()
+            .find_map(|preferred| {
+                formats
+                    .iter()
+                    .find(|format| format.eq_ignore_ascii_case(preferred))
+            })
+            .or_else(|| formats.first())?;
+        library.format_path(id, format).ok().flatten()
+    }
+
+    // ---------------------------------------------------------------------
+    // Library list
+    // ---------------------------------------------------------------------
+
+    /// Re-reads every book (for the sidebar) and the visible list.
+    fn refresh_all(&mut self) {
+        let result = self
+            .library
+            .as_ref()
+            .map(|library| library.list_books(&ListOptions::default()));
+        self.all_books = match result {
+            Some(Ok(books)) => books,
+            Some(Err(err)) => {
+                self.set_status(format!("Could not read the library: {err}"), Tone::Error);
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        self.categories = Categories::from_books(&self.all_books);
+        if !self.shelf_exists(&self.shelf) {
+            self.shelf = Shelf::All;
+        }
+        self.reload();
+    }
+
+    fn shelf_exists(&self, shelf: &Shelf) -> bool {
+        let has = |entries: &[(String, usize)], name: &str| {
+            entries.iter().any(|(entry, _)| entry == name)
+        };
+        match shelf {
+            Shelf::All | Shelf::RecentlyAdded => true,
+            Shelf::Author(name) => has(&self.categories.authors, name),
+            Shelf::Series(name) => has(&self.categories.series, name),
+            Shelf::Tag(name) => has(&self.categories.tags, name),
+            Shelf::Format(name) => has(&self.categories.formats, name),
+        }
+    }
+
+    /// Re-runs the search and shelf filter for the visible list.
+    pub fn reload(&mut self) {
         let query = self.query.trim().to_string();
+        let (sort, descending, limit) = match self.shelf {
+            Shelf::RecentlyAdded => (BookSort::Date, true, Some(RECENTLY_ADDED_LIMIT)),
+            _ => (self.settings.sort(), self.settings.descending, None),
+        };
         let options = ListOptions {
             query: if query.is_empty() { None } else { Some(query) },
-            ..Default::default()
+            sort: Some(sort),
+            descending,
+            limit,
         };
         let result = self
             .library
             .as_ref()
             .map(|library| library.list_books(&options));
         match result {
-            Some(Ok(books)) => self.books = books,
+            Some(Ok(books)) => {
+                let shelf = &self.shelf;
+                self.books = books
+                    .into_iter()
+                    .filter(|book| shelf.matches(book))
+                    .collect();
+            }
             Some(Err(err)) => {
                 self.books.clear();
-                self.status = format!("Search failed: {err}");
+                self.set_status(format!("Search failed: {err}"), Tone::Error);
             }
             None => self.books.clear(),
         }
     }
 
-    fn load_book(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        self.clear_crop();
+    /// Keeps a sensible selection after the list changes.
+    fn ensure_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing {
+            return;
+        }
+        if self.selected_index().is_none() {
+            match self.books.first().map(|book| book.id) {
+                Some(id) => self.load_book(id, window, cx),
+                None => self.clear_selection(),
+            }
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.metadata = None;
+        self.cover_path = None;
+        self.selected_formats.clear();
+        self.selected_path = None;
+        self.editing = false;
+    }
+
+    pub fn select_shelf(&mut self, shelf: Shelf, window: &mut Window, cx: &mut Context<Self>) {
+        self.shelf = shelf;
+        self.reload();
+        self.ensure_selection(window, cx);
+        if let Some(index) = self.selected_index() {
+            self.scroll_to(index);
+        }
+        window.focus(&self.list_focus, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_section(&mut self, section: ShelfSection, cx: &mut Context<Self>) {
+        if !self.expanded_sections.remove(&section) {
+            self.expanded_sections.insert(section);
+        }
+        cx.notify();
+    }
+
+    /// Sorts by `sort`; choosing the current sort again flips the direction.
+    fn set_sort(&mut self, sort: BookSort, cx: &mut Context<Self>) {
+        if self.settings.sort() == sort {
+            self.settings.descending = !self.settings.descending;
+        } else {
+            self.settings.set_sort(sort);
+            // Newest or best first is the useful default for these.
+            self.settings.descending =
+                matches!(sort, BookSort::Date | BookSort::Pubdate | BookSort::Rating);
+        }
+        self.reload();
+        if let Some(index) = self.selected_index() {
+            self.scroll_to(index);
+        }
+        self.settings_changed(cx);
+    }
+
+    pub fn load_book(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(library) = self.library.as_ref() else {
             return;
         };
         let metadata = match library.get_metadata(id) {
             Ok(metadata) => metadata,
             Err(err) => {
-                self.status = format!("Could not load book #{id}: {err}");
+                self.set_status(format!("Could not load book #{id}: {err}"), Tone::Error);
                 return;
             }
         };
@@ -292,13 +694,52 @@ impl CalibreApp {
         self.selected_path = relative;
         self.cover_path = cover_path;
         self.editing = false;
-        self.confirm_remove = false;
-        self.screen = Screen::Library;
     }
 
-    fn select_book(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
-        self.load_book(id, window, cx);
+    pub fn select_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.books.get(index).map(|book| book.id) else {
+            return;
+        };
+        if self.selected != Some(id) {
+            if self.editing {
+                self.set_status(
+                    "Save or cancel your metadata changes before choosing another book.",
+                    Tone::Info,
+                );
+                cx.notify();
+                return;
+            }
+            self.load_book(id, window, cx);
+        }
+        self.scroll_to(index);
         cx.notify();
+    }
+
+    fn scroll_to(&self, index: usize) {
+        match self.settings.view {
+            ViewMode::List => self
+                .list_scroll
+                .scroll_to_item(index, ScrollStrategy::Center),
+            ViewMode::Grid => self.grid_scroll.scroll_to_item(index),
+        }
+    }
+
+    fn grid_columns(&self) -> usize {
+        let width = self.grid_width.get() - 2.0 * crate::ui::GRID_PADDING;
+        let cell = crate::ui::GRID_CARD_WIDTH + crate::ui::GRID_GAP;
+        (((width + crate::ui::GRID_GAP) / cell).floor().max(1.0)) as usize
+    }
+
+    fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.books.is_empty() {
+            return;
+        }
+        let last = self.books.len() as isize - 1;
+        let next = match self.selected_index() {
+            Some(index) => (index as isize + delta).clamp(0, last),
+            None => 0,
+        };
+        self.select_index(next as usize, window, cx);
     }
 
     fn fill_form(&self, metadata: &Metadata, window: &mut Window, cx: &mut Context<Self>) {
@@ -372,84 +813,135 @@ impl CalibreApp {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // Opening libraries
+    // ---------------------------------------------------------------------
+
     fn install_library(
         &mut self,
         library: Library,
-        path: &std::path::Path,
+        path: &Path,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.discard_epub_editor();
+        self.clear_crop();
         self.library = Some(library);
+        self.screen = Screen::Library;
+        self.shelf = Shelf::All;
         self.query.clear();
         set_input(&self.search, String::new(), window, cx);
-        set_input(
-            &self.library_path,
-            path.to_string_lossy().to_string(),
-            window,
-            cx,
-        );
-        self.devices = device::discover();
-        self.selected = None;
-        self.metadata = None;
-        self.cover_path = None;
-        self.selected_formats.clear();
-        self.selected_path = None;
-        self.reload(cx);
-        if let Some(id) = self.books.first().map(|book| book.id) {
-            self.load_book(id, window, cx);
+        self.clear_selection();
+        self.refresh_all();
+        self.ensure_selection(window, cx);
+        if let Some(index) = self.selected_index() {
+            self.scroll_to(index);
         }
-        self.status = format!(
-            "Opened {} ({} books, {} device(s))",
-            path.display(),
-            self.books.len(),
-            self.devices.len()
+
+        self.settings.remember_library(path);
+        cx.add_recent_document(path);
+        self.settings_changed(cx);
+        self.sync_window_chrome(window);
+        window.focus(&self.list_focus, cx);
+        self.set_status(
+            format!(
+                "Opened {} — {} book(s).",
+                path.display(),
+                self.all_books.len()
+            ),
+            Tone::Info,
         );
+        self.scan_devices(window, cx);
         cx.notify();
     }
 
-    fn open_library(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_library(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_unsaved_changes() {
+            self.set_status(
+                "Save or cancel your changes before switching libraries.",
+                Tone::Info,
+            );
+            cx.notify();
+            return;
+        }
         match Library::open(&path) {
             Ok(library) => self.install_library(library, &path, window, cx),
             Err(err) => {
-                self.status = format!(
-                    "Could not open {}: {err}. Use New to create it.",
-                    path.display()
+                self.settings
+                    .recent_libraries
+                    .retain(|recent| recent != &path);
+                self.settings_changed(cx);
+                self.announce(
+                    format!("Could not open {}: {err}", path.display()),
+                    Tone::Error,
+                    window,
+                    cx,
                 );
                 cx.notify();
             }
         }
     }
 
-    fn create_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let raw = self.library_path.read(cx).value().to_string();
-        if raw.trim().is_empty() {
-            self.status = "Enter a folder for the new library.".to_string();
-            cx.notify();
+    fn create_library_at(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if files::is_library(&path) {
+            self.open_library(path, window, cx);
             return;
         }
-        let path = PathBuf::from(raw.trim());
         match Library::create(&path) {
-            Ok(library) => self.install_library(library, &path, window, cx),
+            Ok(library) => {
+                self.install_library(library, &path, window, cx);
+                self.announce(
+                    format!("Created a new library in {}.", path.display()),
+                    Tone::Success,
+                    window,
+                    cx,
+                );
+            }
             Err(err) => {
-                self.status = format!("Could not create {}: {err}", path.display());
+                self.announce(
+                    format!("Could not create {}: {err}", path.display()),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
                 cx.notify();
             }
         }
     }
 
-    fn browse_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn prompt_open_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Choose a calibre library folder".into()),
+            prompt: Some("Open Library".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(path) = paths.into_iter().next() {
+            let Ok(Ok(Some(paths))) = receiver.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            if files::is_library(&path) {
+                this.update_in(cx, |this, window, cx| this.open_library(path, window, cx))
+                    .ok();
+                return;
+            }
+            // Offer to create a library in a folder that has none.
+            let answer = this.update_in(cx, |_, window, cx| {
+                window.prompt(
+                    PromptLevel::Info,
+                    &format!("“{}” is not a calibre library.", display_name(&path)),
+                    Some("Create a new, empty library in this folder?"),
+                    &["Create Library", "Cancel"],
+                    cx,
+                )
+            });
+            if let Ok(answer) = answer {
+                if let Ok(0) = answer.await {
                     this.update_in(cx, |this, window, cx| {
-                        this.open_library(path, window, cx);
+                        this.create_library_at(path, window, cx)
                     })
                     .ok();
                 }
@@ -458,22 +950,87 @@ impl CalibreApp {
         .detach();
     }
 
-    fn browse_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.library.is_none() {
-            self.status = "Open a library before adding books.".to_string();
+    pub fn prompt_new_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let default = default_library_path();
+        let home = default
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let suggested = if default.exists() {
+            "New Calibre Library"
+        } else {
+            "Calibre Library"
+        };
+        let receiver = cx.prompt_for_new_path(&home, Some(suggested));
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(path))) = receiver.await {
+                this.update_in(cx, |this, window, cx| {
+                    this.create_library_at(path, window, cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Handles files and folders from drag and drop or the OS ("Open With",
+    /// the Dock icon): libraries are opened and ebooks are added.
+    pub fn open_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        let dropped = files::classify(paths);
+        let had_library = dropped.library.is_some();
+        if let Some(library) = dropped.library {
+            self.open_library(library, window, cx);
+        }
+        if dropped.books.is_empty() {
+            if !had_library {
+                self.announce(
+                    "Drop ebook files or a calibre library folder.",
+                    Tone::Info,
+                    window,
+                    cx,
+                );
+            }
             cx.notify();
+            return;
+        }
+        if self.library.is_none() {
+            self.announce(
+                "Open a library before adding books.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.add_paths(dropped.books, window, cx);
+    }
+
+    // ---------------------------------------------------------------------
+    // Adding, exporting and removing books
+    // ---------------------------------------------------------------------
+
+    pub fn prompt_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.library.is_none() {
+            self.prompt_open_library(window, cx);
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: true,
-            prompt: Some("Add ebooks to the library".into()),
+            prompt: Some("Add to Library".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 this.update_in(cx, |this, window, cx| {
-                    this.add_paths(paths, window, cx);
+                    let books = files::classify(paths).books;
+                    if books.is_empty() {
+                        this.announce("No ebook files were selected.", Tone::Info, window, cx);
+                        cx.notify();
+                    } else {
+                        this.add_paths(books, window, cx);
+                    }
                 })
                 .ok();
             }
@@ -482,9 +1039,19 @@ impl CalibreApp {
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing {
+            self.announce(
+                "Save or cancel your metadata changes before adding books.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let mut added = 0usize;
         let mut last_id = None;
-        let mut last_error = None;
+        let mut errors = Vec::new();
         if let Some(library) = self.library.as_mut() {
             for path in paths {
                 match library.add_book(&path) {
@@ -492,64 +1059,54 @@ impl CalibreApp {
                         added += 1;
                         last_id = Some(book.id);
                     }
-                    Err(err) => {
-                        last_error = Some(format!("{}: {err}", path.display()));
-                    }
+                    Err(err) => errors.push(format!("{}: {err}", display_name(&path))),
                 }
             }
         }
+        // Show the new books: clear filters that might hide them.
+        self.shelf = Shelf::All;
         self.query.clear();
         set_input(&self.search, String::new(), window, cx);
-        self.reload(cx);
+        self.refresh_all();
         if let Some(id) = last_id {
             self.load_book(id, window, cx);
+            if let Some(index) = self.selected_index() {
+                self.scroll_to(index);
+            }
         }
-        self.status = match last_error {
-            Some(err) => format!("Added {added} book(s). Last error: {err}"),
-            None => format!("Added {added} book(s)."),
+        let (message, tone) = match (added, errors.last()) {
+            (0, Some(err)) => (format!("No books added. {err}"), Tone::Error),
+            (_, Some(err)) => (
+                format!(
+                    "Added {added} book(s); {} failed. Last error: {err}",
+                    errors.len()
+                ),
+                Tone::Error,
+            ),
+            (1, None) => ("Added 1 book.".to_string(), Tone::Success),
+            (_, None) => (format!("Added {added} books."), Tone::Success),
         };
+        self.announce(message, tone, window, cx);
         cx.notify();
     }
 
-    fn browse_cover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
+    fn prompt_export(&mut self, ids: Vec<i64>, window: &mut Window, cx: &mut Context<Self>) {
+        if ids.is_empty() {
+            self.set_status("There are no books to export.", Tone::Info);
+            cx.notify();
             return;
-        };
+        }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
+            files: false,
+            directories: true,
             multiple: false,
-            prompt: Some("Choose a cover image".into()),
+            prompt: Some("Export Here".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(path) = paths.into_iter().next() {
+                if let Some(destination) = paths.into_iter().next() {
                     this.update_in(cx, |this, window, cx| {
-                        let data = match std::fs::read(&path) {
-                            Ok(data) => data,
-                            Err(err) => {
-                                this.status = format!("Could not read cover: {err}");
-                                cx.notify();
-                                return;
-                            }
-                        };
-                        let result = this
-                            .library
-                            .as_mut()
-                            .map(|library| library.set_cover(id, Some(&data)));
-                        match result {
-                            Some(Ok(())) => {
-                                this.load_book(id, window, cx);
-                                this.status = format!("Cover updated from {}", path.display());
-                            }
-                            Some(Err(err)) => {
-                                this.status = format!("Cover update failed: {err}");
-                            }
-                            None => {
-                                this.status = "Open a library first.".to_string();
-                            }
-                        }
-                        cx.notify();
+                        this.export_books(ids, destination, window, cx);
                     })
                     .ok();
                 }
@@ -558,113 +1115,661 @@ impl CalibreApp {
         .detach();
     }
 
-    fn browse_export_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.library.is_none() {
-            self.status = "Open a library before exporting.".to_string();
-            cx.notify();
-            return;
-        }
-        let ids: Vec<i64> = self.books.iter().map(|book| book.id).collect();
-        if ids.is_empty() {
-            self.status = "There are no books in the current list to export.".to_string();
-            cx.notify();
-            return;
-        }
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose a folder for the exported books".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(destination) = paths.into_iter().next() {
-                    this.update_in(cx, |this, _, cx| {
-                        this.export_books(ids, destination, cx);
-                    })
-                    .ok();
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn browse_export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose an export folder".into()),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = receiver.await {
-                if let Some(destination) = paths.into_iter().next() {
-                    this.update_in(cx, |this, _, cx| {
-                        this.export_selected(id, destination, cx);
-                    })
-                    .ok();
-                }
-            }
-        })
-        .detach();
-    }
-
-    fn export_selected(&mut self, id: i64, destination: PathBuf, cx: &mut Context<Self>) {
-        self.export_books(vec![id], destination, cx);
-    }
-
-    fn export_books(&mut self, ids: Vec<i64>, destination: PathBuf, cx: &mut Context<Self>) {
-        if ids.is_empty() {
-            self.status = "There are no books to export.".to_string();
-            cx.notify();
-            return;
-        }
+    fn export_books(
+        &mut self,
+        ids: Vec<i64>,
+        destination: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let book_count = ids.len();
         let result = self
             .library
             .as_ref()
             .map(|library| library.export_books(&ids, &destination, EXPORT_TEMPLATE, None));
         match result {
-            Some(Ok(paths)) if paths.is_empty() => {
-                self.status = "Nothing to export: these books have no format files.".to_string();
-            }
+            Some(Ok(paths)) if paths.is_empty() => self.announce(
+                "Nothing to export: these books have no format files.",
+                Tone::Info,
+                window,
+                cx,
+            ),
             Some(Ok(paths)) => {
-                self.status = format!(
-                    "Exported {} file(s) from {book_count} book(s) to {}.",
-                    paths.len(),
-                    destination.display()
+                self.announce(
+                    format!(
+                        "Exported {} file(s) from {book_count} book(s) to {}.",
+                        paths.len(),
+                        destination.display()
+                    ),
+                    Tone::Success,
+                    window,
+                    cx,
                 );
+                cx.reveal_path(&destination);
             }
-            Some(Err(err)) => self.status = format!("Export failed: {err}"),
-            None => self.status = "Open a library first.".to_string(),
+            Some(Err(err)) => {
+                self.announce(format!("Export failed: {err}"), Tone::Error, window, cx)
+            }
+            None => self.set_status("Open a library first.", Tone::Info),
         }
         cx.notify();
     }
 
-    fn begin_cover_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn confirm_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected else {
             return;
         };
-        let Some(path) = self.cover_path.clone() else {
-            self.status = "This book has no cover to crop. Choose a cover first.".to_string();
-            cx.notify();
+        let title = self.selected_title();
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            &format!("Remove “{title}” from the library?"),
+            Some(
+                "The book and all of its files are deleted from the library folder. \
+                 This cannot be undone.",
+            ),
+            &["Remove", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(0) = receiver.await {
+                this.update_in(cx, |this, window, cx| this.remove_book(id, window, cx))
+                    .ok();
+            }
+        })
+        .detach();
+    }
+
+    fn remove_book(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let index = self.selected_index();
+        let title = self.selected_title();
+        let result = self
+            .library
+            .as_mut()
+            .map(|library| library.remove_book(id, true));
+        match result {
+            Some(Ok(())) => {
+                self.clear_selection();
+                self.refresh_all();
+                // Select the neighbour so the keyboard keeps working.
+                if let Some(index) = index {
+                    let next = index.min(self.books.len().saturating_sub(1));
+                    self.select_index(next, window, cx);
+                }
+                self.announce(format!("Removed “{title}”."), Tone::Success, window, cx);
+            }
+            Some(Err(err)) => {
+                self.announce(format!("Remove failed: {err}"), Tone::Error, window, cx)
+            }
+            None => self.set_status("Open a library first.", Tone::Info),
+        }
+        cx.notify();
+    }
+
+    // ---------------------------------------------------------------------
+    // OS integration for the selected book
+    // ---------------------------------------------------------------------
+
+    fn open_selected_externally(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
             return;
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
+        match self.preferred_format_path(id, &self.selected_formats) {
+            Some(path) => {
+                cx.open_with_system(&path);
+                self.set_status(
+                    format!("Opened {} in its default app.", display_name(&path)),
+                    Tone::Info,
+                );
+            }
+            None => self.announce("This book has no files to open.", Tone::Info, window, cx),
+        }
+        cx.notify();
+    }
+
+    pub fn open_format_externally(&mut self, format: &str, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let path = self
+            .library
+            .as_ref()
+            .and_then(|library| library.format_path(id, format).ok().flatten());
+        match path {
+            Some(path) => {
+                cx.open_with_system(&path);
+                self.set_status(format!("Opened {}.", display_name(&path)), Tone::Info);
+            }
+            None => self.set_status(format!("No {format} file was found."), Tone::Error),
+        }
+        cx.notify();
+    }
+
+    pub fn save_conversion(
+        &mut self,
+        source: &str,
+        extension: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((library, id)) = self.library.as_ref().zip(self.selected) else {
+            return;
+        };
+        let input = match library.format_path(id, source) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                self.announce(
+                    format!("No {source} file was found."),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
+                return;
+            }
             Err(err) => {
-                self.status = format!("Could not read cover: {err}");
+                self.announce(err.to_string(), Tone::Error, window, cx);
+                return;
+            }
+        };
+        let default = default_library_path();
+        let home = default.parent().unwrap_or_else(|| Path::new("."));
+        let suggested = format!(
+            "{}.{extension}",
+            text::sanitize_component(&self.selected_title())
+        );
+        let receiver = cx.prompt_for_new_path(home, Some(&suggested));
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(mut output))) = receiver.await else {
+                return;
+            };
+            if output.extension().is_none() {
+                output.set_extension(extension);
+            }
+            if !output
+                .extension()
+                .and_then(|suffix| suffix.to_str())
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(extension))
+            {
+                this.update_in(cx, |this, window, cx| {
+                    this.announce(
+                        format!("Choose a .{extension} filename."),
+                        Tone::Error,
+                        window,
+                        cx,
+                    );
+                })
+                .ok();
+                return;
+            }
+            let result = cx
+                .background_spawn(async move {
+                    cr_core::formats::convert(&input, &output).map(|()| output)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(output) => this.announce(
+                    format!("Saved {}.", display_name(&output)),
+                    Tone::Success,
+                    window,
+                    cx,
+                ),
+                Err(err) => {
+                    this.announce(format!("Conversion failed: {err}"), Tone::Error, window, cx)
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn reveal_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let file = self.preferred_format_path(id, &self.selected_formats);
+        let folder = self.library.as_ref().and_then(|library| {
+            self.selected_path
+                .as_ref()
+                .map(|relative| library.root().join(relative))
+        });
+        match file.or(folder) {
+            Some(path) => cx.reveal_path(&path),
+            None => self.set_status("This book has no files on disk.", Tone::Error),
+        }
+        cx.notify();
+    }
+
+    fn copy_book_info(&mut self, cx: &mut Context<Self>) {
+        let Some(metadata) = &self.metadata else {
+            return;
+        };
+        let text = if metadata.authors.is_empty() {
+            metadata.title.clone()
+        } else {
+            format!("{} — {}", metadata.title, metadata.authors.join(" & "))
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        self.set_status("Copied title and author.", Tone::Info);
+        cx.notify();
+    }
+
+    pub fn set_cover_from_file(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(err) => {
+                self.announce(
+                    format!("Could not read cover: {err}"),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
                 cx.notify();
                 return;
             }
         };
-        let source = match image::load_from_memory(&bytes) {
+        if let Err(err) = image::load_from_memory(&data) {
+            self.announce(
+                format!("Unsupported cover image: {err}"),
+                Tone::Error,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        let result = self
+            .library
+            .as_mut()
+            .map(|library| library.set_cover(id, Some(&data)));
+        match result {
+            Some(Ok(())) => {
+                self.load_book(id, window, cx);
+                self.refresh_all();
+                self.announce("Cover updated.", Tone::Success, window, cx);
+            }
+            Some(Err(err)) => self.announce(
+                format!("Cover update failed: {err}"),
+                Tone::Error,
+                window,
+                cx,
+            ),
+            None => self.set_status("Open a library first.", Tone::Info),
+        }
+        cx.notify();
+    }
+
+    fn prompt_cover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.is_none() || self.editing {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use as Cover".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.into_iter().next() {
+                    this.update_in(cx, |this, window, cx| {
+                        this.set_cover_from_file(&path, window, cx)
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ---------------------------------------------------------------------
+    // Devices
+    // ---------------------------------------------------------------------
+
+    /// Scans for e-readers off the UI thread: USB (MTP) discovery can block.
+    pub fn scan_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.scanning_devices {
+            return;
+        }
+        self.scanning_devices = true;
+        cx.notify();
+        let scan = cx.background_spawn(async move { device::discover() });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = scan.await;
+            this.update_in(cx, |this, _, cx| {
+                this.scanning_devices = false;
+                match result {
+                    Ok(devices) => this.devices = devices,
+                    Err(err) => this.set_status(format!("Device scan failed: {err}"), Tone::Error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn rescan_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_status("Looking for e-readers…", Tone::Info);
+        self.scan_devices(window, cx);
+    }
+
+    pub fn send_selected(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sending_to_device {
+            return;
+        }
+        let Some(id) = self.selected else {
+            return;
+        };
+        let Some(device) = self.devices.get(index).cloned() else {
+            self.announce(
+                "No e-reader is connected. Connect one in USB file-transfer mode and rescan.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        };
+        let Some(library) = &self.library else {
+            self.set_status("Open a library first.", Tone::Info);
+            cx.notify();
+            return;
+        };
+        // The transfer runs on a background thread with its own connection.
+        let path = library.root().to_path_buf();
+        let device_name = device.name.clone();
+        self.sending_to_device = true;
+        self.set_status(format!("Sending to {device_name}…"), Tone::Info);
+        cx.notify();
+        let transfer = cx.background_spawn(async move {
+            let library = Library::open(&path)?;
+            device::send(&library, &device, &[id], &SendOptions::default())
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = transfer.await;
+            this.update_in(cx, |this, window, cx| {
+                this.sending_to_device = false;
+                match result {
+                    Ok(report) => match (report.sent.first(), report.skipped.first()) {
+                        (Some(sent), _) => this.announce(
+                            format!(
+                                "Sent “{}” ({}) to {device_name}.",
+                                sent.title,
+                                format_size(sent.bytes)
+                            ),
+                            Tone::Success,
+                            window,
+                            cx,
+                        ),
+                        (_, Some((_, reason))) => {
+                            this.announce(format!("Nothing sent: {reason}"), Tone::Info, window, cx)
+                        }
+                        _ => this.set_status("Nothing sent.", Tone::Info),
+                    },
+                    Err(err) => {
+                        this.announce(format!("Send failed: {err}"), Tone::Error, window, cx)
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ---------------------------------------------------------------------
+    // Metadata editing
+    // ---------------------------------------------------------------------
+
+    pub fn begin_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen != Screen::Library || self.editing {
+            return;
+        }
+        if let Some(metadata) = self.metadata.clone() {
+            self.fill_form(&metadata, window, cx);
+            self.editing = true;
+            if !self.settings.inspector_visible {
+                self.settings.inspector_visible = true;
+                self.settings_changed(cx);
+            }
+            self.title_input
+                .update(cx, |input, cx| input.focus(window, cx));
+            self.set_status("Editing metadata. ⌘S saves, Esc cancels.", Tone::Info);
+            window.set_window_edited(true);
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(metadata) = self.metadata.clone() {
+            self.fill_form(&metadata, window, cx);
+        }
+        self.editing = false;
+        self.set_status("Changes discarded.", Tone::Info);
+        window.set_window_edited(self.has_unsaved_changes());
+        window.focus(&self.list_focus, cx);
+        cx.notify();
+    }
+
+    /// Saves the metadata form. Returns whether the save succeeded.
+    pub fn save_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(id) = self.selected else {
+            return false;
+        };
+        let update = match self.read_form(cx) {
+            Ok(update) => update,
+            Err(err) => {
+                self.announce(err, Tone::Error, window, cx);
+                cx.notify();
+                return false;
+            }
+        };
+        let Some(library) = self.library.as_mut() else {
+            self.set_status("Open a library first.", Tone::Info);
+            cx.notify();
+            return false;
+        };
+        let saved = match library.update_book(id, &update) {
+            Ok(()) => {
+                self.load_book(id, window, cx);
+                self.refresh_all();
+                if let Some(index) = self.selected_index() {
+                    self.scroll_to(index);
+                }
+                self.set_status("Metadata saved.", Tone::Success);
+                window.focus(&self.list_focus, cx);
+                true
+            }
+            Err(err) => {
+                self.announce(format!("Save failed: {err}"), Tone::Error, window, cx);
+                false
+            }
+        };
+        window.set_window_edited(self.has_unsaved_changes());
+        cx.notify();
+        saved
+    }
+
+    fn read_form(&self, cx: &App) -> Result<BookUpdate, String> {
+        let get = |input: &Entity<InputState>| input.read(cx).value().to_string();
+
+        let title = get(&self.title_input).trim().to_string();
+        if title.is_empty() {
+            return Err("Title cannot be empty.".to_string());
+        }
+        let authors = split_authors(&get(&self.authors_input));
+        let series = get(&self.series_input).trim().to_string();
+        let series_index = text::parse_series_index(&get(&self.series_index_input))
+            .ok_or("Series index must be a number.")?;
+        let publisher = get(&self.publisher_input).trim().to_string();
+        let tags = split_commas(&get(&self.tags_input));
+        let rating_raw = get(&self.rating_input).trim().to_string();
+        let rating = if rating_raw.is_empty() {
+            None
+        } else {
+            Some(
+                rating_raw
+                    .parse::<u8>()
+                    .map_err(|_| "Rating must be a number from 0 to 10.")?
+                    .min(10),
+            )
+        };
+        let languages = split_commas(&get(&self.languages_input));
+        let identifiers = parse_identifiers(&get(&self.identifiers_input))?;
+        let pubdate_raw = get(&self.pubdate_input).trim().to_string();
+        let pubdate = if pubdate_raw.is_empty() {
+            None
+        } else {
+            Some(
+                parse_user_date(&pubdate_raw)
+                    .ok_or("Publication date must look like YYYY-MM-DD.")?,
+            )
+        };
+        let comments_raw = self.comments_input.read(cx).value().to_string();
+        let comments = if comments_raw.trim().is_empty() {
+            None
+        } else {
+            Some(htmlize_comments(&comments_raw))
+        };
+
+        Ok(BookUpdate {
+            title: Some(title),
+            authors: Some(authors),
+            series: Some(Some(series).filter(|series| !series.is_empty())),
+            series_index: Some(series_index),
+            publisher: Some(Some(publisher).filter(|publisher| !publisher.is_empty())),
+            tags: Some(tags),
+            rating: Some(rating),
+            comments: Some(comments),
+            identifiers: Some(identifiers),
+            languages: Some(languages),
+            pubdate: Some(pubdate),
+            ..Default::default()
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Reader
+    // ---------------------------------------------------------------------
+
+    pub fn start_reading(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        if self.editing {
+            return;
+        }
+        let result = self
+            .library
+            .as_ref()
+            .map(|library| library.read_book(id, None));
+        match result {
+            Some(Ok(book)) if !book.chapters.is_empty() => {
+                self.chapters = book.chapters;
+                self.chapter_index = 0;
+                self.reader_title = self.selected_title();
+                self.screen = Screen::Reader;
+                self.reader_scroll.set_offset(point(px(0.), px(0.)));
+                window.focus(&self.reader_focus, cx);
+                self.set_status(
+                    format!("Reading {} chapter(s).", self.chapters.len()),
+                    Tone::Info,
+                );
+                self.sync_window_chrome(window);
+            }
+            Some(Ok(_)) => self.announce("No readable text in this file.", Tone::Info, window, cx),
+            Some(Err(err)) => self.announce(
+                format!("Cannot read this book: {err}"),
+                Tone::Error,
+                window,
+                cx,
+            ),
+            None => self.set_status("Open a library first.", Tone::Info),
+        }
+        cx.notify();
+    }
+
+    pub fn close_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.screen = Screen::Library;
+        self.reader_title.clear();
+        self.sync_window_chrome(window);
+        window.focus(&self.list_focus, cx);
+        if let Some(index) = self.selected_index() {
+            self.scroll_to(index);
+        }
+        cx.notify();
+    }
+
+    pub fn step_chapter(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.chapters.is_empty() {
+            return;
+        }
+        let next = self.chapter_index as isize + delta;
+        if next >= 0 && (next as usize) < self.chapters.len() {
+            self.set_chapter(next as usize, cx);
+        }
+    }
+
+    pub fn set_chapter(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.chapters.len() {
+            self.chapter_index = index;
+            self.reader_scroll.set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        }
+    }
+
+    fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let size = if delta == 0.0 {
+            DEFAULT_READER_FONT_SIZE
+        } else {
+            (self.settings.reader_font_size + delta)
+                .clamp(MIN_READER_FONT_SIZE, MAX_READER_FONT_SIZE)
+        };
+        if size != self.settings.reader_font_size {
+            self.settings.reader_font_size = size;
+            self.save_settings();
+        }
+        cx.notify();
+    }
+
+    // ---------------------------------------------------------------------
+    // Cover cropping
+    // ---------------------------------------------------------------------
+
+    pub fn begin_cover_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.selected else {
+            return;
+        };
+        if self.editing || self.screen != Screen::Library {
+            return;
+        }
+        let Some(path) = self.cover_path.clone() else {
+            self.announce(
+                "This book has no cover to crop. Choose a cover first.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        };
+        let loaded = std::fs::read(&path)
+            .map_err(|err| format!("Could not read cover: {err}"))
+            .and_then(|bytes| {
+                image::load_from_memory(&bytes)
+                    .map_err(|err| format!("Unsupported cover image: {err}"))
+            });
+        let source = match loaded {
             Ok(source) => source,
             Err(err) => {
-                self.status = format!("Unsupported cover image: {err}");
+                self.announce(err, Tone::Error, window, cx);
                 cx.notify();
                 return;
             }
@@ -675,18 +1780,19 @@ impl CalibreApp {
         set_input(&self.crop_height, "100".to_string(), window, cx);
         self.crop_source = Some(source);
         self.crop_book_id = Some(id);
-        self.cropping = true;
-        self.editing = false;
-        if let Err(err) = self.update_crop_preview(cx) {
-            self.status = err;
-        } else {
-            self.status =
-                "Adjust the crop or choose a preset, then save the cropped cover.".to_string();
+        self.screen = Screen::Crop;
+        window.focus(&self.focus_handle, cx);
+        match self.update_crop_preview(cx) {
+            Ok(()) => self.set_status(
+                "Drag the frame or pick a preset, then save the cover.",
+                Tone::Info,
+            ),
+            Err(err) => self.set_status(err, Tone::Error),
         }
         cx.notify();
     }
 
-    fn update_crop_preview(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+    pub fn update_crop_preview(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         let data = {
             let Some(source) = self.crop_source.as_ref() else {
                 return Err("No cover is loaded for cropping.".to_string());
@@ -694,13 +1800,7 @@ impl CalibreApp {
             let (left, top, width, height) = self.crop_percentages(cx)?;
             let (x, y, w, h) =
                 crop_pixels(source.width(), source.height(), left, top, width, height);
-            let cropped = source.crop_imm(x, y, w, h);
-            let mut data = Vec::new();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, 90);
-            encoder
-                .encode_image(&cropped.to_rgb8())
-                .map_err(|err| format!("Could not encode crop preview: {err}"))?;
-            data
+            encode_jpeg(&source.crop_imm(x, y, w, h), 90)?
         };
         if let Some(old) = self.crop_preview_path.take() {
             let _ = std::fs::remove_file(old);
@@ -717,27 +1817,30 @@ impl CalibreApp {
         Ok(())
     }
 
-    fn crop_percentages(&self, cx: &gpui_kit::App) -> Result<(f32, f32, f32, f32), String> {
+    pub fn crop_percentages(&self, cx: &App) -> Result<(f32, f32, f32, f32), String> {
         let value = |input: &Entity<InputState>, name: &str| -> Result<f32, String> {
-            let raw = input.read(cx).value().trim().to_string();
-            raw.parse::<f32>()
+            input
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<f32>()
                 .map_err(|_| format!("{name} must be a number from 0 to 100."))
         };
-        let mut left = value(&self.crop_left, "Left")?;
-        let mut top = value(&self.crop_top, "Top")?;
-        let mut width = value(&self.crop_width, "Width")?;
-        let mut height = value(&self.crop_height, "Height")?;
+        let left = value(&self.crop_left, "Left")?;
+        let top = value(&self.crop_top, "Top")?;
+        let width = value(&self.crop_width, "Width")?;
+        let height = value(&self.crop_height, "Height")?;
         if !(left.is_finite() && top.is_finite() && width.is_finite() && height.is_finite()) {
             return Err("Crop values must be finite numbers.".to_string());
         }
-        left = left.clamp(0.0, 99.0);
-        top = top.clamp(0.0, 99.0);
-        width = width.clamp(1.0, 100.0 - left);
-        height = height.clamp(1.0, 100.0 - top);
+        let left = left.clamp(0.0, 99.0);
+        let top = top.clamp(0.0, 99.0);
+        let width = width.clamp(1.0, 100.0 - left);
+        let height = height.clamp(1.0, 100.0 - top);
         Ok((left, top, width, height))
     }
 
-    fn crop_view_dims(&self, cx: &gpui_kit::App) -> (f32, f32) {
+    pub fn crop_view_dims(&self, cx: &App) -> (f32, f32) {
         let Some(source) = self.crop_source.as_ref() else {
             return (220., 330.);
         };
@@ -747,12 +1850,12 @@ impl CalibreApp {
         fit_dims(
             source.width() as f32 * width / 100.0,
             source.height() as f32 * height / 100.0,
-            240.,
-            380.,
+            260.,
+            400.,
         )
     }
 
-    fn start_crop_drag(
+    pub fn start_crop_drag(
         &mut self,
         position: Point<Pixels>,
         bounds: (f32, f32, f32, f32),
@@ -765,7 +1868,7 @@ impl CalibreApp {
         let (left, top, width, height) = match self.crop_percentages(cx) {
             Ok(values) => values,
             Err(err) => {
-                self.status = err;
+                self.set_status(err, Tone::Error);
                 cx.notify();
                 return;
             }
@@ -816,7 +1919,12 @@ impl CalibreApp {
         });
     }
 
-    fn drag_crop(&mut self, position: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn drag_crop(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(drag) = self.crop_drag else {
             return;
         };
@@ -824,52 +1932,42 @@ impl CalibreApp {
         let delta_y = (position.y.as_f32() - drag.start_y) / drag.display_height * 100.0;
         let (mut left, mut top, mut width, mut height) =
             (drag.left, drag.top, drag.width, drag.height);
+        let right = drag.left + drag.width;
+        let bottom = drag.top + drag.height;
+        let moves_left = matches!(
+            drag.mode,
+            CropDragMode::Left | CropDragMode::TopLeft | CropDragMode::BottomLeft
+        );
+        let moves_right = matches!(
+            drag.mode,
+            CropDragMode::Right | CropDragMode::TopRight | CropDragMode::BottomRight
+        );
+        let moves_top = matches!(
+            drag.mode,
+            CropDragMode::Top | CropDragMode::TopLeft | CropDragMode::TopRight
+        );
+        let moves_bottom = matches!(
+            drag.mode,
+            CropDragMode::Bottom | CropDragMode::BottomLeft | CropDragMode::BottomRight
+        );
 
-        match drag.mode {
-            CropDragMode::Move => {
-                left = (drag.left + delta_x).clamp(0.0, 100.0 - drag.width);
-                top = (drag.top + delta_y).clamp(0.0, 100.0 - drag.height);
-            }
-            CropDragMode::Left => {
-                let right = drag.left + drag.width;
-                left = (drag.left + delta_x).clamp(0.0, right - 1.0);
-                width = right - left;
-            }
-            CropDragMode::Right => {
-                width = (drag.width + delta_x).clamp(1.0, 100.0 - drag.left);
-            }
-            CropDragMode::Top => {
-                let bottom = drag.top + drag.height;
-                top = (drag.top + delta_y).clamp(0.0, bottom - 1.0);
-                height = bottom - top;
-            }
-            CropDragMode::Bottom => {
-                height = (drag.height + delta_y).clamp(1.0, 100.0 - drag.top);
-            }
-            CropDragMode::TopLeft => {
-                let right = drag.left + drag.width;
-                let bottom = drag.top + drag.height;
-                left = (drag.left + delta_x).clamp(0.0, right - 1.0);
-                top = (drag.top + delta_y).clamp(0.0, bottom - 1.0);
-                width = right - left;
-                height = bottom - top;
-            }
-            CropDragMode::TopRight => {
-                let bottom = drag.top + drag.height;
-                top = (drag.top + delta_y).clamp(0.0, bottom - 1.0);
-                width = (drag.width + delta_x).clamp(1.0, 100.0 - drag.left);
-                height = bottom - top;
-            }
-            CropDragMode::BottomLeft => {
-                let right = drag.left + drag.width;
-                left = (drag.left + delta_x).clamp(0.0, right - 1.0);
-                width = right - left;
-                height = (drag.height + delta_y).clamp(1.0, 100.0 - drag.top);
-            }
-            CropDragMode::BottomRight => {
-                width = (drag.width + delta_x).clamp(1.0, 100.0 - drag.left);
-                height = (drag.height + delta_y).clamp(1.0, 100.0 - drag.top);
-            }
+        if drag.mode == CropDragMode::Move {
+            left = (drag.left + delta_x).clamp(0.0, 100.0 - drag.width);
+            top = (drag.top + delta_y).clamp(0.0, 100.0 - drag.height);
+        }
+        if moves_left {
+            left = (drag.left + delta_x).clamp(0.0, right - 1.0);
+            width = right - left;
+        }
+        if moves_right {
+            width = (drag.width + delta_x).clamp(1.0, 100.0 - drag.left);
+        }
+        if moves_top {
+            top = (drag.top + delta_y).clamp(0.0, bottom - 1.0);
+            height = bottom - top;
+        }
+        if moves_bottom {
+            height = (drag.height + delta_y).clamp(1.0, 100.0 - drag.top);
         }
 
         set_input(&self.crop_left, format!("{left:.2}"), window, cx);
@@ -879,18 +1977,17 @@ impl CalibreApp {
         cx.notify();
     }
 
-    fn end_crop_drag(&mut self, cx: &mut Context<Self>) {
+    pub fn end_crop_drag(&mut self, cx: &mut Context<Self>) {
         if self.crop_drag.take().is_none() {
             return;
         }
-        match self.update_crop_preview(cx) {
-            Ok(()) => self.status = "Crop preview updated. Save to apply it.".to_string(),
-            Err(err) => self.status = err,
+        if let Err(err) = self.update_crop_preview(cx) {
+            self.set_status(err, Tone::Error);
         }
         cx.notify();
     }
 
-    fn apply_crop_preset(
+    pub fn apply_crop_preset(
         &mut self,
         target_aspect: Option<f32>,
         window: &mut Window,
@@ -917,42 +2014,33 @@ impl CalibreApp {
         set_input(&self.crop_top, format!("{:.2}", preset.1), window, cx);
         set_input(&self.crop_width, format!("{:.2}", preset.2), window, cx);
         set_input(&self.crop_height, format!("{:.2}", preset.3), window, cx);
-        match self.update_crop_preview(cx) {
-            Ok(()) => self.status = "Crop preset applied.".to_string(),
-            Err(err) => self.status = err,
+        if let Err(err) = self.update_crop_preview(cx) {
+            self.set_status(err, Tone::Error);
         }
         cx.notify();
     }
 
-    fn apply_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn apply_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.crop_book_id.or(self.selected) else {
             return;
         };
-        let data = {
-            let Some(source) = self.crop_source.as_ref() else {
-                self.status = "No cover is loaded for cropping.".to_string();
-                cx.notify();
-                return;
-            };
-            let (left, top, width, height) = match self.crop_percentages(cx) {
-                Ok(values) => values,
-                Err(err) => {
-                    self.status = err;
-                    cx.notify();
-                    return;
-                }
-            };
-            let (x, y, w, h) =
-                crop_pixels(source.width(), source.height(), left, top, width, height);
-            let cropped = source.crop_imm(x, y, w, h);
-            let mut data = Vec::new();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, 92);
-            if let Err(err) = encoder.encode_image(&cropped.to_rgb8()) {
-                self.status = format!("Could not encode cropped cover: {err}");
+        let encoded = match self.crop_source.as_ref() {
+            None => Err("No cover is loaded for cropping.".to_string()),
+            Some(source) => self
+                .crop_percentages(cx)
+                .and_then(|(left, top, width, height)| {
+                    let (x, y, w, h) =
+                        crop_pixels(source.width(), source.height(), left, top, width, height);
+                    encode_jpeg(&source.crop_imm(x, y, w, h), 92)
+                }),
+        };
+        let data = match encoded {
+            Ok(data) => data,
+            Err(err) => {
+                self.announce(err, Tone::Error, window, cx);
                 cx.notify();
                 return;
             }
-            data
         };
         let result = self
             .library
@@ -961,19 +2049,25 @@ impl CalibreApp {
         match result {
             Some(Ok(())) => {
                 self.clear_crop();
+                self.screen = Screen::Library;
                 self.load_book(id, window, cx);
-                self.reload(cx);
-                self.status = "Cover cropped and saved.".to_string();
+                self.refresh_all();
+                window.focus(&self.list_focus, cx);
+                self.announce("Cover cropped and saved.", Tone::Success, window, cx);
             }
-            Some(Err(err)) => self.status = format!("Cover crop failed: {err}"),
-            None => self.status = "Open a library first.".to_string(),
+            Some(Err(err)) => {
+                self.announce(format!("Cover crop failed: {err}"), Tone::Error, window, cx)
+            }
+            None => self.set_status("Open a library first.", Tone::Info),
         }
         cx.notify();
     }
 
-    fn cancel_crop(&mut self, cx: &mut Context<Self>) {
+    pub fn cancel_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_crop();
-        self.status = "Cover crop cancelled.".to_string();
+        self.screen = Screen::Library;
+        window.focus(&self.list_focus, cx);
+        self.set_status("Cover crop cancelled.", Tone::Info);
         cx.notify();
     }
 
@@ -981,54 +2075,74 @@ impl CalibreApp {
         if let Some(path) = self.crop_preview_path.take() {
             let _ = std::fs::remove_file(path);
         }
-        self.cropping = false;
         self.crop_book_id = None;
         self.crop_source = None;
         self.crop_drag = None;
+        if self.screen == Screen::Crop {
+            self.screen = Screen::Library;
+        }
     }
 
-    fn begin_epub_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    // ---------------------------------------------------------------------
+    // EPUB editor
+    // ---------------------------------------------------------------------
+
+    pub fn begin_epub_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected else {
             return;
         };
+        if self.editing || self.screen != Screen::Library {
+            return;
+        }
         if !self
             .selected_formats
             .iter()
             .any(|format| format.eq_ignore_ascii_case("EPUB"))
         {
-            self.status = "This book has no EPUB file to edit.".to_string();
+            self.announce(
+                "This book has no EPUB file to edit.",
+                Tone::Info,
+                window,
+                cx,
+            );
             cx.notify();
             return;
         }
         let dir = std::env::temp_dir().join(format!("calibre-rust-edit-{id}-{}", temp_stamp()));
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.status = format!("Could not create editor folder: {err}");
+            self.announce(
+                format!("Could not create editor folder: {err}"),
+                Tone::Error,
+                window,
+                cx,
+            );
             cx.notify();
             return;
         }
-        let result = self
+        let unpacked = self
             .library
             .as_ref()
             .map(|library| library.unpack_book(id, "EPUB", &dir));
-        match result {
-            Some(Ok(_)) => {}
-            Some(Err(err)) => {
-                let _ = std::fs::remove_dir_all(&dir);
-                self.status = format!("Could not unpack EPUB: {err}");
-                cx.notify();
-                return;
-            }
-            None => {
-                let _ = std::fs::remove_dir_all(&dir);
-                self.status = "Open a library first.".to_string();
-                cx.notify();
-                return;
-            }
+        if let Some(Err(err)) = unpacked {
+            let _ = std::fs::remove_dir_all(&dir);
+            self.announce(
+                format!("Could not unpack EPUB: {err}"),
+                Tone::Error,
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
         }
         let files = scan_epub_files(&dir);
         if files.is_empty() {
             let _ = std::fs::remove_dir_all(&dir);
-            self.status = "This EPUB has no editable text files.".to_string();
+            self.announce(
+                "This EPUB has no editable text files.",
+                Tone::Info,
+                window,
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -1038,20 +2152,23 @@ impl CalibreApp {
         self.epub_selected = None;
         self.epub_dirty = false;
         self.screen = Screen::Epub;
-        self.load_epub_file(0, window, cx);
-        self.status = format!(
-            "Editing EPUB for book #{id} ({} editable file(s)).",
-            self.epub_files.len()
-        );
+        window.focus(&self.focus_handle, cx);
+        // Start on the first content document rather than META-INF.
+        let first = self
+            .epub_files
+            .iter()
+            .position(|file| file.relative.ends_with(".xhtml") || file.relative.ends_with(".html"))
+            .unwrap_or(0);
+        self.load_epub_file(first, window, cx);
         cx.notify();
     }
 
-    fn load_epub_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn load_epub_file(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.epub_selected == Some(index) {
             return;
         }
         if let Err(err) = self.save_current_epub_file(cx) {
-            self.status = err;
+            self.set_status(err, Tone::Error);
             cx.notify();
             return;
         }
@@ -1063,12 +2180,14 @@ impl CalibreApp {
                 set_textarea(&self.epub_editor, text, window, cx);
                 self.epub_selected = Some(index);
                 self.epub_dirty = false;
-                self.status = format!("Editing {}.", file.relative);
+                self.set_status(format!("Editing {}.", file.relative), Tone::Info);
             }
-            Err(err) => {
-                self.status = format!("Could not read {}: {err}", file.relative);
-            }
+            Err(err) => self.set_status(
+                format!("Could not read {}: {err}", file.relative),
+                Tone::Error,
+            ),
         }
+        window.set_window_edited(self.has_unsaved_changes());
         cx.notify();
     }
 
@@ -1083,119 +2202,112 @@ impl CalibreApp {
             return Ok(());
         };
         let text = self.epub_editor.read(cx).value().to_string();
-        std::fs::write(&file.path, text)
+        std::fs::write(&file.path, &text)
             .map_err(|err| format!("Could not save {}: {err}", file.relative))?;
+        if let Some(entry) = self.epub_files.get_mut(index) {
+            entry.size = text.len() as u64;
+        }
         self.epub_dirty = false;
         Ok(())
     }
 
-    fn save_epub_action(&mut self, cx: &mut Context<Self>) {
+    pub fn save_epub_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self
             .epub_selected
             .and_then(|index| self.epub_files.get(index))
             .map(|file| file.relative.clone())
             .unwrap_or_default();
         match self.save_current_epub_file(cx) {
-            Ok(()) => self.status = format!("Saved {name}."),
-            Err(err) => self.status = err,
+            Ok(()) => self.set_status(
+                format!("Saved {name}. Repack to write the changes into the library."),
+                Tone::Success,
+            ),
+            Err(err) => self.set_status(err, Tone::Error),
         }
+        window.set_window_edited(self.has_unsaved_changes());
         cx.notify();
     }
 
-    fn repack_epub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Repacks the EPUB into the library. Returns whether it succeeded.
+    pub fn repack_epub(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let (Some(id), Some(dir)) = (self.epub_book_id, self.epub_dir.clone()) else {
-            return;
+            return false;
         };
         if let Err(err) = self.save_current_epub_file(cx) {
-            self.status = err;
+            self.announce(err, Tone::Error, window, cx);
             cx.notify();
-            return;
+            return false;
         }
         let output =
             std::env::temp_dir().join(format!("calibre-rust-repack-{id}-{}.epub", temp_stamp()));
-        let repacked = epub_formats::repack(&dir, &output);
-        match repacked {
-            Ok(count) => {
-                let replaced = self
-                    .library
+        let outcome = epub_formats::repack(&dir, &output)
+            .map_err(|err| format!("Could not repack EPUB: {err}"))
+            .and_then(|count| {
+                self.library
                     .as_mut()
-                    .map(|library| library.replace_format(id, "EPUB", &output));
-                match replaced {
-                    Some(Ok(())) => {
-                        let _ = std::fs::remove_dir_all(&dir);
-                        let _ = std::fs::remove_file(&output);
-                        self.epub_book_id = None;
-                        self.epub_dir = None;
-                        self.epub_files.clear();
-                        self.epub_selected = None;
-                        self.epub_dirty = false;
-                        self.screen = Screen::Library;
-                        self.load_book(id, window, cx);
-                        self.reload(cx);
-                        self.status =
-                            format!("Repacked {count} file(s) and replaced the library EPUB.");
-                    }
-                    Some(Err(err)) => {
-                        let _ = std::fs::remove_file(&output);
-                        self.status = format!("Could not replace the library EPUB: {err}");
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(&output);
-                        self.status = "Open a library first.".to_string();
-                    }
-                }
+                    .ok_or_else(|| "Open a library first.".to_string())?
+                    .replace_format(id, "EPUB", &output)
+                    .map_err(|err| format!("Could not replace the library EPUB: {err}"))?;
+                Ok(count)
+            });
+        let _ = std::fs::remove_file(&output);
+        let ok = match outcome {
+            Ok(count) => {
+                self.discard_epub_editor();
+                self.load_book(id, window, cx);
+                self.refresh_all();
+                window.focus(&self.list_focus, cx);
+                self.announce(
+                    format!("Repacked {count} files into the library EPUB."),
+                    Tone::Success,
+                    window,
+                    cx,
+                );
+                true
             }
             Err(err) => {
-                let _ = std::fs::remove_file(&output);
-                self.status = format!("Could not repack EPUB: {err}");
+                self.announce(err, Tone::Error, window, cx);
+                false
             }
-        }
+        };
+        window.set_window_edited(self.has_unsaved_changes());
         cx.notify();
+        ok
     }
 
-    fn close_epub_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn close_epub_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.epub_dirty {
-            self.close_epub_editor_now(cx);
+            self.discard_epub_editor();
+            self.set_status("Closed the EPUB editor.", Tone::Info);
+            window.focus(&self.list_focus, cx);
+            cx.notify();
             return;
         }
         let receiver = window.prompt(
             PromptLevel::Warning,
-            "Save changes before closing the EPUB editor?",
-            Some("Discard will lose edits made since the last save."),
-            &["Save & close", "Discard", "Cancel"],
+            "Save changes to the EPUB before closing?",
+            Some("Your edits are only written to the library when the EPUB is repacked."),
+            &["Repack & Close", "Discard Changes", "Cancel"],
             cx,
         );
-        cx.spawn_in(window, async move |this, cx| match receiver.await {
-            Ok(0) => {
-                this.update_in(cx, |this, _, cx| match this.save_current_epub_file(cx) {
-                    Ok(()) => this.close_epub_editor_now(cx),
-                    Err(err) => {
-                        this.status = err;
-                        cx.notify();
-                    }
-                })
-                .ok();
-            }
-            Ok(1) => {
-                this.update_in(cx, |this, _, cx| this.close_epub_editor_now(cx))
-                    .ok();
-            }
-            _ => {}
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = receiver.await;
+            this.update_in(cx, |this, window, cx| match answer {
+                Ok(0) => {
+                    this.repack_epub(window, cx);
+                }
+                Ok(1) => {
+                    this.discard_epub_editor();
+                    window.set_window_edited(this.has_unsaved_changes());
+                    window.focus(&this.list_focus, cx);
+                    this.set_status("Discarded EPUB edits.", Tone::Info);
+                    cx.notify();
+                }
+                _ => {}
+            })
+            .ok();
         })
         .detach();
-    }
-
-    fn close_epub_editor_now(&mut self, cx: &mut Context<Self>) {
-        if let Some(dir) = self.epub_dir.take() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        self.epub_book_id = None;
-        self.epub_files.clear();
-        self.epub_selected = None;
-        self.epub_dirty = false;
-        self.screen = Screen::Library;
-        self.status = "Closed the EPUB editor.".to_string();
-        cx.notify();
     }
 
     fn discard_epub_editor(&mut self) {
@@ -1211,1637 +2323,372 @@ impl CalibreApp {
         }
     }
 
-    fn begin_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(metadata) = self.metadata.clone() {
-            self.fill_form(&metadata, window, cx);
-            self.editing = true;
-            self.status = "Editing metadata. Save to write metadata.opf.".to_string();
-            cx.notify();
+    // ---------------------------------------------------------------------
+    // Closing and quitting
+    // ---------------------------------------------------------------------
+
+    fn window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.has_unsaved_changes() {
+            self.resolve_unsaved(AfterResolve::CloseWindow, window, cx);
+            return false;
         }
+        self.persist_window_state(window);
+        self.cleanup_temp_files();
+        true
     }
 
-    fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(metadata) = self.metadata.clone() {
-            self.fill_form(&metadata, window, cx);
-        }
-        self.editing = false;
-        self.status = "Changes discarded.".to_string();
-        cx.notify();
-    }
-
-    fn save_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        let get = |input: &Entity<InputState>| input.read(cx).value().to_string();
-
-        let title = get(&self.title_input).trim().to_string();
-        if title.is_empty() {
-            self.status = "Title cannot be empty.".to_string();
-            cx.notify();
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_unsaved_changes() {
+            self.resolve_unsaved(AfterResolve::Quit, window, cx);
             return;
         }
-        let authors = split_authors(&get(&self.authors_input));
-        let series = get(&self.series_input).trim().to_string();
-        let series_index = match text::parse_series_index(&get(&self.series_index_input)) {
-            Some(index) => index,
-            None => {
-                self.status = "Series index must be a number.".to_string();
-                cx.notify();
-                return;
-            }
-        };
-        let publisher = get(&self.publisher_input).trim().to_string();
-        let tags = split_commas(&get(&self.tags_input));
-        let rating_raw = get(&self.rating_input).trim().to_string();
-        let rating = if rating_raw.is_empty() {
-            Some(None)
-        } else {
-            match rating_raw.parse::<u8>() {
-                Ok(value) => Some(Some(value.min(10))),
-                Err(_) => {
-                    self.status = "Rating must be a number from 0 to 10.".to_string();
-                    cx.notify();
-                    return;
-                }
-            }
-        };
-        let languages = split_commas(&get(&self.languages_input));
-        let identifiers = match parse_identifiers(&get(&self.identifiers_input)) {
-            Ok(identifiers) => identifiers,
-            Err(err) => {
-                self.status = err;
-                cx.notify();
-                return;
-            }
-        };
-        let pubdate_raw = get(&self.pubdate_input).trim().to_string();
-        let pubdate = if pubdate_raw.is_empty() {
-            Some(None)
-        } else {
-            match parse_user_date(&pubdate_raw) {
-                Some(date) => Some(Some(date)),
-                None => {
-                    self.status = "Publication date must look like YYYY-MM-DD.".to_string();
-                    cx.notify();
-                    return;
-                }
-            }
-        };
-        let comments_raw = self.comments_input.read(cx).value().to_string();
-        let comments = if comments_raw.trim().is_empty() {
-            Some(None)
-        } else {
-            Some(Some(htmlize_comments(&comments_raw)))
-        };
-
-        let update = BookUpdate {
-            title: Some(title),
-            authors: Some(authors),
-            series: Some(if series.is_empty() {
-                None
-            } else {
-                Some(series)
-            }),
-            series_index: Some(series_index),
-            publisher: Some(if publisher.is_empty() {
-                None
-            } else {
-                Some(publisher)
-            }),
-            tags: Some(tags),
-            rating,
-            comments,
-            identifiers: Some(identifiers),
-            languages: Some(languages),
-            pubdate,
-            ..Default::default()
-        };
-
-        let Some(library) = self.library.as_mut() else {
-            self.status = "Open a library first.".to_string();
-            cx.notify();
-            return;
-        };
-        let result = library.update_book(id, &update);
-        match result {
-            Ok(()) => {
-                self.load_book(id, window, cx);
-                self.reload(cx);
-                self.status = "Metadata saved and metadata.opf updated.".to_string();
-            }
-            Err(err) => {
-                self.status = format!("Save failed: {err}");
-            }
-        }
-        cx.notify();
+        self.persist_window_state(window);
+        self.cleanup_temp_files();
+        cx.quit();
     }
 
-    fn remove_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        if !self.confirm_remove {
-            self.confirm_remove = true;
-            self.status = format!("Click Remove again to delete book #{id} and its files.");
-            cx.notify();
-            return;
-        }
-        let result = self
-            .library
-            .as_mut()
-            .map(|library| library.remove_book(id, true));
-        match result {
-            Some(Ok(())) => {
-                self.selected = None;
-                self.metadata = None;
-                self.cover_path = None;
-                self.selected_formats.clear();
-                self.selected_path = None;
-                self.confirm_remove = false;
-                self.reload(cx);
-                self.status = format!("Removed book #{id}.");
-            }
-            Some(Err(err)) => self.status = format!("Remove failed: {err}"),
-            None => self.status = "Open a library first.".to_string(),
-        }
-        cx.notify();
-    }
-
-    fn start_reading(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        let result = self
-            .library
-            .as_ref()
-            .map(|library| library.read_book(id, None));
-        match result {
-            Some(Ok(book)) if !book.chapters.is_empty() => {
-                self.chapters = book.chapters;
-                self.chapter_index = 0;
-                self.reader_title = self
-                    .metadata
-                    .as_ref()
-                    .map(|metadata| metadata.title.clone())
-                    .unwrap_or_else(|| format!("Book #{id}"));
-                self.screen = Screen::Reader;
-                self.status = format!("Reading {} chapter(s).", self.chapters.len());
-            }
-            Some(Ok(_)) => {
-                self.status =
-                    "No readable text in this format (try EPUB, FB2, TXT or HTML).".to_string();
-            }
-            Some(Err(err)) => self.status = format!("Cannot read this book: {err}"),
-            None => self.status = "Open a library first.".to_string(),
-        }
-        cx.notify();
-    }
-
-    fn step_chapter(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.chapters.is_empty() {
-            return;
-        }
-        let next = self.chapter_index as isize + delta;
-        if next >= 0 && (next as usize) < self.chapters.len() {
-            self.chapter_index = next as usize;
-            cx.notify();
-        }
-    }
-
-    fn set_chapter(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.chapters.len() {
-            self.chapter_index = index;
-            cx.notify();
-        }
-    }
-
-    fn refresh_devices(&mut self, cx: &mut Context<Self>) {
-        self.devices = device::discover();
-        self.status = format!("{} device(s) detected.", self.devices.len());
-        cx.notify();
-    }
-
-    fn send_selected(&mut self, device: Device, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        let result = self
-            .library
-            .as_ref()
-            .map(|library| device::send(library, &device, &[id], &SendOptions::default()));
-        match result {
-            Some(Ok(report)) => {
-                if let Some(sent) = report.sent.first() {
-                    self.status = format!(
-                        "Sent {} ({}) to {}.",
-                        sent.title,
-                        format_size(sent.bytes),
-                        device.name
-                    );
-                } else if let Some((_, reason)) = report.skipped.first() {
-                    self.status = format!("Nothing sent: {reason}");
-                }
-            }
-            Some(Err(err)) => self.status = format!("Send failed: {err}"),
-            None => self.status = "Open a library first.".to_string(),
-        }
-        cx.notify();
-    }
-
-    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.dark = !self.dark;
-        Theme::change(
-            if self.dark {
-                ThemeMode::Dark
-            } else {
-                ThemeMode::Light
-            },
-            None,
-            cx,
-        );
-        cx.notify();
-    }
-}
-
-impl Render for CalibreApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let background = cx.theme().background;
-        let foreground = cx.theme().foreground;
-        let header = header(self, cx);
-        let body = match self.screen {
-            Screen::Reader => reader_view(self, cx),
-            Screen::Epub => epub_editor_view(self, cx),
-            Screen::Library => library_view(self, cx),
-        };
-        let status = status_bar(self, cx);
-
-        v_flex()
-            .size_full()
-            .bg(background)
-            .text_color(foreground)
-            .child(header)
-            .child(body)
-            .child(status)
-    }
-}
-
-fn header(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let surface = cx.theme().secondary;
-    let background = cx.theme().background;
-    let border = cx.theme().border;
-    let primary = cx.theme().primary;
-
-    h_flex()
-        .h(px(56.))
-        .px_4()
-        .gap_2()
-        .items_center()
-        .bg(surface)
-        .border_b_1()
-        .border_color(border)
-        .child(
-            div()
-                .w(px(28.))
-                .h(px(28.))
-                .rounded(px(7.))
-                .bg(primary)
-                .text_color(background)
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_sm()
-                .font_weight(FontWeight::BOLD)
-                .child("cr"),
-        )
-        .child(Label::new("calibre-rust").font_weight(FontWeight::BOLD))
-        .child(div().w(px(16.)))
-        .child(Input::new(&app.library_path).w(px(360.)))
-        .child(
-            Button::new("open-library")
-                .primary()
-                .label("Open")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    let path = PathBuf::from(this.library_path.read(cx).value().to_string());
-                    this.open_library(path, window, cx);
-                })),
-        )
-        .child(
-            Button::new("new-library")
-                .label("New")
-                .on_click(cx.listener(|this, _, window, cx| this.create_library(window, cx))),
-        )
-        .child(
-            Button::new("browse-library")
-                .label("Browse...")
-                .on_click(cx.listener(|this, _, window, cx| this.browse_library(window, cx))),
-        )
-        .child(div().flex_1())
-        .child(
-            Button::new("add-books")
-                .primary()
-                .icon(IconName::Plus)
-                .label("Add books")
-                .on_click(cx.listener(|this, _, window, cx| this.browse_add_books(window, cx))),
-        )
-        .child(
-            Button::new("export-all")
-                .label(if app.query.is_empty() {
-                    "Export all"
-                } else {
-                    "Export filtered"
-                })
-                .on_click(cx.listener(|this, _, window, cx| this.browse_export_all(window, cx))),
-        )
-        .child(
-            Button::new("refresh-devices")
-                .icon(IconName::RefreshCw)
-                .label("Devices")
-                .on_click(cx.listener(|this, _, _, cx| this.refresh_devices(cx))),
-        )
-        .child(
-            Button::new("toggle-theme")
-                .label(if app.dark { "Light" } else { "Dark" })
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
-        )
-        .into_any_element()
-}
-
-fn library_view(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let background = cx.theme().background;
-    if app.library.is_none() {
-        return empty_state(
-            "No library open",
-            "Enter the path to a calibre library above, choose a folder, or create a new one.",
-            cx,
-        );
-    }
-    h_flex()
-        .flex_1()
-        .overflow_hidden()
-        .bg(background)
-        .child(sidebar(app, cx))
-        .child(detail_panel(app, cx))
-        .into_any_element()
-}
-
-fn sidebar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let surface = cx.theme().secondary;
-    let border = cx.theme().border;
-    let primary = cx.theme().primary;
-    let muted = cx.theme().muted_foreground;
-
-    let rows: Vec<AnyElement> = app
-        .books
-        .iter()
-        .map(|book| {
-            let id = book.id;
-            let selected = app.selected == Some(id);
-            let title = book.title.clone();
-            let authors = if book.authors.is_empty() {
-                "Unknown".to_string()
-            } else {
-                book.authors.join(" & ")
-            };
-            let formats = book.formats.join(" ");
-            let muted = muted;
-            let selected_bg = primary.opacity(0.12);
-            let hover_bg = primary.opacity(0.06);
-            h_flex()
-                .id(("book", id as usize))
-                .w_full()
-                .px_3()
-                .py_2()
-                .gap_3()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .bg(if selected { selected_bg } else { surface })
-                .hover(move |style| style.bg(hover_bg))
-                .on_click(cx.listener(move |this, _, window, cx| this.select_book(id, window, cx)))
-                .child(div().w(px(3.)).h(px(34.)).rounded(px(2.)).bg(if selected {
-                    primary
-                } else {
-                    surface
-                }))
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap_1()
-                        .child(Label::new(title).font_weight(FontWeight::MEDIUM))
-                        .child(Label::new(authors).text_xs().text_color(muted)),
-                )
-                .child(div().text_xs().text_color(muted).child(formats))
-                .into_any_element()
-        })
-        .collect();
-
-    let count = format!("{} book(s)", app.books.len());
-    v_flex()
-        .w(px(348.))
-        .h_full()
-        .bg(surface)
-        .border_r_1()
-        .border_color(border)
-        .child(
-            v_flex()
-                .p_3()
-                .gap_2()
-                .child(
-                    Input::new(&app.search)
-                        .cleanable(true)
-                        .prefix(Icon::new(IconName::Search).small()),
-                )
-                .child(
-                    h_flex()
-                        .justify_between()
-                        .child(Label::new(count).text_xs().text_color(muted))
-                        .child(
-                            Label::new(if app.query.is_empty() {
-                                "All books".to_string()
-                            } else {
-                                format!("Filter: {}", app.query)
-                            })
-                            .text_xs()
-                            .text_color(muted),
-                        ),
-                ),
-        )
-        .child(
-            div()
-                .id("library-scroll")
-                .flex_1()
-                .overflow_y_scroll()
-                .child(v_flex().px_2().pb_3().gap_1().children(rows)),
-        )
-        .into_any_element()
-}
-
-fn detail_panel(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let border = cx.theme().border;
-    if app.cropping {
-        return crop_panel(app, cx);
-    }
-    let Some(metadata) = &app.metadata else {
-        return v_flex()
-            .flex_1()
-            .child(empty_state(
-                "Select a book",
-                "Choose a book in the library to see its metadata, read it or send it to a device.",
-                cx,
-            ))
-            .into_any_element();
-    };
-    let Some(id) = app.selected else {
-        return empty_state("Select a book", "No book selected.", cx);
-    };
-
-    let muted = cx.theme().muted_foreground;
-    let primary = cx.theme().primary;
-    let surface = cx.theme().secondary;
-
-    let title = metadata.title.clone();
-    let authors = if metadata.authors.is_empty() {
-        "Unknown".to_string()
-    } else {
-        metadata.authors.join(" & ")
-    };
-    let series = metadata.series.clone();
-    let rating = metadata.rating;
-    let formats = app.selected_formats.join(" · ");
-    let tags = metadata.tags.clone();
-
-    let cover = cover_element(app, cx);
-
-    let mut meta_badges = h_flex().gap_2().flex_wrap();
-    if let Some(series) = series.clone() {
-        meta_badges = meta_badges.child(badge(
-            format!(
-                "{} #{}",
-                series,
-                text::format_series_index(metadata.series_index)
-            ),
-            primary.opacity(0.12),
-            primary,
-        ));
-    }
-    if let Some(rating) = rating {
-        meta_badges = meta_badges.child(badge(
-            format!("{}/5", rating / 2),
-            primary.opacity(0.12),
-            primary,
-        ));
-    }
-    meta_badges = meta_badges.child(badge(
-        if formats.is_empty() {
-            "no formats".to_string()
-        } else {
-            formats
-        },
-        surface,
-        muted,
-    ));
-
-    let header =
-        h_flex()
-            .gap_5()
-            .items_start()
-            .child(cover)
-            .child(
-                v_flex()
-                    .flex_1()
-                    .gap_2()
-                    .child(Label::new(title).text_xl().font_weight(FontWeight::BOLD))
-                    .child(Label::new(authors).text_color(muted))
-                    .child(meta_badges)
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .flex_wrap()
-                            .children(tags.iter().map(|tag| badge(tag.clone(), surface, muted))),
-                    ),
+    fn resolve_unsaved(&mut self, then: AfterResolve, window: &mut Window, cx: &mut Context<Self>) {
+        let (message, detail) = if self.epub_book_id.is_some() {
+            (
+                "Repack your EPUB changes before closing?",
+                "Edits that are not repacked are lost when calibre-rust closes.",
             )
-            .child(
-                v_flex()
-                    .w(px(170.))
-                    .gap_2()
-                    .child(
-                        Button::new("read-book")
-                            .primary()
-                            .icon(IconName::BookOpen)
-                            .label("Read")
-                            .on_click(cx.listener(|this, _, _, cx| this.start_reading(cx))),
-                    )
-                    .child(if app.editing {
-                        Button::new("cancel-edit").label("Cancel").on_click(
-                            cx.listener(|this, _, window, cx| this.cancel_edit(window, cx)),
-                        )
-                    } else {
-                        Button::new("edit-book").label("Edit metadata").on_click(
-                            cx.listener(|this, _, window, cx| this.begin_edit(window, cx)),
-                        )
-                    })
-                    .child(
-                        Button::new("change-cover").label("Cover...").on_click(
-                            cx.listener(|this, _, window, cx| this.browse_cover(window, cx)),
-                        ),
-                    )
-                    .child(Button::new("crop-cover").label("Crop cover").on_click(
-                        cx.listener(|this, _, window, cx| this.begin_cover_crop(window, cx)),
-                    ))
-                    .child(Button::new("edit-epub").label("Edit EPUB...").on_click(
-                        cx.listener(|this, _, window, cx| this.begin_epub_edit(window, cx)),
-                    ))
-                    .child(Button::new("export-book").label("Export...").on_click(
-                        cx.listener(|this, _, window, cx| this.browse_export(window, cx)),
-                    ))
-                    .child(
-                        Button::new("remove-book")
-                            .danger()
-                            .label(if app.confirm_remove {
-                                "Confirm remove"
-                            } else {
-                                "Remove"
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| this.remove_selected(cx))),
-                    ),
-            );
-
-    let body = if app.editing {
-        edit_form(app, cx)
-    } else {
-        details(app, metadata, cx)
-    };
-
-    v_flex()
-        .id("details-scroll")
-        .flex_1()
-        .h_full()
-        .overflow_y_scroll()
-        .p_6()
-        .gap_5()
-        .child(header)
-        .child(div().h(px(1.)).w_full().bg(border))
-        .child(body)
-        .child(devices_panel(app, id, cx))
-        .into_any_element()
-}
-
-fn details(app: &CalibreApp, metadata: &Metadata, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let muted = cx.theme().muted_foreground;
-    let border = cx.theme().border;
-
-    let series = match &metadata.series {
-        Some(series) => format!(
-            "{} #{}",
-            series,
-            text::format_series_index(metadata.series_index)
-        ),
-        None => String::new(),
-    };
-    let identifiers = metadata
-        .identifiers
-        .iter()
-        .map(|(kind, value)| format!("{kind}={value}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let comments = metadata
-        .comments
-        .as_deref()
-        .map(html::html_to_text)
-        .unwrap_or_default();
-    let comments = if comments.chars().count() > 1200 {
-        format!("{}…", comments.chars().take(1200).collect::<String>())
-    } else {
-        comments
-    };
-
-    v_flex()
-        .w_full()
-        .gap_3()
-        .child(metadata_row("Series", series, muted))
-        .child(metadata_row(
-            "Publisher",
-            metadata.publisher.clone().unwrap_or_default(),
-            muted,
-        ))
-        .child(metadata_row("Tags", metadata.tags.join(", "), muted))
-        .child(metadata_row(
-            "Rating",
-            metadata
-                .rating
-                .map(|rating| format!("{}/5", rating / 2))
-                .unwrap_or_default(),
-            muted,
-        ))
-        .child(metadata_row(
-            "Languages",
-            metadata.languages.join(", "),
-            muted,
-        ))
-        .child(metadata_row("Identifiers", identifiers, muted))
-        .child(metadata_row(
-            "Published",
-            metadata
-                .pubdate
-                .as_ref()
-                .map(|date| date.format("%Y-%m-%d").to_string())
-                .unwrap_or_default(),
-            muted,
-        ))
-        .child(metadata_row(
-            "Added",
-            metadata
-                .timestamp
-                .as_ref()
-                .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
-                .unwrap_or_default(),
-            muted,
-        ))
-        .child(metadata_row(
-            "Formats",
-            app.selected_formats.join(", "),
-            muted,
-        ))
-        .child(metadata_row(
-            "Path",
-            app.selected_path.clone().unwrap_or_default(),
-            muted,
-        ))
-        .child(
-            v_flex()
-                .w_full()
-                .gap_1()
-                .pt_2()
-                .child(Label::new("Comments").text_xs().text_color(muted))
-                .child(
-                    div()
-                        .id("comments-scroll")
-                        .w_full()
-                        .max_h(px(220.))
-                        .overflow_y_scroll()
-                        .p_3()
-                        .rounded(px(6.))
-                        .bg(cx.theme().secondary)
-                        .border_1()
-                        .border_color(border)
-                        .text_sm()
-                        .child(if comments.trim().is_empty() {
-                            "No comments.".to_string()
-                        } else {
-                            comments
-                        }),
-                ),
-        )
-        .into_any_element()
-}
-
-fn edit_form(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let muted = cx.theme().muted_foreground;
-
-    let field_input =
-        |label: &str, input: &Entity<InputState>| field(label, Input::new(input).w_full(), muted);
-
-    v_flex()
-        .w_full()
-        .gap_4()
-        .child(
-            h_flex()
-                .flex_wrap()
-                .gap_4()
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Title", &app.title_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Authors", &app.authors_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Series", &app.series_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Series index", &app.series_index_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Publisher", &app.publisher_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Tags", &app.tags_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Rating (0-10)", &app.rating_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Languages", &app.languages_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Identifiers", &app.identifiers_input)),
-                )
-                .child(
-                    div()
-                        .w(px(310.))
-                        .child(field_input("Published", &app.pubdate_input)),
-                ),
-        )
-        .child(field(
-            "Comments / description",
-            Textarea::new(&app.comments_input).w_full().h(px(150.)),
-            muted,
-        ))
-        .child(
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("save-metadata")
-                        .primary()
-                        .label("Save metadata")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.save_metadata(window, cx)),
-                        ),
-                )
-                .child(
-                    Button::new("discard-metadata")
-                        .label("Discard")
-                        .on_click(cx.listener(|this, _, window, cx| this.cancel_edit(window, cx))),
-                ),
-        )
-        .into_any_element()
-}
-
-fn devices_panel(app: &CalibreApp, _id: i64, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let muted = cx.theme().muted_foreground;
-    let border = cx.theme().border;
-
-    let device_buttons: Vec<AnyElement> = app
-        .devices
-        .iter()
-        .enumerate()
-        .map(|(index, device)| {
-            let device = device.clone();
-            Button::new(("send-to-device", index))
-                .label(format!("Send to {}", device.name))
-                .on_click(cx.listener(move |this, _, _, cx| this.send_selected(device.clone(), cx)))
-                .into_any_element()
-        })
-        .collect();
-
-    v_flex()
-        .w_full()
-        .pt_4()
-        .gap_2()
-        .border_t_1()
-        .border_color(border)
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(Label::new("Send to device").font_weight(FontWeight::MEDIUM))
-                .child(
-                    Button::new("scan-devices")
-                        .ghost()
-                        .icon(IconName::RefreshCw)
-                        .label("Scan")
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_devices(cx))),
-                ),
-        )
-        .child(if app.devices.is_empty() {
-            div()
-                .text_sm()
-                .text_color(muted)
-                .child("No e-reader detected. Connect a Kindle, Kobo or USB reader and press Scan.")
-                .into_any_element()
         } else {
-            h_flex()
-                .gap_2()
-                .flex_wrap()
-                .children(device_buttons)
-                .into_any_element()
-        })
-        .into_any_element()
-}
-
-fn reader_view(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    if app.chapters.is_empty() {
-        return empty_state(
-            "Nothing to read",
-            "Choose a book with readable text and press Read.",
+            (
+                "Save metadata changes before closing?",
+                "Your changes to this book will be lost if you don’t save them.",
+            )
+        };
+        let receiver = window.prompt(
+            PromptLevel::Warning,
+            message,
+            Some(detail),
+            &["Save", "Don’t Save", "Cancel"],
             cx,
         );
-    }
-    let border = cx.theme().border;
-    let surface = cx.theme().secondary;
-    let muted = cx.theme().muted_foreground;
-    let primary = cx.theme().primary;
-
-    let current = app.chapters.get(app.chapter_index);
-    let chapter_title = current
-        .map(|chapter| chapter.title.clone())
-        .unwrap_or_default();
-    let chapter_text = current
-        .map(|chapter| chapter.text.clone())
-        .unwrap_or_default();
-    let total_words: usize = app
-        .chapters
-        .iter()
-        .map(|chapter| chapter.text.split_whitespace().count())
-        .sum();
-
-    let chapter_rows: Vec<AnyElement> = app
-        .chapters
-        .iter()
-        .enumerate()
-        .map(|(index, chapter)| {
-            let selected = index == app.chapter_index;
-            let title = chapter.title.clone();
-            let words = chapter.text.split_whitespace().count();
-            h_flex()
-                .id(("chapter", index))
-                .w_full()
-                .px_3()
-                .py_2()
-                .gap_2()
-                .rounded(px(6.))
-                .cursor_pointer()
-                .bg(if selected {
-                    primary.opacity(0.12)
-                } else {
-                    surface
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.set_chapter(index, cx)))
-                .child(
-                    div()
-                        .w(px(26.))
-                        .text_xs()
-                        .text_color(if selected { primary } else { muted })
-                        .child(format!("{:>2}", index + 1)),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap_1()
-                        .child(Label::new(title).text_sm())
-                        .child(
-                            Label::new(format!("{words} words"))
-                                .text_xs()
-                                .text_color(muted),
-                        ),
-                )
-                .into_any_element()
-        })
-        .collect();
-
-    let paragraphs: Vec<AnyElement> = chapter_text
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|paragraph| !paragraph.is_empty())
-        .map(|paragraph| {
-            div()
-                .w_full()
-                .text_base()
-                .child(paragraph.to_string())
-                .into_any_element()
-        })
-        .collect();
-
-    v_flex()
-        .flex_1()
-        .overflow_hidden()
-        .child(
-            h_flex()
-                .px_4()
-                .py_2()
-                .gap_2()
-                .items_center()
-                .border_b_1()
-                .border_color(border)
-                .bg(surface)
-                .child(
-                    Button::new("back-to-library")
-                        .icon(IconName::ChevronLeft)
-                        .label("Library")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.screen = Screen::Library;
-                            cx.notify();
-                        })),
-                )
-                .child(Label::new(app.reader_title.clone()).font_weight(FontWeight::BOLD))
-                .child(div().flex_1())
-                .child(
-                    Button::new("previous-chapter")
-                        .icon(IconName::ChevronLeft)
-                        .label("Prev")
-                        .on_click(cx.listener(|this, _, _, cx| this.step_chapter(-1, cx))),
-                )
-                .child(
-                    Label::new(format!(
-                        "{} / {}",
-                        app.chapter_index + 1,
-                        app.chapters.len()
-                    ))
-                    .text_sm()
-                    .text_color(muted),
-                )
-                .child(
-                    Button::new("next-chapter")
-                        .icon(IconName::ChevronRight)
-                        .label("Next")
-                        .on_click(cx.listener(|this, _, _, cx| this.step_chapter(1, cx))),
-                ),
-        )
-        .child(
-            h_flex()
-                .flex_1()
-                .overflow_hidden()
-                .child(
-                    v_flex()
-                        .w(px(300.))
-                        .h_full()
-                        .bg(surface)
-                        .border_r_1()
-                        .border_color(border)
-                        .child(
-                            v_flex()
-                                .p_3()
-                                .gap_1()
-                                .child(Label::new("Chapters").font_weight(FontWeight::BOLD))
-                                .child(
-                                    Label::new(format!(
-                                        "{} chapters · {} words",
-                                        app.chapters.len(),
-                                        total_words
-                                    ))
-                                    .text_xs()
-                                    .text_color(muted),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("chapter-scroll")
-                                .flex_1()
-                                .overflow_y_scroll()
-                                .child(v_flex().px_2().pb_3().gap_1().children(chapter_rows)),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("reader-scroll")
-                        .flex_1()
-                        .h_full()
-                        .overflow_y_scroll()
-                        .p_8()
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .max_w(px(820.))
-                                .gap_4()
-                                .child(
-                                    Label::new(chapter_title)
-                                        .text_xl()
-                                        .font_weight(FontWeight::BOLD),
-                                )
-                                .child(div().w(px(48.)).h(px(2.)).bg(primary))
-                                .children(paragraphs),
-                        ),
-                ),
-        )
-        .into_any_element()
-}
-
-fn crop_panel(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let border = cx.theme().border;
-    let surface = cx.theme().secondary;
-    let muted = cx.theme().muted_foreground;
-    let primary = cx.theme().primary;
-
-    let (original_width, original_height) = match app.crop_source.as_ref() {
-        Some(source) => fit_dims(source.width() as f32, source.height() as f32, 280., 420.),
-        None => (280., 420.),
-    };
-    let (crop_left, crop_top, crop_width, crop_height) =
-        app.crop_percentages(cx).unwrap_or((0.0, 0.0, 100.0, 100.0));
-    let bounds_cell = Rc::new(Cell::new((0.0f32, 0.0f32, 0.0f32, 0.0f32)));
-    let original = match &app.cover_path {
-        Some(path) => {
-            let bounds_for_mouse = bounds_cell.clone();
-            div()
-                .relative()
-                .w(px(original_width))
-                .h(px(original_height))
-                .rounded(px(6.))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                        let bounds = bounds_for_mouse.get();
-                        this.start_crop_drag(event.position, bounds, cx);
-                    }),
-                )
-                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
-                    if event.dragging() {
-                        this.drag_crop(event.position, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let answer = receiver.await;
+            this.update_in(cx, |this, window, cx| {
+                let proceed = match answer {
+                    Ok(0) => {
+                        let mut ok = true;
+                        if this.epub_book_id.is_some() {
+                            ok = this.repack_epub(window, cx);
+                        }
+                        if ok && this.editing {
+                            ok = this.save_metadata(window, cx);
+                        }
+                        ok
                     }
-                }))
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|this, _event: &MouseUpEvent, _, cx| this.end_crop_drag(cx)),
-                )
-                .on_mouse_up_out(
-                    MouseButton::Left,
-                    cx.listener(|this, _event: &MouseUpEvent, _, cx| this.end_crop_drag(cx)),
-                )
-                .child(img(path.clone()).absolute().size_full())
-                .child(
-                    canvas(
-                        {
-                            let bounds_cell = bounds_cell.clone();
-                            move |bounds, _, _| {
-                                bounds_cell.set((
-                                    bounds.origin.x.as_f32(),
-                                    bounds.origin.y.as_f32(),
-                                    bounds.size.width.as_f32(),
-                                    bounds.size.height.as_f32(),
-                                ))
-                            }
-                        },
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .size_full(),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .left(relative(crop_left / 100.0))
-                        .top(relative(crop_top / 100.0))
-                        .w(relative(crop_width / 100.0))
-                        .h(relative(crop_height / 100.0))
-                        .border_1()
-                        .border_color(primary)
-                        .child(
-                            div()
-                                .absolute()
-                                .top(-px(4.))
-                                .left(-px(4.))
-                                .w(px(8.))
-                                .h(px(8.))
-                                .rounded(px(4.))
-                                .bg(primary),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(-px(4.))
-                                .right(-px(4.))
-                                .w(px(8.))
-                                .h(px(8.))
-                                .rounded(px(4.))
-                                .bg(primary),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom(-px(4.))
-                                .left(-px(4.))
-                                .w(px(8.))
-                                .h(px(8.))
-                                .rounded(px(4.))
-                                .bg(primary),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom(-px(4.))
-                                .right(-px(4.))
-                                .w(px(8.))
-                                .h(px(8.))
-                                .rounded(px(4.))
-                                .bg(primary),
-                        ),
-                )
-                .into_any_element()
-        }
-        None => div()
-            .w(px(original_width))
-            .h(px(original_height))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(border)
-            .bg(surface)
-            .into_any_element(),
-    };
-    let (preview_width, preview_height) = app.crop_view_dims(cx);
-    let preview = match &app.crop_preview_path {
-        Some(path) => img(path.clone())
-            .w(px(preview_width))
-            .h(px(preview_height))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(border)
-            .into_any_element(),
-        None => v_flex()
-            .w(px(preview_width))
-            .h(px(preview_height))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(border)
-            .bg(surface)
-            .items_center()
-            .justify_center()
-            .child(Label::new("Press Preview crop").text_xs().text_color(muted))
-            .into_any_element(),
-    };
-    let source_dims = app
-        .crop_source
-        .as_ref()
-        .map(|source| format!("{} x {} px", source.width(), source.height()))
-        .unwrap_or_default();
+                    Ok(1) => {
+                        this.discard_epub_editor();
+                        this.editing = false;
+                        true
+                    }
+                    _ => false,
+                };
+                if !proceed {
+                    return;
+                }
+                this.persist_window_state(window);
+                this.cleanup_temp_files();
+                match then {
+                    AfterResolve::CloseWindow => window.remove_window(),
+                    AfterResolve::Quit => cx.quit(),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
 
-    v_flex()
-        .id("crop-scroll")
-        .flex_1()
-        .h_full()
-        .overflow_y_scroll()
-        .p_6()
-        .gap_5()
-        .child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Button::new("cancel-crop-top")
-                        .icon(IconName::ChevronLeft)
-                        .label("Cancel")
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_crop(cx))),
-                )
-                .child(
-                    Label::new("Crop cover")
-                        .text_xl()
-                        .font_weight(FontWeight::BOLD),
-                )
-                .child(div().flex_1())
-                .child(Label::new(source_dims).text_xs().text_color(muted)),
-        )
-        .child(
-            h_flex()
-                .gap_6()
-                .items_start()
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(Label::new("Crop selection").text_xs().text_color(muted))
-                        .child(original)
-                        .child(
-                            Label::new("Drag the box or its corners to crop.")
-                                .text_xs()
-                                .text_color(muted),
-                        ),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .gap_3()
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .child(
-                                    Label::new("Preview (updates on release)")
-                                        .text_xs()
-                                        .text_color(muted),
-                                )
-                                .child(preview),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .flex_wrap()
-                                .child(
-                                    Button::new("crop-preset-2-3")
-                                        .label("2:3")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.apply_crop_preset(Some(2.0 / 3.0), window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("crop-preset-square")
-                                        .label("1:1")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.apply_crop_preset(Some(1.0), window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("crop-preset-3-4")
-                                        .label("3:4")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.apply_crop_preset(Some(0.75), window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("crop-preset-original")
-                                        .label("Original")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.apply_crop_preset(None, window, cx)
-                                        })),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_3()
-                                .flex_wrap()
-                                .child(
-                                    div().w(px(140.)).child(field(
-                                        "Left %",
-                                        Input::new(&app.crop_left).w_full(),
-                                        muted,
-                                    )),
-                                )
-                                .child(
-                                    div().w(px(140.)).child(field(
-                                        "Top %",
-                                        Input::new(&app.crop_top).w_full(),
-                                        muted,
-                                    )),
-                                )
-                                .child(
-                                    div().w(px(140.)).child(field(
-                                        "Width %",
-                                        Input::new(&app.crop_width).w_full(),
-                                        muted,
-                                    )),
-                                )
-                                .child(
-                                    div().w(px(140.)).child(field(
-                                        "Height %",
-                                        Input::new(&app.crop_height).w_full(),
-                                        muted,
-                                    )),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("preview-crop")
-                                        .label("Preview crop")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            match this.update_crop_preview(cx) {
-                                                Ok(()) => {
-                                                    this.status =
-                                                        "Crop preview updated.".to_string()
-                                                }
-                                                Err(err) => this.status = err,
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new("save-crop")
-                                        .primary()
-                                        .label("Save cropped cover")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.apply_crop(window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("cancel-crop")
-                                        .label("Cancel")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_crop(cx)
-                                        })),
-                                ),
-                        ),
-                ),
-        )
-        .child(
-            Label::new(
-                "Percentages are relative to the original cover. 2:3 is the usual ebook cover ratio.",
+    fn persist_window_state(&mut self, window: &Window) {
+        let (bounds, maximized) = match window.window_bounds() {
+            WindowBounds::Windowed(bounds) | WindowBounds::Fullscreen(bounds) => (bounds, false),
+            WindowBounds::Maximized(bounds) => (bounds, true),
+        };
+        self.settings.window = Some(SavedBounds {
+            x: bounds.origin.x.as_f32(),
+            y: bounds.origin.y.as_f32(),
+            width: bounds.size.width.as_f32(),
+            height: bounds.size.height.as_f32(),
+            maximized,
+        });
+        self.save_settings();
+    }
+
+    /// Last chance to save state when the OS quits the app directly (Dock
+    /// "Quit", logout, AppleScript), bypassing the Quit action.
+    pub fn prepare_for_quit(&mut self, window: &Window) {
+        self.persist_window_state(window);
+        self.cleanup_temp_files();
+    }
+
+    fn cleanup_temp_files(&mut self) {
+        self.clear_crop();
+        self.discard_epub_editor();
+    }
+
+    // ---------------------------------------------------------------------
+    // Action dispatch
+    // ---------------------------------------------------------------------
+
+    /// Registers every window-level action handler on the root element.
+    pub fn register_actions(&self, root: Div, cx: &mut Context<Self>) -> Div {
+        root.on_action(cx.listener(|this, _: &Quit, window, cx| this.request_quit(window, cx)))
+            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| {
+                if this.window_should_close(window, cx) {
+                    window.remove_window();
+                }
+            }))
+            .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
+            .on_action(cx.listener(|_, _: &Zoom, window, _| window.zoom_window()))
+            .on_action(cx.listener(|_, _: &ToggleFullScreen, window, _| window.toggle_fullscreen()))
+            .on_action(cx.listener(|this, _: &About, window, cx| this.show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| {
+                this.show_shortcuts = !this.show_shortcuts;
+                cx.notify();
+            }))
+            // File
+            .on_action(
+                cx.listener(|this, _: &AddBooks, window, cx| this.prompt_add_books(window, cx)),
             )
-            .text_xs()
-            .text_color(muted),
-        )
-        .into_any_element()
-}
+            .on_action(
+                cx.listener(|this, _: &OpenLibrary, window, cx| {
+                    this.prompt_open_library(window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &NewLibrary, window, cx| this.prompt_new_library(window, cx)),
+            )
+            .on_action(cx.listener(|this, action: &OpenRecentLibrary, window, cx| {
+                if let Some(path) = this.settings.recent_libraries.get(action.0).cloned() {
+                    this.open_library(path, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ClearRecentLibraries, _, cx| {
+                this.settings.recent_libraries.clear();
+                this.settings_changed(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportSelected, window, cx| {
+                let ids = this.selected.into_iter().collect();
+                this.prompt_export(ids, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportAll, window, cx| {
+                let ids = this.books.iter().map(|book| book.id).collect();
+                this.prompt_export(ids, window, cx);
+            }))
+            // Edit
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if this.screen != Screen::Library || this.library.is_none() {
+                    return;
+                }
+                this.search.update(cx, |input, cx| input.focus(window, cx));
+            }))
+            .on_action(cx.listener(Self::on_cancel))
+            .on_action(
+                cx.listener(|this, _: &SaveChanges, window, cx| match this.screen {
+                    Screen::Epub => this.save_epub_action(window, cx),
+                    Screen::Crop => this.apply_crop(window, cx),
+                    Screen::Library if this.editing => {
+                        this.save_metadata(window, cx);
+                    }
+                    _ => {}
+                }),
+            )
+            // View
+            .on_action(cx.listener(|this, _: &ShowAsList, _, cx| this.set_view(ViewMode::List, cx)))
+            .on_action(cx.listener(|this, _: &ShowAsGrid, _, cx| this.set_view(ViewMode::Grid, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.settings.sidebar_visible = !this.settings.sidebar_visible;
+                this.settings_changed(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDetailsPane, _, cx| {
+                this.settings.inspector_visible = !this.settings.inspector_visible;
+                this.settings_changed(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ThemeSystem, window, cx| {
+                this.set_theme(ThemePreference::System, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ThemeLight, window, cx| {
+                this.set_theme(ThemePreference::Light, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ThemeDark, window, cx| {
+                this.set_theme(ThemePreference::Dark, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &SortByTitle, _, cx| this.set_sort(BookSort::Title, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SortByAuthor, _, cx| this.set_sort(BookSort::Author, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SortByDateAdded, _, cx| this.set_sort(BookSort::Date, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SortByPublished, _, cx| {
+                    this.set_sort(BookSort::Pubdate, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &SortBySeries, _, cx| this.set_sort(BookSort::Series, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SortByRating, _, cx| this.set_sort(BookSort::Rating, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleSortDirection, _, cx| {
+                let sort = this.settings.sort();
+                this.set_sort(sort, cx);
+            }))
+            // Book
+            .on_action(cx.listener(|this, _: &ReadBook, window, cx| {
+                if this.screen == Screen::Library {
+                    this.start_reading(window, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &EditMetadata, window, cx| this.begin_edit(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ChangeCover, window, cx| this.prompt_cover(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CropCover, window, cx| this.begin_cover_crop(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &EditEpub, window, cx| this.begin_epub_edit(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &RepackEpub, window, cx| {
+                this.repack_epub(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenInDefaultApp, window, cx| {
+                this.open_selected_externally(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RevealInFileManager, _, cx| this.reveal_selected(cx)))
+            .on_action(cx.listener(|this, _: &CopyBookInfo, _, cx| this.copy_book_info(cx)))
+            .on_action(cx.listener(|this, _: &RemoveBook, window, cx| {
+                if this.screen == Screen::Library && !this.editing {
+                    this.confirm_remove(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SendToFirstDevice, window, cx| {
+                this.send_selected(0, window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &SendToDevice, window, cx| {
+                this.send_selected(action.0, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &RescanDevices, window, cx| this.rescan_devices(window, cx)),
+            )
+            // List navigation
+            .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
+                let step = this.vertical_step();
+                this.move_selection(-step, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectNext, window, cx| {
+                let step = this.vertical_step();
+                this.move_selection(step, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectLeft, window, cx| {
+                if this.settings.view == ViewMode::Grid {
+                    this.move_selection(-1, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SelectRight, window, cx| {
+                if this.settings.view == ViewMode::Grid {
+                    this.move_selection(1, window, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &SelectFirst, window, cx| this.select_index(0, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
+                let last = this.books.len().saturating_sub(1);
+                this.select_index(last, window, cx);
+            }))
+            // Reader
+            .on_action(cx.listener(|this, _: &PreviousChapter, _, cx| this.step_chapter(-1, cx)))
+            .on_action(cx.listener(|this, _: &NextChapter, _, cx| this.step_chapter(1, cx)))
+            .on_action(
+                cx.listener(|this, _: &IncreaseFontSize, _, cx| this.change_font_size(1.0, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &DecreaseFontSize, _, cx| this.change_font_size(-1.0, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ResetFontSize, _, cx| this.change_font_size(0.0, cx)))
+            .on_action(cx.listener(|this, _: &ToggleChapterList, _, cx| {
+                this.chapter_list_visible = !this.chapter_list_visible;
+                cx.notify();
+            }))
+    }
 
-fn epub_editor_view(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let border = cx.theme().border;
-    let surface = cx.theme().secondary;
-    let muted = cx.theme().muted_foreground;
-    let primary = cx.theme().primary;
+    fn vertical_step(&self) -> isize {
+        match self.settings.view {
+            ViewMode::List => 1,
+            ViewMode::Grid => self.grid_columns() as isize,
+        }
+    }
 
-    if app.epub_files.is_empty() {
-        return empty_state(
-            "No editable EPUB files",
-            "Close the editor and try another book.",
+    fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+        if self.settings.view != view {
+            self.settings.view = view;
+            if let Some(index) = self.selected_index() {
+                self.scroll_to(index);
+            }
+            self.settings_changed(cx);
+        }
+    }
+
+    /// Escape backs out of whatever is in progress, innermost first.
+    fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.show_shortcuts {
+            self.show_shortcuts = false;
+            cx.notify();
+            return;
+        }
+        match self.screen {
+            Screen::Crop => self.cancel_crop(window, cx),
+            Screen::Epub => self.close_epub_editor(window, cx),
+            Screen::Reader => self.close_reader(window, cx),
+            Screen::Library if self.editing => self.cancel_edit(window, cx),
+            Screen::Library if !self.query.is_empty() => {
+                self.query.clear();
+                set_input(&self.search, String::new(), window, cx);
+                self.reload();
+                if let Some(index) = self.selected_index() {
+                    self.scroll_to(index);
+                }
+                window.focus(&self.list_focus, cx);
+                cx.notify();
+            }
+            Screen::Library => window.focus(&self.list_focus, cx),
+        }
+    }
+
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let detail = format!(
+            "Version {}\nA small, fast ebook library manager that works with calibre libraries.",
+            env!("CARGO_PKG_VERSION")
+        );
+        let receiver = window.prompt(
+            PromptLevel::Info,
+            "calibre-rust",
+            Some(&detail),
+            &["OK", "Website"],
             cx,
         );
-    }
-    let Some(selected) = app.epub_selected else {
-        return empty_state("No file selected", "Choose a file on the left.", cx);
-    };
-    let Some(current) = app.epub_files.get(selected) else {
-        return empty_state("No file selected", "Choose a file on the left.", cx);
-    };
-    let book_title = app
-        .metadata
-        .as_ref()
-        .map(|metadata| metadata.title.clone())
-        .unwrap_or_else(|| "EPUB".to_string());
-
-    let rows: Vec<AnyElement> = app
-        .epub_files
-        .iter()
-        .enumerate()
-        .map(|(index, file)| {
-            let is_selected = app.epub_selected == Some(index);
-            let relative = file.relative.clone();
-            h_flex()
-                .id(("epub-file", index))
-                .w_full()
-                .px_3()
-                .py_2()
-                .rounded(px(5.))
-                .cursor_pointer()
-                .bg(if is_selected {
-                    primary.opacity(0.12)
-                } else {
-                    surface
-                })
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.load_epub_file(index, window, cx)),
-                )
-                .child(Label::new(relative).text_xs())
-                .into_any_element()
+        cx.spawn(async move |_, cx| {
+            if let Ok(1) = receiver.await {
+                cx.update(|cx| cx.open_url(PROJECT_URL));
+            }
         })
-        .collect();
-
-    let dirty_label = if app.epub_dirty {
-        "Unsaved changes"
-    } else {
-        "Saved"
-    };
-
-    v_flex()
-        .flex_1()
-        .overflow_hidden()
-        .child(
-            h_flex()
-                .px_4()
-                .py_2()
-                .gap_2()
-                .items_center()
-                .border_b_1()
-                .border_color(border)
-                .bg(surface)
-                .child(
-                    Button::new("close-epub-editor")
-                        .icon(IconName::ChevronLeft)
-                        .label("Library")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.close_epub_editor(window, cx)),
-                        ),
-                )
-                .child(Label::new("EPUB editor").font_weight(FontWeight::BOLD))
-                .child(Label::new(book_title).text_sm().text_color(muted))
-                .child(div().flex_1())
-                .child(
-                    Label::new(dirty_label)
-                        .text_xs()
-                        .text_color(if app.epub_dirty { primary } else { muted }),
-                )
-                .child(
-                    Button::new("save-epub-file")
-                        .label("Save file")
-                        .on_click(cx.listener(|this, _, _, cx| this.save_epub_action(cx))),
-                )
-                .child(
-                    Button::new("repack-epub")
-                        .primary()
-                        .label("Repack & replace")
-                        .on_click(cx.listener(|this, _, window, cx| this.repack_epub(window, cx))),
-                ),
-        )
-        .child(
-            h_flex()
-                .flex_1()
-                .overflow_hidden()
-                .child(
-                    v_flex()
-                        .w(px(330.))
-                        .h_full()
-                        .bg(surface)
-                        .border_r_1()
-                        .border_color(border)
-                        .child(
-                            v_flex()
-                                .p_3()
-                                .gap_1()
-                                .child(Label::new("Editable files").font_weight(FontWeight::MEDIUM))
-                                .child(
-                                    Label::new(format!("{} file(s)", app.epub_files.len()))
-                                        .text_xs()
-                                        .text_color(muted),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("epub-file-scroll")
-                                .flex_1()
-                                .overflow_y_scroll()
-                                .child(v_flex().px_2().pb_3().gap_1().children(rows)),
-                        ),
-                )
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .h_full()
-                        .min_h(px(0.))
-                        .p_4()
-                        .gap_2()
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .child(
-                                    Label::new(current.relative.clone())
-                                        .font_weight(FontWeight::MEDIUM),
-                                )
-                                .child(
-                                    Label::new(format_size(current.size))
-                                        .text_xs()
-                                        .text_color(muted),
-                                ),
-                        )
-                        .child(Textarea::new(&app.epub_editor).w_full().h(relative(1.))),
-                ),
-        )
-        .into_any_element()
-}
-
-fn cover_element(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let border = cx.theme().border;
-    let surface = cx.theme().secondary;
-    let muted = cx.theme().muted_foreground;
-
-    match &app.cover_path {
-        Some(path) => img(path.clone())
-            .w(px(132.))
-            .h(px(198.))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(border)
-            .into_any_element(),
-        None => v_flex()
-            .w(px(132.))
-            .h(px(198.))
-            .rounded(px(6.))
-            .border_1()
-            .border_color(border)
-            .bg(surface)
-            .items_center()
-            .justify_center()
-            .child(Icon::new(IconName::BookOpen).large().text_color(muted))
-            .into_any_element(),
+        .detach();
     }
 }
 
-fn metadata_row(label: &str, value: String, muted: Hsla) -> AnyElement {
-    h_flex()
-        .w_full()
-        .gap_4()
-        .items_start()
-        .child(
-            div()
-                .w(px(110.))
-                .text_sm()
-                .text_color(muted)
-                .child(label.to_string()),
-        )
-        .child(div().flex_1().text_sm().child(if value.trim().is_empty() {
-            "—".to_string()
-        } else {
-            value
-        }))
-        .into_any_element()
-}
-
-fn field(label: &str, control: impl IntoElement, muted: Hsla) -> AnyElement {
-    v_flex()
-        .w_full()
-        .gap_1()
-        .child(Label::new(label.to_string()).text_xs().text_color(muted))
-        .child(control)
-        .into_any_element()
-}
-
-fn badge(text: String, background: Hsla, foreground: Hsla) -> AnyElement {
-    div()
-        .px_2()
-        .py_1()
-        .rounded(px(5.))
-        .bg(background)
-        .text_color(foreground)
-        .text_xs()
-        .child(text)
-        .into_any_element()
-}
-
-fn empty_state(title: &str, subtitle: &str, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let muted = cx.theme().muted_foreground;
-    v_flex()
-        .flex_1()
-        .h_full()
-        .items_center()
-        .justify_center()
-        .gap_2()
-        .p_8()
-        .child(Icon::new(IconName::BookOpen).large().text_color(muted))
-        .child(
-            Label::new(title.to_string())
-                .text_xl()
-                .font_weight(FontWeight::BOLD),
-        )
-        .child(
-            div()
-                .max_w(px(460.))
-                .text_center()
-                .text_sm()
-                .text_color(muted)
-                .child(subtitle.to_string()),
-        )
-        .into_any_element()
-}
-
-fn status_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
-    let surface = cx.theme().secondary;
-    let border = cx.theme().border;
-    let muted = cx.theme().muted_foreground;
-    h_flex()
-        .h(px(26.))
-        .px_4()
-        .items_center()
-        .bg(surface)
-        .border_t_1()
-        .border_color(border)
-        .text_xs()
-        .text_color(muted)
-        .child(app.status.clone())
-        .into_any_element()
-}
+// -------------------------------------------------------------------------
+// Free helpers
+// -------------------------------------------------------------------------
 
 fn text_input(
     placeholder: &str,
@@ -2851,12 +2698,7 @@ fn text_input(
     cx.new(|cx| InputState::new(window, cx).placeholder(placeholder.to_string()))
 }
 
-fn set_input(
-    input: &Entity<InputState>,
-    value: String,
-    window: &mut Window,
-    cx: &mut Context<CalibreApp>,
-) {
+pub fn set_input(input: &Entity<InputState>, value: String, window: &mut Window, cx: &mut App) {
     input.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 
@@ -2873,13 +2715,16 @@ fn text_area(
     })
 }
 
-fn set_textarea(
-    input: &Entity<TextareaState>,
-    value: String,
-    window: &mut Window,
-    cx: &mut Context<CalibreApp>,
-) {
+fn set_textarea(input: &Entity<TextareaState>, value: String, window: &mut Window, cx: &mut App) {
     input.update(cx, |state, cx| state.set_value(value, window, cx));
+}
+
+fn encode_jpeg(image: &DynamicImage, quality: u8) -> Result<Vec<u8>, String> {
+    let mut data = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, quality)
+        .encode_image(&image.to_rgb8())
+        .map_err(|err| format!("Could not encode the cover: {err}"))?;
+    Ok(data)
 }
 
 fn crop_pixels(
@@ -2901,7 +2746,7 @@ fn crop_pixels(
     (x, y, width, height)
 }
 
-fn fit_dims(width: f32, height: f32, max_width: f32, max_height: f32) -> (f32, f32) {
+pub fn fit_dims(width: f32, height: f32, max_width: f32, max_height: f32) -> (f32, f32) {
     if width <= 0.0 || height <= 0.0 {
         return (max_width, max_height);
     }
@@ -2929,18 +2774,14 @@ fn collect_epub_files(root: &Path, directory: &Path, files: &mut Vec<EpubFile>) 
             collect_epub_files(root, &path, files);
             continue;
         }
-        if !file_type.is_file() {
-            continue;
-        }
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !matches!(
-            extension.as_str(),
-            "xhtml" | "html" | "htm" | "css" | "opf" | "ncx" | "xml" | "svg" | "txt" | "js"
-        ) {
+        let editable = file_type.is_file()
+            && files::has_extension(
+                &path,
+                &[
+                    "xhtml", "html", "htm", "css", "opf", "ncx", "xml", "svg", "txt", "js",
+                ],
+            );
+        if !editable {
             continue;
         }
         files.push(EpubFile {
@@ -2991,7 +2832,7 @@ fn parse_identifiers(input: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(identifiers)
 }
 
-fn default_library_path() -> PathBuf {
+pub fn default_library_path() -> PathBuf {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -2999,7 +2840,13 @@ fn default_library_path() -> PathBuf {
         .join("Calibre Library")
 }
 
-fn format_size(bytes: u64) -> String {
+pub fn display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+pub fn format_size(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -3011,5 +2858,56 @@ fn format_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn crop_pixels_stay_inside_the_image() {
+        assert_eq!(
+            crop_pixels(100, 200, 0.0, 0.0, 100.0, 100.0),
+            (0, 0, 100, 200)
+        );
+        assert_eq!(
+            crop_pixels(100, 200, 50.0, 50.0, 100.0, 100.0),
+            (50, 100, 50, 100)
+        );
+        assert_eq!(crop_pixels(10, 10, 99.0, 99.0, 1.0, 1.0), (9, 9, 1, 1));
+    }
+
+    #[core::prelude::v1::test]
+    fn identifiers_parse_both_separators() {
+        let parsed = parse_identifiers("ISBN=123, asin:B00X").unwrap();
+        assert_eq!(parsed.get("isbn").map(String::as_str), Some("123"));
+        assert_eq!(parsed.get("asin").map(String::as_str), Some("B00X"));
+        assert!(parse_identifiers("nope").is_err());
+    }
+
+    #[core::prelude::v1::test]
+    fn categories_count_and_sort_case_insensitively() {
+        let book = |authors: &[&str], tags: &[&str]| BookSummary {
+            id: 1,
+            title: "t".into(),
+            authors: authors.iter().map(|a| a.to_string()).collect(),
+            author_sort: String::new(),
+            publisher: None,
+            series: None,
+            series_index: 1.0,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            rating: None,
+            formats: vec!["EPUB".into()],
+            has_cover: false,
+            timestamp: None,
+            pubdate: None,
+            path: String::new(),
+        };
+        let categories =
+            Categories::from_books(&[book(&["b", "A"], &["x"]), book(&["A"], &["x", "Y"])]);
+        assert_eq!(categories.authors, vec![("A".into(), 2), ("b".into(), 1)]);
+        assert_eq!(categories.tags, vec![("x".into(), 2), ("Y".into(), 1)]);
+        assert_eq!(categories.formats, vec![("EPUB".into(), 2)]);
     }
 }
