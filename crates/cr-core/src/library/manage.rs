@@ -297,38 +297,53 @@ impl Library {
         if !self.formats(id)?.iter().any(|have| *have == format) {
             return Err(Error::Other(format!("book {id} has no {format} format")));
         }
-        // The file reaches the trash before the record goes, so a failure
-        // never leaves a file the library no longer knows about.
-        let mut moved = None;
-        if let Some(path) = self.format_path(id, &format)? {
-            let trash = self.trash_dir('f', id);
-            fs::create_dir_all(&trash)?;
-            let meta = self.get_metadata(id)?;
-            let label = serde_json::json!({"title": meta.title, "authors": meta.authors});
-            write_atomic(&trash.join(TRASH_LABEL), label.to_string().as_bytes())?;
-            // Staged under another name so an older trashed copy of this
-            // format survives if the record cannot be removed.
-            let staged = trash.join(format!("{}.incoming", format.to_ascii_lowercase()));
-            copy_atomic(&path, &staged)?;
-            moved = Some((path, staged));
-        }
-        let deleted = self.conn.execute(
+        let live = self.format_path(id, &format)?;
+        let trash = self.trash_dir('f', id);
+        let label = match &live {
+            Some(_) => {
+                let meta = self.get_metadata(id)?;
+                Some(serde_json::json!({"title": meta.title, "authors": meta.authors}))
+            }
+            None => None,
+        };
+        // The record goes only once the file is safely in the trash, and an
+        // older trashed copy of this format is kept until that is certain.
+        let tx = self.conn.transaction()?;
+        tx.execute(
             "DELETE FROM data WHERE book=?1 AND format=?2 COLLATE NOCASE",
             params![id, format],
-        );
-        match (deleted, moved) {
-            (Ok(_), Some((path, staged))) => {
-                fs::rename(&staged, staged.with_extension(""))?;
-                fs::remove_file(&path)?;
+        )?;
+        let Some((live, label)) = live.zip(label) else {
+            tx.commit()?;
+            return self.sync_book(id);
+        };
+        fs::create_dir_all(&trash)?;
+        write_atomic(&trash.join(TRASH_LABEL), label.to_string().as_bytes())?;
+        let name = format.to_ascii_lowercase();
+        let target = trash.join(&name);
+        let staged = trash.join(format!("{name}.incoming"));
+        let previous = trash.join(format!("{name}.previous"));
+        let had_previous = target.is_file();
+        let placed = (|| -> Result<()> {
+            copy_atomic(&live, &staged)?;
+            if had_previous {
+                fs::rename(&target, &previous)?;
             }
-            (Ok(_), None) => {}
-            (Err(error), moved) => {
-                if let Some((_, target)) = moved {
-                    let _ = fs::remove_file(target);
-                }
-                return Err(error.into());
+            fs::rename(&staged, &target)?;
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = placed {
+            let _ = fs::remove_file(&staged);
+            if had_previous && previous.is_file() {
+                let _ = fs::rename(&previous, &target);
+            } else if !had_previous {
+                let _ = fs::remove_file(&target);
             }
+            return Err(error);
         }
+        let _ = fs::remove_file(&previous);
+        fs::remove_file(&live)?;
         self.sync_book(id)
     }
 
