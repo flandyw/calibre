@@ -2870,7 +2870,12 @@ impl CalibreApp {
         let Some(dir) = self.epub_dir.clone() else {
             return;
         };
-        if let Err(err) = self.save_current_epub_file(cx) {
+        // Writing the file for the check does not put it in the library, so
+        // the editor still has unsaved work afterwards.
+        let dirty = self.epub_dirty;
+        let written = self.save_current_epub_file(cx);
+        self.epub_dirty = dirty;
+        if let Err(err) = written {
             self.announce(err, Tone::Error, window, cx);
             return;
         }
