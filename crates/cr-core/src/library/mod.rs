@@ -1438,12 +1438,13 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let directory = path.parent().unwrap_or(Path::new("."));
     let mut temporary = shared_temporary(directory)?;
-    temporary.write_all(bytes)?;
+    // Match the replaced file's mode before any content is written.
     if let Ok(existing) = fs::metadata(path) {
         temporary
             .as_file()
             .set_permissions(existing.permissions())?;
     }
+    temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
