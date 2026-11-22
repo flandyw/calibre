@@ -221,18 +221,28 @@ enum RtfTarget {
 
 fn parse_rtf(data: &[u8]) -> Rtf {
     let mut rtf = Rtf::default();
-    let mut stack: Vec<RtfTarget> = Vec::new();
+    // Each group has its own destination and `\uc` fallback length.
+    let mut stack: Vec<(RtfTarget, usize)> = Vec::new();
     let mut target = RtfTarget::Body;
+    let mut fallback = 1usize;
+    let mut encoding = encoding_rs::WINDOWS_1252;
+    // The first half of a UTF-16 surrogate pair.
+    let mut high: Option<u16> = None;
     // Fallback characters still to skip after a `\u` escape.
     let mut skip = 0usize;
     let mut pending: Vec<u8> = Vec::new();
     let mut position = 0;
 
-    fn flush(rtf: &mut Rtf, target: RtfTarget, pending: &mut Vec<u8>) {
+    fn flush(
+        rtf: &mut Rtf,
+        target: RtfTarget,
+        pending: &mut Vec<u8>,
+        encoding: &'static encoding_rs::Encoding,
+    ) {
         if pending.is_empty() {
             return;
         }
-        let (decoded, _, _) = encoding_rs::WINDOWS_1252.decode(pending);
+        let (decoded, _, _) = encoding.decode(pending);
         match target {
             RtfTarget::Body => rtf.body.push_str(&decoded),
             RtfTarget::Info(field) => rtf.info[field].push_str(&decoded),
@@ -253,12 +263,12 @@ fn parse_rtf(data: &[u8]) -> Rtf {
         position += 1;
         match byte {
             b'{' => {
-                flush(&mut rtf, target, &mut pending);
-                stack.push(target);
+                flush(&mut rtf, target, &mut pending, encoding);
+                stack.push((target, fallback));
             }
             b'}' => {
-                flush(&mut rtf, target, &mut pending);
-                target = stack.pop().unwrap_or(RtfTarget::Body);
+                flush(&mut rtf, target, &mut pending, encoding);
+                (target, fallback) = stack.pop().unwrap_or((RtfTarget::Body, 1));
             }
             b'\\' => {
                 let Some(&next) = data.get(position) else {
@@ -306,7 +316,7 @@ fn parse_rtf(data: &[u8]) -> Rtf {
                 if data.get(position) == Some(&b' ') {
                     position += 1;
                 }
-                flush(&mut rtf, target, &mut pending);
+                flush(&mut rtf, target, &mut pending, encoding);
                 match word {
                     "par" | "line" | "sect" | "page" => emit(&mut rtf, target, "\n"),
                     "tab" => emit(&mut rtf, target, "\t"),
@@ -317,12 +327,32 @@ fn parse_rtf(data: &[u8]) -> Rtf {
                     "ldblquote" => emit(&mut rtf, target, "“"),
                     "rdblquote" => emit(&mut rtf, target, "”"),
                     "u" => {
-                        // Negative values are the code point minus 65536.
-                        let code = number.unwrap_or(0).rem_euclid(65536) as u32;
-                        if let Some(ch) = char::from_u32(code) {
-                            emit(&mut rtf, target, ch.encode_utf8(&mut [0; 4]));
+                        // A UTF-16 unit; negative values are it minus 65536.
+                        let unit = number.unwrap_or(0).rem_euclid(65536) as u16;
+                        let units = match high.take() {
+                            Some(first) => vec![first, unit],
+                            None => vec![unit],
+                        };
+                        match String::from_utf16(&units) {
+                            Ok(text) => emit(&mut rtf, target, &text),
+                            Err(_) if (0xD800..0xDC00).contains(&unit) => high = Some(unit),
+                            Err(_) => {}
                         }
-                        skip = 1;
+                        skip = fallback;
+                    }
+                    "uc" => fallback = number.unwrap_or(1).max(0) as usize,
+                    "ansicpg" => {
+                        let label = match number.unwrap_or(1252) {
+                            932 => "shift_jis".to_string(),
+                            936 => "gbk".to_string(),
+                            949 => "euc-kr".to_string(),
+                            950 => "big5".to_string(),
+                            10000 => "macintosh".to_string(),
+                            page => format!("windows-{page}"),
+                        };
+                        if let Some(found) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+                            encoding = found;
+                        }
                     }
                     "bin" => position += number.unwrap_or(0).max(0) as usize,
                     "info" => target = RtfTarget::Skip,
@@ -344,7 +374,7 @@ fn parse_rtf(data: &[u8]) -> Rtf {
             other => pending.push(other),
         }
     }
-    flush(&mut rtf, target, &mut pending);
+    flush(&mut rtf, target, &mut pending, encoding);
     rtf
 }
 
@@ -554,6 +584,11 @@ mod tests {
         assert_eq!(rtf.info[0], "My Book");
         assert_eq!(rtf.info[1], "Ann Lee");
         assert_eq!(rtf.body, "Café —dash\nSecond bold line\n");
+
+        let rtf = parse_rtf(
+            br"{\rtf1\ansi\ansicpg1251 \'cf\'f0\'e8 {\uc2 \u8212 --x}\uc0 \u-10179 \u-8704 !\par}",
+        );
+        assert_eq!(rtf.body, "При —x😀!\n");
     }
 
     #[test]
