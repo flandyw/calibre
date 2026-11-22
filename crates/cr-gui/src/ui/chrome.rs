@@ -216,8 +216,11 @@ fn library_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
 
 fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     let muted = cx.theme().muted_foreground;
-    let total = app.chapters.len();
-    let position = format!("{} / {}", app.chapter_index + 1, total);
+    let total = app.book.as_ref().map_or(0, |book| book.sections.len());
+    let position = match app.book.as_ref() {
+        Some(book) => format!("{:.0}%", book.fraction(app.reader_locator()) * 100.0),
+        None => String::new(),
+    };
     h_flex()
         .w_full()
         .gap_1()
@@ -263,6 +266,24 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             "Bigger text",
             IncreaseFontSize,
         ))
+        .child(tool_button(
+            "reader-find",
+            IconName::Search,
+            "Find in book",
+            FindInBook,
+        ))
+        .child(tool_button(
+            "reader-bookmark",
+            Lucide::Bookmark,
+            "Bookmark this place",
+            ToggleBookmark,
+        ))
+        .child(tool_button(
+            "reader-highlight",
+            Lucide::Highlighter,
+            "Highlight the selected paragraph",
+            ToggleHighlight,
+        ))
         .child(div().w(px(8.)))
         .child(
             tool_button(
@@ -271,7 +292,7 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 "Previous chapter",
                 PreviousChapter,
             )
-            .disabled(app.chapter_index == 0),
+            .disabled(app.section_index == 0),
         )
         .child(div().text_xs().text_color(muted).child(position))
         .child(
@@ -281,7 +302,7 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 "Next chapter",
                 NextChapter,
             )
-            .disabled(app.chapter_index + 1 >= total),
+            .disabled(app.section_index + 1 >= total),
         )
         .into_any_element()
 }
@@ -740,6 +761,10 @@ pub fn shortcuts_overlay(window: &mut Window, cx: &mut Context<CalibreApp>) -> A
             row("Smaller text", &DecreaseFontSize, reader_ctx, window),
             row("Actual size", &ResetFontSize, reader_ctx, window),
             row("Toggle chapters", &ToggleChapterList, reader_ctx, window),
+            row("Find in book", &FindInBook, reader_ctx, window),
+            row("Next match", &NextMatch, reader_ctx, window),
+            row("Bookmark", &ToggleBookmark, reader_ctx, window),
+            row("Highlight paragraph", &ToggleHighlight, reader_ctx, window),
         ],
         cx,
     );

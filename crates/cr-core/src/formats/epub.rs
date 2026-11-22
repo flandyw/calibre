@@ -22,6 +22,13 @@ pub(super) struct ManifestItem {
     properties: String,
 }
 
+impl ManifestItem {
+    /// Whether this is the EPUB 3 navigation document.
+    pub(super) fn is_nav(&self) -> bool {
+        self.properties.split_whitespace().any(|p| p == "nav")
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct Package {
     pub(super) metadata: Metadata,

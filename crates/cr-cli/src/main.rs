@@ -10,9 +10,9 @@ use cr_core::device::{self, Device, SendOptions};
 use cr_core::formats::{ConvertOptions, Profile, INPUT_FORMATS, OUTPUT_FORMATS};
 use cr_core::jobs::JobContext;
 use cr_core::library::{
-    filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, CatalogFormat,
-    Category, Collision, ConvertOutcome, DuplicatePolicy, ExportOptions, ImportOptions, Library,
-    LibraryConvertOptions, ListOptions, SearchReplace, TextField,
+    filename_pattern, scan_sources, AddOutcome, Annotation, AnnotationFormat, BookSort, BookUpdate,
+    BulkEdit, CatalogFormat, Category, Collision, ConvertOutcome, DuplicatePolicy, ExportOptions,
+    ImportOptions, Library, LibraryConvertOptions, ListOptions, SearchReplace, TextField,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
 use cr_core::text::{self, split_authors};
@@ -213,6 +213,34 @@ enum Command {
         /// Wrap width for text output
         #[arg(long, default_value_t = 80)]
         width: usize,
+        /// Show the book's table of contents
+        #[arg(long)]
+        toc: bool,
+        /// Find text in the book and show each match with its place
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// Bookmarks and highlights: list, add, note, rm, search, export or import-calibre
+    Annotations {
+        #[arg(default_value = "list")]
+        action: String,
+        /// Annotation ID for `note` and `rm`; text for `search`
+        target: Option<String>,
+        /// Book ID (all books when omitted for list, search and export)
+        #[arg(long)]
+        book: Option<i64>,
+        /// For `add`: the passage to highlight, or with --bookmark the text to bookmark at
+        #[arg(long)]
+        find: Option<String>,
+        /// For `add`: make a bookmark instead of a highlight
+        #[arg(long)]
+        bookmark: bool,
+        /// Note text for `add` and `note`
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Export format: markdown or json
+        #[arg(long, default_value = "markdown")]
+        format: String,
     },
     /// Convert a book file, or library books, to EPUB, AZW3, MOBI, HTMLZ or TXT
     Convert {
@@ -947,7 +975,130 @@ fn run(cli: Cli) -> Result<()> {
             list,
             all,
             width,
-        } => read_book(&library_path, id, format, chapter, list, all, width)?,
+            toc,
+            search,
+        } => {
+            if toc || search.is_some() {
+                let library = Library::open(&library_path)?;
+                let book = library.open_book(id, format.as_deref())?;
+                if toc {
+                    for entry in &book.toc {
+                        println!(
+                            "{}{} ({:.0}%)",
+                            "  ".repeat(entry.level.saturating_sub(1) as usize),
+                            entry.title,
+                            book.fraction(entry.target) * 100.0
+                        );
+                    }
+                }
+                if let Some(query) = search {
+                    let hits = book.search(&query, 0);
+                    for hit in &hits {
+                        let chapter = book
+                            .toc_index(hit.start)
+                            .map(|index| book.toc[index].title.as_str())
+                            .unwrap_or_default();
+                        println!(
+                            "{:>3.0}%  {chapter}: {}",
+                            book.fraction(hit.start) * 100.0,
+                            hit.snippet
+                        );
+                    }
+                    println!("{} match(es).", hits.len());
+                }
+            } else {
+                read_book(&library_path, id, format, chapter, list, all, width)?
+            }
+        }
+        Command::Annotations {
+            action,
+            target,
+            book,
+            find,
+            bookmark,
+            note,
+            format,
+        } => {
+            let library = Library::open(&library_path)?;
+            let need_book = || book.ok_or_else(|| anyhow!("give the book with --book ID"));
+            let need_id = || {
+                target
+                    .as_deref()
+                    .and_then(|target| target.parse::<i64>().ok())
+                    .ok_or_else(|| anyhow!("give the annotation's ID"))
+            };
+            let show = |annotations: &[Annotation]| {
+                for annotation in annotations {
+                    println!(
+                        "#{}\tbook {}\t{}\t{}\t{}{}",
+                        annotation.id,
+                        annotation.book,
+                        annotation.kind.as_str(),
+                        annotation.chapter,
+                        annotation.text,
+                        if annotation.note.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\t[{}]", annotation.note)
+                        }
+                    );
+                }
+            };
+            match action.as_str() {
+                "list" => {
+                    show(&library.annotations(book)?);
+                    if let Some(id) = book {
+                        for annotation in library.calibre_annotations(id)? {
+                            println!(
+                                "calibre\tbook {id}\t{}\t{}\t{}",
+                                annotation.kind.as_str(),
+                                annotation.format,
+                                annotation.text
+                            );
+                        }
+                    }
+                }
+                "search" => {
+                    let mut found = library.search_annotations(
+                        target.as_deref().context("give the text to search for")?,
+                    )?;
+                    found.retain(|annotation| book.is_none_or(|id| annotation.book == id));
+                    show(&found);
+                }
+                "add" => {
+                    let id = need_book()?;
+                    let content = library.open_book(id, None)?;
+                    let query = find.context("give the passage with --find TEXT")?;
+                    let hit = content
+                        .search(&query, 1)
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("the book does not contain that text"))?;
+                    let end = (!bookmark).then_some(hit.end);
+                    let annotation = library.add_annotation(id, &content, hit.start, end, &note)?;
+                    show(&[annotation]);
+                }
+                "note" => library.set_annotation_note(need_id()?, &note)?,
+                "rm" => library.remove_annotation(need_id()?)?,
+                "export" => {
+                    let format = match format.to_ascii_lowercase().as_str() {
+                        "markdown" | "md" => AnnotationFormat::Markdown,
+                        "json" => AnnotationFormat::Json,
+                        other => bail!("unknown format {other}; use markdown or json"),
+                    };
+                    print!("{}", library.export_annotations(book, format)?);
+                }
+                "import-calibre" => {
+                    let id = need_book()?;
+                    let content = library.open_book(id, None)?;
+                    let (added, missing) = library.import_calibre_annotations(id, &content)?;
+                    println!("Imported {added} highlight(s); {missing} not found in the book.");
+                }
+                other => bail!(
+                    "unknown action {other}; use list, add, note, rm, search, export or import-calibre"
+                ),
+            }
+        }
         Command::Convert {
             args,
             to,

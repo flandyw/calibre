@@ -45,6 +45,18 @@ pub struct Document {
     pub images: Vec<Image>,
     /// Stylesheet carried over from the source.
     pub css: String,
+    /// The source's own table of contents, when it has one.
+    pub toc: Vec<TocItem>,
+}
+
+/// An entry of a source's table of contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TocItem {
+    pub title: String,
+    /// 1 for top-level entries.
+    pub level: u8,
+    /// The `id` in a section that the entry points at.
+    pub anchor: String,
 }
 
 /// How a reader divides a source into sections.
@@ -796,8 +808,100 @@ fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
             document.sections.push(section);
         }
     }
+    // The book's table of contents: the EPUB 3 navigation document, or the
+    // EPUB 2 NCX.
+    let anchor_of = |base: &str, target: &str| {
+        let (file, fragment) = target.split_once('#').unwrap_or((target, ""));
+        let number = *index.get(epub::resolve_href(base, file).as_str())?;
+        let fragment = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
+        Some(if fragment.is_empty() {
+            format!("cr-doc-{number}")
+        } else {
+            unique(&fragment, number)
+        })
+    };
+    let mut contents: Vec<&epub::ManifestItem> = package
+        .manifest
+        .values()
+        .filter(|item| item.is_nav() || item.media_type == "application/x-dtbncx+xml")
+        .collect();
+    contents.sort_by_key(|item| !item.is_nav());
+    for item in contents {
+        let Ok(data) = epub::read_entry(&mut archive, &item.href) else {
+            continue;
+        };
+        let Ok(root) = xml::parse(&data) else {
+            continue;
+        };
+        let base = item.href.rsplit_once('/').map_or("", |(base, _)| base);
+        if item.is_nav() {
+            let navs = root.descendants("nav");
+            let nav = navs
+                .iter()
+                .find(|nav| nav.attr_any(&["epub:type", "type"]) == Some("toc"))
+                .or(navs.first());
+            if let Some(list) = nav.and_then(|nav| nav.child("ol")) {
+                nav_items(list, 1, &mut |title, level, target| {
+                    if let Some(anchor) = anchor_of(base, target) {
+                        document.toc.push(TocItem {
+                            title,
+                            level,
+                            anchor,
+                        });
+                    }
+                });
+            }
+        } else if let Some(map) = root.child("navMap") {
+            ncx_items(map, 1, &mut |title, level, target| {
+                if let Some(anchor) = anchor_of(base, target) {
+                    document.toc.push(TocItem {
+                        title,
+                        level,
+                        anchor,
+                    });
+                }
+            });
+        }
+        if !document.toc.is_empty() {
+            break;
+        }
+    }
     document.images = images.list;
     Ok(())
+}
+
+fn node_text(node: &Node) -> String {
+    let mut text = node.text.clone();
+    for child in &node.children {
+        text.push(' ');
+        text.push_str(&node_text(child));
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Walk the nested `<ol>` of an EPUB 3 navigation document.
+fn nav_items(list: &Node, level: u8, emit: &mut dyn FnMut(String, u8, &str)) {
+    for item in list.children.iter().filter(|item| item.name == "li") {
+        if let Some(link) = item.child("a") {
+            if let Some(href) = link.attr("href") {
+                emit(node_text(link), level, href);
+            }
+        }
+        if let Some(nested) = item.child("ol") {
+            nav_items(nested, level.saturating_add(1), emit);
+        }
+    }
+}
+
+/// Walk the nested `navPoint`s of an NCX.
+fn ncx_items(parent: &Node, level: u8, emit: &mut dyn FnMut(String, u8, &str)) {
+    for point in parent.children.iter().filter(|c| c.name == "navPoint") {
+        let title = point.child("navLabel").map(node_text).unwrap_or_default();
+        if let Some(source) = point.child("content").and_then(|c| c.attr("src")) {
+            emit(title, level, source);
+        }
+        ncx_items(point, level.saturating_add(1), emit);
+    }
 }
 
 fn docx_attr<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
