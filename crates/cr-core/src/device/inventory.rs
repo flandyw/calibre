@@ -12,9 +12,9 @@ use crate::error::{Error, Result};
 use crate::library::Library;
 use crate::text;
 
-const BOOK_EXTENSIONS: [&str; 15] = [
+const BOOK_EXTENSIONS: [&str; 18] = [
     "epub", "kepub", "azw3", "azw", "mobi", "prc", "kfx", "pdf", "txt", "fb2", "rtf", "docx",
-    "htmlz", "cbz", "cbr",
+    "htmlz", "html", "htm", "xhtml", "cbz", "cbr",
 ];
 
 pub(super) fn is_book_file(name: &str) -> bool {
