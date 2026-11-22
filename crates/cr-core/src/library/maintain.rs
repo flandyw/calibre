@@ -342,6 +342,10 @@ impl Library {
         let target = safe_join(&self.root, &restored.path)?;
         // The book may now live under another name; remove only the copies
         // that are safely in the new place and keep anything else.
+        // Names differing only in case are one file on some filesystems.
+        let same_name = |a: &Path, b: &Path| {
+            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+        };
         let mut seen = HashSet::new();
         for (format, source) in &files {
             let kept = target.join(format!(
@@ -352,11 +356,11 @@ impl Library {
                 ),
                 format.to_ascii_lowercase()
             ));
-            if seen.insert(format.clone()) && *source != kept && kept.is_file() {
+            if seen.insert(format.clone()) && !same_name(source, &kept) && kept.is_file() {
                 let _ = fs::remove_file(source);
             }
         }
-        if restored.path != relative {
+        if !same_name(&target, folder) {
             let extras = folder.join(DATA_DIR);
             if extras.is_dir() {
                 let _ = fs::rename(&extras, target.join(DATA_DIR));
