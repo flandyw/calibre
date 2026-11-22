@@ -852,6 +852,8 @@ impl CalibreApp {
         };
         if extend {
             let anchor = self.anchor.or(self.selected_index()).unwrap_or(index);
+            // The list may have shrunk since the anchor was set.
+            let anchor = anchor.min(self.books.len() - 1);
             let (from, to) = (anchor.min(index), anchor.max(index));
             self.marked = self.books[from..=to].iter().map(|book| book.id).collect();
             self.anchor = Some(anchor);
