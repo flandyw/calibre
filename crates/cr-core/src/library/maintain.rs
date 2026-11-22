@@ -255,7 +255,8 @@ impl Library {
 
     /// Rebuild `metadata.db` from the `metadata.opf` in each book folder, for
     /// a library whose database is lost or damaged. Books keep their ids and
-    /// uuids. The previous database is kept as `metadata_pre_restore.db`.
+    /// uuids. The previous database is kept as `metadata_pre_restore.db` (numbered
+    /// when that exists).
     /// Custom columns, saved searches and other settings are not in the OPF
     /// files and are not restored.
     pub fn rebuild(root: &Path) -> Result<(Self, RebuildReport)> {
@@ -281,7 +282,14 @@ impl Library {
         let mut report = RebuildReport::default();
         let database = root.join(DB_FILE);
         if database.exists() {
-            let backup = root.join("metadata_pre_restore.db");
+            // An earlier backup is the only copy of what a rebuild cannot restore.
+            let backup = (0..)
+                .map(|n| match n {
+                    0 => root.join("metadata_pre_restore.db"),
+                    n => root.join(format!("metadata_pre_restore_{n}.db")),
+                })
+                .find(|path| !path.exists())
+                .unwrap_or_default();
             fs::rename(&database, &backup)?;
             report.backup = Some(backup);
         }
