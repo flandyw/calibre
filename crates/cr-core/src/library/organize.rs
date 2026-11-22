@@ -678,3 +678,128 @@ fn custom_column_ddl(id: i64, datatype: &str, normalized: bool) -> String {
          FROM {table};"
     )
 }
+
+/// The file format of a catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogFormat {
+    Csv,
+    Json,
+}
+
+impl CatalogFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "csv" => Some(Self::Csv),
+            "json" => Some(Self::Json),
+            _ => None,
+        }
+    }
+}
+
+const CATALOG_FIELDS: [&str; 13] = [
+    "id",
+    "title",
+    "authors",
+    "series",
+    "series_index",
+    "tags",
+    "publisher",
+    "rating",
+    "languages",
+    "identifiers",
+    "pubdate",
+    "timestamp",
+    "formats",
+];
+
+impl Library {
+    /// A catalog of the books matching `query` (all books when empty), one
+    /// row per book with every custom column as `#label`.
+    pub fn catalog(&self, query: &str, format: CatalogFormat) -> Result<String> {
+        let options = super::ListOptions {
+            query: Some(query.to_string()),
+            ..Default::default()
+        };
+        let columns = self.custom_columns()?;
+        let mut rows = Vec::new();
+        for book in self.list_books(&options)? {
+            let meta = self.get_metadata(book.id)?;
+            let date = |value: Option<chrono::DateTime<chrono::Utc>>| {
+                value.map(|date| date.format("%Y-%m-%d").to_string())
+            };
+            let identifiers: Vec<String> = meta
+                .identifiers
+                .iter()
+                .map(|(kind, value)| format!("{kind}:{value}"))
+                .collect();
+            let mut row = serde_json::json!({
+                "id": book.id,
+                "title": meta.title,
+                "authors": meta.authors,
+                "series": meta.series,
+                "series_index": meta.series.as_ref().map(|_| meta.series_index),
+                "tags": meta.tags,
+                "publisher": meta.publisher,
+                "rating": meta.rating.map(|rating| f64::from(rating) / 2.0),
+                "languages": meta.languages,
+                "identifiers": identifiers,
+                "pubdate": date(meta.pubdate),
+                "timestamp": date(meta.timestamp),
+                "formats": self.formats(book.id)?,
+            });
+            let mut custom = self.custom_values(book.id)?;
+            for column in &columns {
+                let values = custom.remove(&column.label).unwrap_or_default();
+                row[format!("#{}", column.label)] = if column.is_multiple {
+                    serde_json::json!(values)
+                } else {
+                    serde_json::json!(values.first())
+                };
+            }
+            rows.push(row);
+        }
+        if format == CatalogFormat::Json {
+            return serde_json::to_string_pretty(&rows)
+                .map_err(|error| Error::Other(error.to_string()));
+        }
+        let mut header: Vec<String> = CATALOG_FIELDS.iter().map(|f| f.to_string()).collect();
+        header.extend(columns.iter().map(|column| format!("#{}", column.label)));
+        let mut out = header.join(",");
+        out.push_str("\r\n");
+        for row in &rows {
+            let cells: Vec<String> = header
+                .iter()
+                .map(|field| {
+                    csv_cell(&match &row[field.as_str()] {
+                        serde_json::Value::Null => String::new(),
+                        serde_json::Value::String(text) => text.clone(),
+                        serde_json::Value::Array(items) => items
+                            .iter()
+                            .map(|item| item.as_str().unwrap_or_default())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        other => other.to_string(),
+                    })
+                })
+                .collect();
+            out.push_str(&cells.join(","));
+            out.push_str("\r\n");
+        }
+        Ok(out)
+    }
+}
+
+fn csv_cell(value: &str) -> String {
+    // A leading formula character would be run by spreadsheet programs.
+    let risky = value.starts_with(['=', '+', '-', '@']) && value.parse::<f64>().is_err();
+    let value = if risky {
+        format!("'{value}")
+    } else {
+        value.to_string()
+    };
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value
+    }
+}

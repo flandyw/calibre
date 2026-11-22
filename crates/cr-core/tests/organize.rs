@@ -2,7 +2,7 @@
 
 use std::fs;
 
-use cr_core::library::{BookUpdate, Category, Library, ListOptions};
+use cr_core::library::{BookUpdate, CatalogFormat, Category, Library, ListOptions};
 use tempfile::tempdir;
 
 fn fixture() -> (tempfile::TempDir, Library) {
@@ -256,4 +256,42 @@ fn full_text_index_finds_passages_and_tracks_changes() {
     assert!(library.fts_search("spice", 10).unwrap().is_empty());
     assert_eq!(library.fts_search("sandworms", 10).unwrap()[0].book, dune);
     assert!(library.fts_search("handsome", 10).unwrap().is_empty());
+}
+
+#[test]
+fn catalog_lists_books_with_custom_columns() {
+    let (_temp, mut library) = fixture();
+    library
+        .create_custom_column("pages", "Pages", "int", false, &[])
+        .unwrap();
+    library.set_custom_value(1, "pages", "412").unwrap();
+    library
+        .update_book(
+            3,
+            &BookUpdate {
+                title: Some("=Emma, \"again\"".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let csv = library.catalog("tag:classic", CatalogFormat::Csv).unwrap();
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].starts_with("id,title,authors,") && lines[0].ends_with(",#pages"));
+    assert!(lines[2].starts_with("1,Dune,Frank Herbert,Dune,1.0,\"sf, classic\",,5.0,"));
+    assert!(lines[2].ends_with(",TXT,412"));
+    assert!(lines[1].starts_with("3,\"'=Emma, \"\"again\"\"\",Jane Austen,,,"));
+
+    let json = library.catalog("", CatalogFormat::Json).unwrap();
+    let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 4);
+    let dune = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == 1)
+        .unwrap();
+    assert_eq!(dune["#pages"], "412");
+    assert_eq!(dune["tags"], serde_json::json!(["sf", "classic"]));
 }

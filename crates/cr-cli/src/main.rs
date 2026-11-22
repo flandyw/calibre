@@ -9,9 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use cr_core::device::{self, Device, SendOptions};
 use cr_core::jobs::JobContext;
 use cr_core::library::{
-    filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, Category,
-    Collision, DuplicatePolicy, ExportOptions, ImportOptions, Library, ListOptions, SearchReplace,
-    TextField,
+    filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, CatalogFormat,
+    Category, Collision, DuplicatePolicy, ExportOptions, ImportOptions, Library, ListOptions,
+    SearchReplace, TextField,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
 use cr_core::text::{self, split_authors};
@@ -157,6 +157,13 @@ enum Command {
         /// An allowed value of an enumeration column (repeat)
         #[arg(long = "choice")]
         choices: Vec<String>,
+    },
+    /// Write a catalog of the library (or of a search) as CSV or JSON
+    Catalog {
+        /// Output file ending in .csv or .json (`-` prints CSV)
+        output: PathBuf,
+        /// Only include books matching this search
+        query: Vec<String>,
     },
     /// Search inside books: `cr fts index`, then `cr fts search WORDS`
     Fts {
@@ -791,6 +798,21 @@ fn run(cli: Cli) -> Result<()> {
                     println!("Removed column #{}", label.trim_start_matches('#'));
                 }
                 other => bail!("unknown action `{other}` (use list, add or rm)"),
+            }
+        }
+        Command::Catalog { output, query } => {
+            let library = Library::open(&library_path)?;
+            let extension = output.extension().and_then(|e| e.to_str()).unwrap_or("csv");
+            let format = CatalogFormat::parse(extension).ok_or_else(|| {
+                anyhow!("unknown catalog type `.{extension}` (use .csv or .json)")
+            })?;
+            let catalog = library.catalog(&query.join(" "), format)?;
+            if output.as_os_str() == "-" {
+                print!("{catalog}");
+            } else {
+                fs::write(&output, catalog)
+                    .with_context(|| format!("cannot write {}", output.display()))?;
+                println!("Wrote {}", output.display());
             }
         }
         Command::Fts {
