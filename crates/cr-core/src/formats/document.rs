@@ -56,6 +56,8 @@ enum Split {
     Headings,
     /// At every FictionBook `<section>`.
     Fb2,
+    /// FictionBook markup kept as one section.
+    Fb2Whole,
 }
 
 /// The file extension and media type of an image, from its first bytes.
@@ -170,6 +172,12 @@ const SKIPPED: [&str; 15] = [
     "binary",
 ];
 
+impl Split {
+    fn is_fb2(self) -> bool {
+        matches!(self, Split::Fb2 | Split::Fb2Whole)
+    }
+}
+
 /// The XHTML element a source element becomes; `None` keeps only its content.
 fn map_tag(name: &str, split: Split) -> Option<&'static str> {
     const KEPT: [&str; 44] = [
@@ -218,7 +226,7 @@ fn map_tag(name: &str, split: Split) -> Option<&'static str> {
         "q",
         "tt",
     ];
-    if split == Split::Fb2 {
+    if split.is_fb2() {
         match name {
             "emphasis" => return Some("em"),
             "strikethrough" => return Some("s"),
@@ -234,7 +242,7 @@ fn map_tag(name: &str, split: Split) -> Option<&'static str> {
     }
     match name {
         "section" | "article" | "aside" | "header" | "footer" | "nav" | "main" | "center" => {
-            (split != Split::Fb2).then_some("div")
+            (!split.is_fb2()).then_some("div")
         }
         "font" => Some("span"),
         "strike" | "del" => Some("s"),
@@ -251,6 +259,8 @@ struct Xhtml<'a> {
     /// The current section has text outside headings.
     has_text: bool,
     ids: HashSet<String>,
+    /// Gives an `id` the name it has in the whole document.
+    rename_id: &'a dyn Fn(&str) -> String,
     css: String,
     image: &'a mut dyn FnMut(&str) -> Option<String>,
     link: &'a dyn Fn(&str) -> Option<String>,
@@ -285,13 +295,16 @@ impl Xhtml<'_> {
                 let tag = &rest[1..end];
                 at += end + 1;
                 let name = tag_name(tag);
-                let skipped = SKIPPED.contains(&name.as_str())
-                    || (name == "title" && self.split != Split::Fb2);
-                if skipped && !tag.starts_with('/') && !tag.ends_with('/') {
-                    // Skip to the matching end tag; these do not nest.
+                let skipped =
+                    SKIPPED.contains(&name.as_str()) || (name == "title" && !self.split.is_fb2());
+                if skipped && name != "embed" && !tag.starts_with('/') && !tag.ends_with('/') {
+                    // Skip to the matching end tag; these do not nest. An
+                    // element that is never closed hides nothing.
                     let lower = markup[at..].to_ascii_lowercase();
                     let close = format!("</{name}");
-                    let content_end = lower.find(&close).unwrap_or(lower.len());
+                    let Some(content_end) = lower.find(&close) else {
+                        continue;
+                    };
                     if name == "style" {
                         self.css.push_str(&markup[at..at + content_end]);
                         self.css.push('\n');
@@ -346,7 +359,10 @@ impl Xhtml<'_> {
     fn finish_section(&mut self) {
         self.close_through(0);
         let html = std::mem::take(&mut self.out);
-        if self.has_text || html.contains("<img ") {
+        if self.has_text
+            || html.contains("<img ")
+            || !super::html::strip_tags(&html).trim().is_empty()
+        {
             self.sections.push(Section {
                 title: first_heading(&html).unwrap_or_default(),
                 html,
@@ -377,9 +393,10 @@ impl Xhtml<'_> {
         let id = attr_value(tag, "id")
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
+            .map(|id| (self.rename_id)(&id))
             .filter(|id| self.ids.insert(id.clone()));
         let starts_section = match self.split {
-            Split::None => false,
+            Split::None | Split::Fb2Whole => false,
             Split::Headings => matches!(name, "h1" | "h2") && self.has_text,
             Split::Fb2 => name == "section" || name == "body",
         };
@@ -476,6 +493,7 @@ fn sections_from_markup(
     markup: &str,
     split: Split,
     ids: &mut HashSet<String>,
+    rename_id: &dyn Fn(&str) -> String,
     image: &mut dyn FnMut(&str) -> Option<String>,
     link: &dyn Fn(&str) -> Option<String>,
 ) -> (Vec<Section>, String) {
@@ -486,6 +504,7 @@ fn sections_from_markup(
         stack: Vec::new(),
         has_text: false,
         ids: std::mem::take(ids),
+        rename_id,
         css: String::new(),
         image,
         link,
@@ -525,7 +544,7 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
     match format {
         "EPUB" => read_epub(path, &mut document)?,
         "HTML" => read_html(path, headings, &mut document)?,
-        "FB2" => read_fb2(path, &mut document)?,
+        "FB2" => read_fb2(path, options.split_chapters, &mut document)?,
         "DOCX" => read_docx(path, options.split_chapters, &mut document)?,
         "TXT" => {
             let content = txt::decode_bytes(&std::fs::read(path)?);
@@ -631,6 +650,7 @@ fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
         &markup,
         split,
         &mut HashSet::new(),
+        &str::to_string,
         &mut image,
         &external_link,
     );
@@ -640,7 +660,7 @@ fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
     Ok(())
 }
 
-fn read_fb2(path: &Path, document: &mut Document) -> Result<()> {
+fn read_fb2(path: &Path, split: bool, document: &mut Document) -> Result<()> {
     let data = std::fs::read(path)?;
     let root = xml::parse(&data)?;
     let binaries: HashMap<&str, &Node> = root
@@ -662,8 +682,9 @@ fn read_fb2(path: &Path, document: &mut Document) -> Result<()> {
     let markup = decode_markup(&data);
     let (sections, _) = sections_from_markup(
         &markup,
-        Split::Fb2,
+        if split { Split::Fb2 } else { Split::Fb2Whole },
         &mut HashSet::new(),
+        &str::to_string,
         &mut image,
         &external_link,
     );
@@ -675,18 +696,53 @@ fn read_fb2(path: &Path, document: &mut Document) -> Result<()> {
 fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
     let package = epub::read_package(path)?;
     let mut archive = ZipArchive::new(File::open(path)?)?;
-    let documents: Vec<&str> = package
+    // Documents outside the reading order (notes, mostly) go last.
+    let hrefs: Vec<&str> = package
         .spine
         .iter()
+        .chain(&package.nonlinear)
         .filter_map(|idref| package.manifest.get(idref))
         .filter(|item| epub::is_html_media_type(&item.media_type))
         .map(|item| item.href.as_str())
         .collect();
-    let anchors: HashMap<&str, String> = documents
+    let mut documents: Vec<(&str, String)> = Vec::new();
+    for href in hrefs {
+        if documents.iter().any(|(seen, _)| *seen == href) {
+            continue;
+        }
+        if let Ok(data) = epub::read_entry(&mut archive, href) {
+            documents.push((href, decode_markup(&data)));
+        }
+    }
+    let index: HashMap<&str, usize> = documents
         .iter()
         .enumerate()
-        .map(|(index, href)| (*href, format!("cr-doc-{}", index + 1)))
+        .map(|(index, (href, _))| (*href, index + 1))
         .collect();
+    // An id used by several files gets the file's number appended, so that
+    // every id is unique in the document and links keep their target.
+    let id_pattern =
+        Regex::new(r#"(?i)\sid\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("valid pattern");
+    let mut first_use: HashMap<&str, usize> = HashMap::new();
+    let mut shared: HashSet<&str> = HashSet::new();
+    for (number, (_, markup)) in documents.iter().enumerate() {
+        for captures in id_pattern.captures_iter(markup) {
+            let id = captures
+                .get(1)
+                .or_else(|| captures.get(2))
+                .map_or("", |id| id.as_str().trim());
+            if *first_use.entry(id).or_insert(number) != number {
+                shared.insert(id);
+            }
+        }
+    }
+    let unique = |id: &str, number: usize| {
+        if shared.contains(id) {
+            format!("{id}-cr{number}")
+        } else {
+            id.to_string()
+        }
+    };
     let mut stylesheets: Vec<&str> = package
         .manifest
         .values()
@@ -702,11 +758,8 @@ fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
     }
     let mut images = Images::default();
     let mut ids = HashSet::new();
-    for href in &documents {
-        let Ok(data) = epub::read_entry(&mut archive, href) else {
-            continue;
-        };
-        let markup = decode_markup(&data);
+    for (number, (href, markup)) in documents.iter().enumerate() {
+        let number = number + 1;
         let base = href.rsplit_once('/').map_or("", |(base, _)| base);
         let mut image = |source: &str| {
             let name = epub::resolve_href(base, source);
@@ -718,23 +771,28 @@ fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
             })
         };
         let link = |target: &str| {
-            if target.starts_with('#') || target.contains(':') {
+            if let Some(fragment) = target.strip_prefix('#') {
+                return Some(format!("#{}", unique(fragment, number)));
+            }
+            if target.contains(':') {
                 return external_link(target);
             }
             // A link to another file of the book: every file starts with an
-            // anchor, and fragments are unique across the document.
-            match target.split_once('#') {
-                Some((_, fragment)) if !fragment.is_empty() => Some(format!("#{fragment}")),
-                _ => anchors
-                    .get(epub::resolve_href(base, target).as_str())
-                    .map(|anchor| format!("#{anchor}")),
-            }
+            // anchor.
+            let (file, fragment) = target.split_once('#').unwrap_or((target, ""));
+            let other = *index.get(epub::resolve_href(base, file).as_str())?;
+            Some(if fragment.is_empty() {
+                format!("#cr-doc-{other}")
+            } else {
+                format!("#{}", unique(fragment, other))
+            })
         };
+        let rename = |id: &str| unique(id, number);
         let (sections, css) =
-            sections_from_markup(&markup, Split::None, &mut ids, &mut image, &link);
+            sections_from_markup(markup, Split::None, &mut ids, &rename, &mut image, &link);
         document.css.push_str(&css);
         for mut section in sections {
-            section.html = format!("<a id=\"{}\"></a>{}", anchors[href], section.html);
+            section.html = format!("<a id=\"cr-doc-{number}\"></a>{}", section.html);
             document.sections.push(section);
         }
     }
@@ -760,6 +818,8 @@ struct Docx<'a> {
     targets: HashMap<String, String>,
     archive: zip::ZipArchive<File>,
     images: &'a mut Images,
+    /// Number of note references seen, for their markers.
+    notes: usize,
 }
 
 impl Docx<'_> {
@@ -799,6 +859,18 @@ impl Docx<'_> {
                     }
                 }
                 "t" => out.push_str(&escape(&child.text)),
+                "footnoteReference" | "endnoteReference" => {
+                    if let Some(id) = docx_attr(child, "id") {
+                        self.notes += 1;
+                        let kind = child.name.trim_end_matches("Reference");
+                        out.push_str(&format!(
+                            "<sup><a id=\"cr-{kind}-ref-{id}\" href=\"#cr-{kind}-{id}\">{}</a></sup>",
+                            self.notes,
+                            kind = kind,
+                            id = escape_attribute(id),
+                        ));
+                    }
+                }
                 "tab" => out.push(' '),
                 "br" | "cr" => out.push_str("<br/>"),
                 "blip" => {
@@ -941,10 +1013,38 @@ fn read_docx(path: &Path, split: bool, document: &mut Document) -> Result<()> {
         targets,
         archive,
         images: &mut images,
+        notes: 0,
     };
     let mut sections = vec![String::new()];
     let body = root.child("body").unwrap_or(&root);
     docx.blocks(body, split, &mut sections);
+    if docx.notes > 0 {
+        let mut notes = String::new();
+        for (kind, entry) in [
+            ("footnote", "word/footnotes.xml"),
+            ("endnote", "word/endnotes.xml"),
+        ] {
+            let Some(data) = documents::zip_entry(&mut docx.archive, entry) else {
+                continue;
+            };
+            for note in xml::parse(&data)?.descendants(kind) {
+                // Separators are layout, not notes.
+                let (Some(id), None) = (docx_attr(note, "id"), docx_attr(note, "type")) else {
+                    continue;
+                };
+                let mut content = vec![String::new()];
+                docx.blocks(note, false, &mut content);
+                let id = escape_attribute(id);
+                notes.push_str(&format!(
+                    "<div id=\"cr-{kind}-{id}\">{}<p><a href=\"#cr-{kind}-ref-{id}\">\u{21a9}</a></p></div>\n",
+                    content.concat()
+                ));
+            }
+        }
+        if !notes.is_empty() {
+            sections.push(format!("<h2>Notes</h2>\n{notes}"));
+        }
+    }
     for html in sections {
         if !html.trim().is_empty() {
             document.sections.push(Section {

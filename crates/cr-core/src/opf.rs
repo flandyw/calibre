@@ -112,7 +112,26 @@ pub fn parse_opf(data: &[u8]) -> Result<Metadata> {
                 meta.identifiers.insert(other.to_string(), value);
             }
             None => {
-                if id == "uuid_id" {
+                // EPUB 3 has no scheme attribute: `isbn:...`, `urn:isbn:...`.
+                let plain = value.strip_prefix("urn:").unwrap_or(&value);
+                let named = plain.split_once(':').filter(|(scheme, rest)| {
+                    !rest.is_empty()
+                        && !rest.starts_with("//")
+                        && !scheme.is_empty()
+                        && scheme
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                });
+                if let Some((scheme, rest)) = named {
+                    let scheme = scheme.to_ascii_lowercase();
+                    if scheme == "uuid" {
+                        if meta.uuid.is_none() {
+                            meta.uuid = Some(rest.to_string());
+                        }
+                    } else if scheme != "calibre" {
+                        meta.identifiers.insert(scheme, rest.to_string());
+                    }
+                } else if id == "uuid_id" {
                     meta.uuid = Some(value);
                 } else if id.contains("calibre") {
                     // calibre's application id; not user-facing metadata.

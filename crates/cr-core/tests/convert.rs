@@ -339,3 +339,147 @@ fn library_conversion_uses_library_metadata_and_keeps_the_original() {
     let original = library.format_path(id, "ORIGINAL_EPUB").unwrap().unwrap();
     assert_eq!(fs::read(original).unwrap(), first);
 }
+
+fn write_zip(path: &Path, entries: &[(&str, &str)]) {
+    let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in entries {
+        zip.start_file(*name, stored).unwrap();
+        zip.write_all(data.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+#[test]
+fn epub_keeps_notes_title_pages_and_links_between_files() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("source.epub");
+    let page = |body: &str| {
+        format!(r#"<html xmlns="http://www.w3.org/1999/xhtml"><body>{body}</body></html>"#)
+    };
+    write_zip(
+        &source,
+        &[
+            ("mimetype", "application/epub+zip"),
+            (
+                "META-INF/container.xml",
+                r#"<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0"><rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+            ),
+            (
+                "content.opf",
+                r#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">urn:uuid:11111111-2222-3333-4444-555555555555</dc:identifier><dc:identifier>isbn:9780000000002</dc:identifier><dc:title>Linked</dc:title><dc:language>en</dc:language></metadata>
+<manifest><item id="t" href="title.xhtml" media-type="application/xhtml+xml"/><item id="a" href="a.xhtml" media-type="application/xhtml+xml"/><item id="b" href="b.xhtml" media-type="application/xhtml+xml"/><item id="n" href="notes.xhtml" media-type="application/xhtml+xml"/></manifest>
+<spine><itemref idref="t"/><itemref idref="a"/><itemref idref="b"/><itemref idref="n" linear="no"/></spine></package>"#,
+            ),
+            ("title.xhtml", &page("<h1>Linked</h1>")),
+            (
+                "a.xhtml",
+                &page(
+                    r##"<h2 id="start">A</h2><p>Text A <a href="b.xhtml#start">to B</a> <a href="#start">top</a> <a href="notes.xhtml#n1">1</a></p>"##,
+                ),
+            ),
+            (
+                "b.xhtml",
+                &page(r##"<h2 id="start">B</h2><p>Text B <a href="a.xhtml#start">to A</a></p>"##),
+            ),
+            ("notes.xhtml", &page(r#"<p id="n1">The note.</p>"#)),
+        ],
+    );
+    let output = temp.path().join("out.htmlz");
+    convert(&source, &output).unwrap();
+    let html = entry(&output, "index.html");
+    assert!(html.contains("<h1>Linked</h1>"));
+    assert!(html.contains(r#"<p id="n1">The note.</p>"#));
+    assert!(html.contains(r##"<a href="#n1">1</a>"##));
+    // Both files used `start`; each link still reaches its own heading.
+    assert!(html.contains(r#"<h2 id="start-cr2">A</h2>"#));
+    assert!(html.contains(r#"<h2 id="start-cr3">B</h2>"#));
+    assert!(html.contains(r##"<a href="#start-cr3">to B</a> <a href="#start-cr2">top</a>"##));
+    assert!(html.contains(r##"<a href="#start-cr2">to A</a>"##));
+
+    // Named identifiers survive a rewrite.
+    let epub = temp.path().join("out.epub");
+    let options = ConvertOptions {
+        profile: Profile::Kindle,
+        ..ConvertOptions::default()
+    };
+    let metadata = cr_core::formats::epub::metadata(&source).unwrap().0;
+    assert_eq!(metadata.identifiers["isbn"], "9780000000002");
+    let text = temp.path().join("book.txt");
+    fs::write(&text, "Some text.").unwrap();
+    let with_metadata = ConvertOptions {
+        metadata: Some(metadata),
+        ..options
+    };
+    convert_with(&text, &epub, &with_metadata).unwrap();
+    let written = cr_core::formats::epub::metadata(&epub).unwrap().0;
+    assert_eq!(written.identifiers["isbn"], "9780000000002");
+    assert_eq!(
+        written.uuid.as_deref(),
+        Some("11111111-2222-3333-4444-555555555555")
+    );
+}
+
+#[test]
+fn unclosed_embed_does_not_swallow_text_and_fb2_can_stay_whole() {
+    let temp = tempdir().unwrap();
+    let page = temp.path().join("page.html");
+    fs::write(
+        &page,
+        "<h1>Only a heading</h1><embed src=x.swf><object data=y><p>After</p>",
+    )
+    .unwrap();
+    let text = temp.path().join("page.txt");
+    convert(&page, &text).unwrap();
+    assert!(fs::read_to_string(&text).unwrap().contains("After"));
+    let heading = temp.path().join("heading.html");
+    fs::write(&heading, "<h1>Only a heading</h1>").unwrap();
+    convert(&heading, &temp.path().join("heading.epub")).unwrap();
+
+    let fb2 = temp.path().join("book.fb2");
+    fs::write(
+        &fb2,
+        r#"<FictionBook><description><title-info><book-title>T</book-title></title-info></description><body><section><title><p>One</p></title><p>a</p></section><section><title><p>Two</p></title><p>b</p></section></body></FictionBook>"#,
+    )
+    .unwrap();
+    let whole = temp.path().join("whole.epub");
+    let options = ConvertOptions {
+        split_chapters: false,
+        ..ConvertOptions::default()
+    };
+    convert_with(&fb2, &whole, &options).unwrap();
+    assert!(!names(&whole).contains(&"OEBPS/section0002.xhtml".to_string()));
+    let body = entry(&whole, "OEBPS/section0001.xhtml");
+    assert!(body.contains("<h2>One</h2>") && body.contains("<h2>Two</h2>"));
+}
+
+#[test]
+fn docx_notes_are_kept_and_linked() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("notes.docx");
+    write_zip(
+        &source,
+        &[
+            (
+                "word/document.xml",
+                r#"<w:document xmlns:w="w"><w:body><w:p><w:r><w:t>Claim</w:t></w:r><w:r><w:footnoteReference w:id="2"/></w:r></w:p></w:body></w:document>"#,
+            ),
+            (
+                "word/footnotes.xml",
+                r#"<w:footnotes xmlns:w="w"><w:footnote w:type="separator" w:id="0"><w:p><w:r><w:t>sep</w:t></w:r></w:p></w:footnote><w:footnote w:id="2"><w:p><w:r><w:footnoteRef/><w:t>The source.</w:t></w:r></w:p></w:footnote></w:footnotes>"#,
+            ),
+        ],
+    );
+    let epub = temp.path().join("notes.epub");
+    convert(&source, &epub).unwrap();
+    assert_well_formed(&epub);
+    let first = entry(&epub, "OEBPS/section0001.xhtml");
+    assert!(first.contains(
+        r##"Claim<sup><a id="cr-footnote-ref-2" href="section0002.xhtml#cr-footnote-2">1</a></sup>"##
+    ));
+    let notes = entry(&epub, "OEBPS/section0002.xhtml");
+    assert!(notes.contains(r#"<div id="cr-footnote-2"><p>The source.</p>"#));
+    assert!(notes.contains(r##"href="section0001.xhtml#cr-footnote-ref-2""##));
+    assert!(!notes.contains("sep"));
+}

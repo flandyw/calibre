@@ -28,6 +28,8 @@ pub(super) struct Package {
     pub(super) cover: Option<Vec<u8>>,
     pub(super) manifest: HashMap<String, ManifestItem>,
     pub(super) spine: Vec<String>,
+    /// Spine items marked `linear="no"`.
+    pub(super) nonlinear: Vec<String>,
 }
 
 /// Read metadata and the cover image from an EPUB.
@@ -181,15 +183,18 @@ pub(super) fn read_package(path: &Path) -> Result<Package> {
     }
 
     let mut spine = Vec::new();
+    let mut nonlinear = Vec::new();
     if let Some(spine_node) = opf_xml.child("spine") {
         for itemref in spine_node.children.iter().filter(|c| c.name == "itemref") {
+            let Some(idref) = itemref.attr("idref") else {
+                continue;
+            };
             if itemref
                 .attr("linear")
                 .is_some_and(|v| v.eq_ignore_ascii_case("no"))
             {
-                continue;
-            }
-            if let Some(idref) = itemref.attr("idref") {
+                nonlinear.push(idref.to_string());
+            } else {
                 spine.push(idref.to_string());
             }
         }
@@ -239,6 +244,7 @@ pub(super) fn read_package(path: &Path) -> Result<Package> {
         cover,
         manifest,
         spine,
+        nonlinear,
     })
 }
 
