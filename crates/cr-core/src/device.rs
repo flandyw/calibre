@@ -481,7 +481,8 @@ fn prepare_book(
                 && (!kindle || KINDLE_FORMATS.contains(&target.as_str()))
                 && crate::formats::OUTPUT_FORMATS.contains(&target.as_str()))
             .then(|| {
-                CONVERT_FROM
+                // Listed best first.
+                crate::formats::INPUT_FORMATS
                     .iter()
                     .filter(|format| **format != target)
                     .find_map(|wanted| available.iter().find(|f| f.eq_ignore_ascii_case(wanted)))
@@ -532,11 +533,6 @@ fn prepare_book(
 }
 
 const KINDLE_FORMATS: [&str; 6] = ["AZW3", "AZW", "MOBI", "PRC", "PDF", "TXT"];
-/// Library formats a device copy can be converted from, best first.
-const CONVERT_FROM: [&str; 10] = [
-    "EPUB", "AZW3", "MOBI", "AZW", "DOCX", "FB2", "HTMLZ", "HTML", "RTF", "TXT",
-];
-
 /// Folders and file stem for a book on the device.
 fn file_stem(template: Option<&str>, meta: &Metadata, id: i64) -> (Vec<String>, String) {
     let Some(template) = template else {
