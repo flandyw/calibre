@@ -88,6 +88,19 @@ fn kindle_gets_a_converted_copy_and_inventory_matches_it() {
     assert_eq!(books[0].format, "AZW3");
     assert!(books[0].path.starts_with("documents/"));
 
+    // The clippings file is not a book and cannot be removed as one.
+    fs::write(device.documents_dir().join("My Clippings.txt"), "x").unwrap();
+    assert_eq!(device::books(Some(&library), &device).unwrap().len(), 1);
+    assert!(device::remove(&device, &["documents/My Clippings.txt".to_string()]).is_err());
+
+    // A second format of the book keeps the shared sidecar folder alive.
+    let twin = books[0].path.replace(".azw3", ".pdf");
+    fs::write(device.root.join(&twin), "x").unwrap();
+    let shared = device.root.join(&books[0].path).with_extension("sdr");
+    fs::create_dir_all(&shared).unwrap();
+    device::remove(&device, &[twin]).unwrap();
+    assert!(shared.is_dir());
+
     // Removing takes the Kindle's sidecar folder and the catalog entry too.
     let sidecar = device.root.join(&books[0].path).with_extension("sdr");
     fs::create_dir_all(&sidecar).unwrap();
@@ -187,6 +200,16 @@ fn a_vanished_device_is_reported_and_dry_runs_write_nothing() {
     assert_eq!(report.sent.len(), 1);
     assert!(!report.sent[0].path.exists());
     assert!(!device.catalog_path().exists());
+
+    // HTMLZ has no reader, but a conversion to it is still sent and listed.
+    let htmlz = SendOptions {
+        format: Some("HTMLZ".into()),
+        ..SendOptions::default()
+    };
+    let report = device::send(&library, &device, &[id], &htmlz).unwrap();
+    assert_eq!(report.sent.len(), 1, "{:?}", report.skipped);
+    fs::write(device.documents_dir().join("Page.html"), "x").unwrap();
+    assert_eq!(device::books(Some(&library), &device).unwrap().len(), 2);
 
     fs::remove_dir_all(&device.root).unwrap();
     assert!(device::books(Some(&library), &device).is_err());
