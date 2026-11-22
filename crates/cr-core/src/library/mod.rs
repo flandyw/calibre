@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -22,8 +23,13 @@ use crate::metadata::{format_datetime, now, parse_datetime, BookSummary, Metadat
 use crate::opf;
 use crate::text;
 
+mod fts;
 mod manage;
+mod organize;
+mod search;
+pub use fts::*;
 pub use manage::*;
+pub use organize::*;
 
 pub const DB_FILE: &str = "metadata.db";
 pub const METADATA_FILE: &str = "metadata.opf";
@@ -43,8 +49,8 @@ const REQUIRED_TABLES: [&str; 8] = [
     "library_id",
 ];
 /// Formats `read_book` can turn into text, best first.
-pub const READABLE_FORMATS: [&str; 9] = [
-    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "TXT",
+pub const READABLE_FORMATS: [&str; 11] = [
+    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "DOCX", "RTF", "TXT",
 ];
 
 /// Test hook: where an injected failure interrupts a mutation.
@@ -175,7 +181,8 @@ impl Library {
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO preferences (key, val) VALUES ('calibre_rust_version', ?1)",
-            [env!("CARGO_PKG_VERSION")],
+            // calibre expects every preference to be JSON.
+            [concat!("\"", env!("CARGO_PKG_VERSION"), "\"")],
         )?;
         Ok(Self {
             root: root.to_path_buf(),
@@ -525,7 +532,8 @@ impl Library {
     /// `title:`, `author:`, `tag:`, `series:`, `publisher:`, `format:`,
     /// `language:`, `identifier:`, `rating:`, `id:` and `sort:`.
     pub fn list_books(&self, options: &ListOptions) -> Result<Vec<BookSummary>> {
-        let parsed = parse_query(options.query.as_deref().unwrap_or_default());
+        let context = self.search_context()?;
+        let parsed = search::compile(options.query.as_deref().unwrap_or_default(), &context);
         let sort = options.sort.or(parsed.sort).unwrap_or(BookSort::Title);
         let descending = options.descending || parsed.descending;
         self.query_summaries(
@@ -716,6 +724,20 @@ impl Library {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM books_pages_link WHERE book=?1", [id])?;
         tx.execute("DELETE FROM book_storage WHERE book=?1", [id])?;
+        // Custom column values have no delete trigger.
+        let custom: Vec<(i64, bool)> = {
+            let mut stmt = tx.prepare("SELECT id, normalized FROM custom_columns")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (column, normalized) in custom {
+            let table = if normalized {
+                format!("books_custom_column_{column}_link")
+            } else {
+                format!("custom_column_{column}")
+            };
+            tx.execute(&format!("DELETE FROM {table} WHERE book=?1"), [id])?;
+        }
         let changed = tx.execute("DELETE FROM books WHERE id=?1", [id])?;
         if changed == 0 {
             return Err(Error::BookNotFound(id));
@@ -1193,6 +1215,29 @@ fn configure_connection(conn: &Connection, writable: bool) -> rusqlite::Result<(
             Ok(text::author_sort(&author))
         },
     )?;
+    conn.create_scalar_function(
+        "regexp",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            // The compiled pattern is cached for the statement.
+            let pattern: Arc<Option<regex::Regex>> = ctx.get_or_create_aux(
+                0,
+                |value| -> std::result::Result<_, std::convert::Infallible> {
+                    let source = value.as_str().unwrap_or_default();
+                    let built = regex::RegexBuilder::new(source)
+                        .case_insensitive(true)
+                        .build();
+                    Ok(built.ok())
+                },
+            )?;
+            let text = ctx.get_raw(1).as_str().unwrap_or_default();
+            Ok(pattern
+                .as_ref()
+                .as_ref()
+                .is_some_and(|re| re.is_match(text)))
+        },
+    )?;
     conn.create_scalar_function("uuid4", 0, FunctionFlags::SQLITE_UTF8, |_| {
         Ok(uuid::Uuid::new_v4().to_string())
     })?;
@@ -1588,218 +1633,9 @@ fn render_template(template: &str, meta: &Metadata, id: i64) -> String {
     rendered
 }
 
-// ---------------------------------------------------------------------------
-// Search query mini-language
-// ---------------------------------------------------------------------------
-
-struct ParsedQuery {
-    where_sql: String,
-    params: Vec<String>,
-    sort: Option<BookSort>,
-    descending: bool,
-}
-
-fn parse_query(query: &str) -> ParsedQuery {
-    let mut clauses = Vec::new();
-    let mut params = Vec::new();
-    let mut sort = None;
-    let mut descending = false;
-
-    for raw_token in tokenize(query) {
-        let (negated, token) = strip_negation(&raw_token);
-        let (field, value) = match token.split_once(':') {
-            Some((field, value)) if !field.is_empty() && !value.is_empty() => {
-                (field.to_ascii_lowercase(), value.to_string())
-            }
-            _ => (String::new(), token.to_string()),
-        };
-
-        if field == "sort" {
-            let (desc, name) = match value.strip_prefix('-') {
-                Some(name) => (true, name),
-                None => (false, value.as_str()),
-            };
-            if let Some(parsed) = BookSort::parse(name) {
-                sort = Some(parsed);
-                descending = desc;
-            }
-            continue;
-        }
-
-        let mut clause_params = Vec::new();
-        let clause = if field.is_empty() {
-            free_text_clause(&value, &mut clause_params)
-        } else if let Some(clause) = field_clause(&field, &value, &mut clause_params) {
-            clause
-        } else {
-            free_text_clause(&token, &mut clause_params)
-        };
-        let clause = if negated {
-            format!("NOT ({clause})")
-        } else {
-            clause
-        };
-        clauses.push(clause);
-        params.extend(clause_params);
-    }
-
-    ParsedQuery {
-        where_sql: clauses.join(" AND "),
-        params,
-        sort,
-        descending,
-    }
-}
-
-fn tokenize(query: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for ch in query.chars() {
-        match ch {
-            '"' => quoted = !quoted,
-            c if c.is_whitespace() && !quoted => {
-                if !current.is_empty() {
-                    out.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        out.push(current);
-    }
-    out
-}
-
-fn strip_negation(token: &str) -> (bool, &str) {
-    if let Some(rest) = token.strip_prefix('!') {
-        if !rest.is_empty() {
-            return (true, rest);
-        }
-    }
-    if let Some(rest) = token.strip_prefix('-') {
-        if !rest.is_empty() && !rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return (true, rest);
-        }
-    }
-    (false, token)
-}
-
-fn field_clause(field: &str, value: &str, params: &mut Vec<String>) -> Option<String> {
-    let like = like_pattern(value);
-    let clause = match field {
-        "title" => {
-            params.push(like);
-            "b.title LIKE ? ESCAPE '\\'"
-        }
-        "author" | "authors" => {
-            params.push(like);
-            "EXISTS (SELECT 1 FROM books_authors_link l JOIN authors a ON a.id=l.author
-                     WHERE l.book=b.id AND a.name LIKE ? ESCAPE '\\')"
-        }
-        "tag" | "tags" => {
-            params.push(like);
-            "EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag
-                     WHERE l.book=b.id AND t.name LIKE ? ESCAPE '\\')"
-        }
-        "series" => {
-            params.push(like);
-            "EXISTS (SELECT 1 FROM books_series_link l JOIN series s ON s.id=l.series
-                     WHERE l.book=b.id AND s.name LIKE ? ESCAPE '\\')"
-        }
-        "publisher" => {
-            params.push(like);
-            "EXISTS (SELECT 1 FROM books_publishers_link l JOIN publishers p ON p.id=l.publisher
-                     WHERE l.book=b.id AND p.name LIKE ? ESCAPE '\\')"
-        }
-        "format" => {
-            params.push(value.trim().to_ascii_uppercase());
-            "EXISTS (SELECT 1 FROM data d WHERE d.book=b.id AND d.format = ?)"
-        }
-        "language" | "lang" => {
-            params.push(like);
-            "EXISTS (SELECT 1 FROM books_languages_link l JOIN languages lang ON lang.id=l.lang_code
-                     WHERE l.book=b.id AND lang.lang_code LIKE ? ESCAPE '\\')"
-        }
-        "identifier" => {
-            if let Some((kind, id_value)) = value.split_once(':') {
-                params.push(kind.to_ascii_lowercase());
-                params.push(like_pattern(id_value));
-                "EXISTS (SELECT 1 FROM identifiers i WHERE i.book=b.id
-                         AND LOWER(i.type)=? AND i.val LIKE ? ESCAPE '\\')"
-            } else {
-                params.push(like);
-                "EXISTS (SELECT 1 FROM identifiers i WHERE i.book=b.id
-                         AND i.val LIKE ? ESCAPE '\\')"
-            }
-        }
-        "rating" => {
-            params.push(value.trim().to_string());
-            "EXISTS (SELECT 1 FROM books_ratings_link l JOIN ratings r ON r.id=l.rating
-                     WHERE l.book=b.id AND r.rating = CAST(? AS INTEGER))"
-        }
-        "id" => {
-            params.push(value.trim().to_string());
-            "b.id = CAST(? AS INTEGER)"
-        }
-        _ => return None,
-    };
-    Some(clause.to_string())
-}
-
-fn free_text_clause(value: &str, params: &mut Vec<String>) -> String {
-    let like = like_pattern(value);
-    params.push(like.clone());
-    params.push(like.clone());
-    params.push(like);
-    "(b.title LIKE ? ESCAPE '\\'
-      OR EXISTS (SELECT 1 FROM books_authors_link l JOIN authors a ON a.id=l.author
-                 WHERE l.book=b.id AND a.name LIKE ? ESCAPE '\\')
-      OR EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag
-                 WHERE l.book=b.id AND t.name LIKE ? ESCAPE '\\'))"
-        .to_string()
-}
-
-fn like_pattern(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len() + 2);
-    escaped.push('%');
-    for ch in value.chars() {
-        if matches!(ch, '%' | '_' | '\\') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped.push('%');
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_search_queries() {
-        let parsed = parse_query("author:tolkien tag:fantasy the hobbit sort:-series");
-        assert_eq!(parsed.params.len(), 8);
-        assert!(parsed.where_sql.contains("a.name LIKE"));
-        assert!(parsed.where_sql.contains("t.name LIKE"));
-        assert_eq!(parsed.sort, Some(BookSort::Series));
-        assert!(parsed.descending);
-    }
-
-    #[test]
-    fn supports_negation_and_quoted_values() {
-        let parsed = parse_query("!tag:romance title:\"the hobbit\"");
-        assert!(parsed.where_sql.starts_with("NOT ("));
-        assert_eq!(parsed.params[0], "%romance%");
-        assert_eq!(parsed.params[1], "%the hobbit%");
-    }
-
-    #[test]
-    fn builds_safe_like_patterns() {
-        assert_eq!(like_pattern("100%_safe"), "%100\\%\\_safe%");
-    }
 
     #[test]
     fn renders_templates() {

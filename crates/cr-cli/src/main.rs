@@ -9,8 +9,9 @@ use clap::{Args, Parser, Subcommand};
 use cr_core::device::{self, Device, SendOptions};
 use cr_core::jobs::JobContext;
 use cr_core::library::{
-    filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, Collision,
-    DuplicatePolicy, ExportOptions, ImportOptions, Library, ListOptions, SearchReplace, TextField,
+    filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, CatalogFormat,
+    Category, Collision, DuplicatePolicy, ExportOptions, ImportOptions, Library, ListOptions,
+    SearchReplace, TextField,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
 use cr_core::text::{self, split_authors};
@@ -113,6 +114,70 @@ enum Command {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<usize>,
+        /// Only look inside this virtual library
+        #[arg(long)]
+        vl: Option<String>,
+    },
+    /// List, save or remove named searches (use one as `search:name`)
+    Searches {
+        /// list, save or rm
+        #[arg(default_value = "list")]
+        action: String,
+        name: Option<String>,
+        /// The query to save
+        query: Vec<String>,
+        /// Work on virtual libraries (`vl:name`, `cr list --vl name`) instead
+        #[arg(long = "virtual")]
+        virtual_library: bool,
+    },
+    /// Browse authors, series, tags, publishers, languages, formats or ratings
+    Categories {
+        /// The category to list (default: a summary of all)
+        category: Option<String>,
+        /// Rename a tag, series or publisher: `--rename OLD NEW` (merges when NEW exists)
+        #[arg(long, num_args = 2, value_names = ["OLD", "NEW"], requires = "category")]
+        rename: Vec<String>,
+    },
+    /// List, add or remove custom columns
+    Columns {
+        /// list, add or rm
+        #[arg(default_value = "list")]
+        action: String,
+        /// Lookup name, e.g. `pages` (searched as `#pages:>300`)
+        label: Option<String>,
+        /// Heading (default: the lookup name)
+        #[arg(long)]
+        name: Option<String>,
+        /// text, comments, series, enumeration, rating, int, float, bool or datetime
+        #[arg(long = "type", default_value = "text")]
+        datatype: String,
+        /// Let a text column hold several comma-separated values
+        #[arg(long)]
+        multiple: bool,
+        /// An allowed value of an enumeration column (repeat)
+        #[arg(long = "choice")]
+        choices: Vec<String>,
+    },
+    /// Write a catalog of the library (or of a search) as CSV or JSON
+    Catalog {
+        /// Output file ending in .csv or .json (`-` prints CSV)
+        output: PathBuf,
+        /// Only include books matching this search
+        query: Vec<String>,
+    },
+    /// Search inside books: `cr fts index`, then `cr fts search WORDS`
+    Fts {
+        /// index or search
+        action: String,
+        query: Vec<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Set a book's value in a custom column (an empty value clears it)
+    SetCustom {
+        id: i64,
+        label: String,
+        value: String,
     },
     /// Show all metadata for one book
     Show { id: i64 },
@@ -570,8 +635,22 @@ fn run(cli: Cli) -> Result<()> {
             sort,
             desc,
             limit,
+            vl,
         } => {
             let library = Library::open(&library_path)?;
+            let mut query = query;
+            if let Some(name) = vl {
+                if !library
+                    .virtual_libraries()?
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(&name))
+                {
+                    bail!("no virtual library named `{name}`");
+                }
+                // Parenthesised, so an `or` in the query stays inside the library.
+                let name = name.replace('"', "\\\"");
+                query = vec![format!("\"vl:{name}\" ({})", query.join(" "))];
+            }
             let sort = match sort {
                 Some(value) => Some(
                     BookSort::parse(&value)
@@ -599,19 +678,218 @@ fn run(cli: Cli) -> Result<()> {
                 print_book_table(&books);
             }
         }
+        Command::Searches {
+            action,
+            name,
+            query,
+            virtual_library,
+        } => {
+            let mut library = Library::open(&library_path)?;
+            let named = || name.clone().ok_or_else(|| anyhow!("give a name"));
+            let store = |library: &mut Library, name: &str, query: Option<&str>| {
+                if virtual_library {
+                    library.set_virtual_library(name, query)
+                } else {
+                    library.set_saved_search(name, query)
+                }
+            };
+            match action.as_str() {
+                "list" => {
+                    let entries = if virtual_library {
+                        library.virtual_libraries()?
+                    } else {
+                        library.saved_searches()?
+                    };
+                    if cli.json {
+                        print_json(&json!(entries))?;
+                    } else {
+                        for (name, query) in entries {
+                            println!("{name}: {query}");
+                        }
+                    }
+                }
+                "save" | "add" => {
+                    if query.is_empty() {
+                        bail!("give the query to save");
+                    }
+                    let name = named()?;
+                    store(&mut library, &name, Some(&query.join(" ")))?;
+                    println!("Saved `{name}`");
+                }
+                "rm" | "remove" => {
+                    let name = named()?;
+                    store(&mut library, &name, None)?;
+                    println!("Removed `{name}`");
+                }
+                other => bail!("unknown action `{other}` (use list, save or rm)"),
+            }
+        }
+        Command::Categories { category, rename } => {
+            let mut library = Library::open(&library_path)?;
+            let parse = |name: &str| {
+                Category::parse(name).ok_or_else(|| anyhow!("unknown category `{name}`"))
+            };
+            match category {
+                None => {
+                    for category in Category::ALL {
+                        let items = library.category_items(category)?;
+                        println!("{:<11} {}", category.name(), items.len());
+                    }
+                }
+                Some(name) if !rename.is_empty() => {
+                    let books =
+                        library.rename_category_item(parse(&name)?, &rename[0], &rename[1])?;
+                    println!(
+                        "Renamed `{}` to `{}` on {} book(s)",
+                        rename[0],
+                        rename[1],
+                        books.len()
+                    );
+                }
+                Some(name) => {
+                    let items = library.category_items(parse(&name)?)?;
+                    if cli.json {
+                        let items: Vec<Value> = items
+                            .iter()
+                            .map(|item| json!({"name": item.name, "books": item.books}))
+                            .collect();
+                        print_json(&json!(items))?;
+                    } else {
+                        for item in items {
+                            println!("{:>6}  {}", item.books, item.name);
+                        }
+                    }
+                }
+            }
+        }
+        Command::Columns {
+            action,
+            label,
+            name,
+            datatype,
+            multiple,
+            choices,
+        } => {
+            let mut library = Library::open(&library_path)?;
+            let labelled = || {
+                label
+                    .clone()
+                    .ok_or_else(|| anyhow!("give the column's lookup name"))
+            };
+            match action.as_str() {
+                "list" => {
+                    for column in library.custom_columns()? {
+                        let kind = if column.is_multiple {
+                            format!("{} (several)", column.datatype)
+                        } else {
+                            column.datatype.clone()
+                        };
+                        println!("#{:<16} {:<18} {}", column.label, kind, column.name);
+                    }
+                }
+                "add" => {
+                    let label = labelled()?;
+                    let name = name.unwrap_or_else(|| label.clone());
+                    let column = library
+                        .create_custom_column(&label, &name, &datatype, multiple, &choices)?;
+                    println!("Added column #{}", column.label);
+                }
+                "rm" | "remove" => {
+                    let label = labelled()?;
+                    library.delete_custom_column(&label)?;
+                    println!("Removed column #{}", label.trim_start_matches('#'));
+                }
+                other => bail!("unknown action `{other}` (use list, add or rm)"),
+            }
+        }
+        Command::Catalog { output, query } => {
+            let library = Library::open(&library_path)?;
+            let extension = output.extension().and_then(|e| e.to_str()).unwrap_or("csv");
+            let format = CatalogFormat::parse(extension).ok_or_else(|| {
+                anyhow!("unknown catalog type `.{extension}` (use .csv or .json)")
+            })?;
+            let catalog = library.catalog(&query.join(" "), format)?;
+            if output.as_os_str() == "-" {
+                print!("{catalog}");
+            } else {
+                fs::write(&output, catalog)
+                    .with_context(|| format!("cannot write {}", output.display()))?;
+                println!("Wrote {}", output.display());
+            }
+        }
+        Command::Fts {
+            action,
+            query,
+            limit,
+        } => {
+            let library = Library::open(&library_path)?;
+            match action.as_str() {
+                "index" => {
+                    let report = library.fts_index(&JobContext::detached())?;
+                    println!(
+                        "Indexed {} book(s), {} unchanged, {} removed",
+                        report.indexed, report.unchanged, report.removed
+                    );
+                    for (id, reason) in &report.failed {
+                        eprintln!("#{id}: {reason}");
+                    }
+                }
+                "search" => {
+                    if !library.has_fts_index() {
+                        bail!("no full-text index yet; run `cr fts index` first");
+                    }
+                    let hits = library.fts_search(&query.join(" "), limit)?;
+                    if cli.json {
+                        let hits: Vec<Value> = hits
+                            .iter()
+                            .map(|hit| {
+                                json!({
+                                    "book": hit.book,
+                                    "title": hit.title,
+                                    "chapter": hit.chapter,
+                                    "chapter_title": hit.chapter_title,
+                                    "snippet": hit.snippet,
+                                })
+                            })
+                            .collect();
+                        print_json(&json!(hits))?;
+                    } else {
+                        for hit in hits {
+                            println!(
+                                "#{} {} — ch. {} {}\n    {}",
+                                hit.book, hit.title, hit.chapter, hit.chapter_title, hit.snippet
+                            );
+                        }
+                    }
+                }
+                other => bail!("unknown action `{other}` (use index or search)"),
+            }
+        }
+        Command::SetCustom { id, label, value } => {
+            let mut library = Library::open(&library_path)?;
+            library.set_custom_value(id, &label, &value)?;
+            println!("Updated #{id}");
+        }
         Command::Show { id } => {
             let library = Library::open(&library_path)?;
             let meta = library.get_metadata(id)?;
             let formats = library.formats(id)?;
             let path = library.book_path(id)?;
+            let custom = library.custom_values(id)?;
             if cli.json {
                 let mut value = meta.to_json();
+                if !custom.is_empty() {
+                    value["custom"] = json!(custom);
+                }
                 value["id"] = json!(id);
                 value["formats"] = json!(formats);
                 value["path"] = json!(path);
                 print_json(&value)?;
             } else {
                 print_metadata(id, &meta, &formats, &path);
+                for (label, values) in &custom {
+                    println!("{:<12} {}", format!("#{label}:"), values.join(", "));
+                }
             }
         }
         Command::Set(args) => {

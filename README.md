@@ -75,7 +75,15 @@ Import from:
 - **FB2** — title/author/series/genre/annotation, embedded cover.
 - **TXT** — filename-derived metadata.
 - **HTML/XHTML** — `<title>`, author/language/keywords meta tags.
+- **DOCX** — document properties (title, author, keywords, description).
+- **RTF** — the `\info` group.
+- **PDF** — the document information dictionary.
+- **CBZ** — `ComicInfo.xml` (series, number, writer, publisher, genre); the
+  first page becomes the cover.
 - Other files can be stored and managed; metadata falls back to the filename.
+
+**Custom columns** of every calibre type except composite are read, written
+and searchable, in calibre's own tables.
 
 Read/write calibre's `metadata.opf` (v2.0). Editable fields:
 
@@ -287,12 +295,39 @@ cr --json show 12
 | `format:EPUB` | has that format (exact) |
 | `language:en` | language code |
 | `identifier:isbn:978...` | identifier type/value |
-| `rating:8` | calibre rating 0–10 |
+| `rating:>=4` | at least four stars (`rating:false`: unrated) |
 | `id:12` | database id |
-| `!tag:romance` | negation |
+| `tag:=sf` | exact match instead of "contains" |
+| `title:~^the` | regular expression |
+| `series:true`, `cover:false` | field is set / empty |
+| `pubdate:>=2020-06`, `date:today`, `date:30daysago` | date comparisons |
+| `size:>2M` | largest format bigger than 2 MB |
+| `#pages:>300`, `#genre:=noir` | custom columns |
+| `search:name`, `vl:name` | a saved search / virtual library |
+| `!tag:romance`, `not tag:romance` | negation |
+| `tag:a or (tag:b and not tag:c)` | OR and grouping |
 | `sort:-series` | order by series descending |
 
-Multiple terms are combined with AND.
+Terms are combined with AND unless `or` is given. This follows calibre's
+search language; ratings are in stars, as in calibre.
+
+### Organising
+
+```sh
+cr searches save unread-sf "tag:sf and #read:false"   # then: cr list search:unread-sf
+cr searches --virtual save Comics "format:cbz"        # then: cr list --vl Comics
+cr categories tags                                    # every tag with its book count
+cr categories tags --rename scifi sf                  # rename, or merge into an existing tag
+cr columns add pages --type int                       # custom column
+cr set-custom 12 pages 412
+cr fts index && cr fts search "spice must flow"       # search inside books
+cr catalog library.csv "tag:sf"                       # CSV or JSON catalog
+```
+
+Saved searches, virtual libraries and custom columns are stored where calibre
+stores them, so both programs share them. The full-text index is a separate
+file (`cr-full-text.db`) that can be deleted at any time; `cr fts index` only
+re-reads books whose files changed.
 
 ## Architecture
 
@@ -349,11 +384,16 @@ Currently missing:
 - **GUI polish** — the GPUI front end has a basic text-based EPUB editor, but
   no visual editor, bulk metadata dialog, trash browser or cover-generation
   tools yet (bulk edits, trash and library transfers are CLI-only).
+- The desktop app does not yet show custom columns, the category browser,
+  saved searches or full-text results (its search box does accept the whole
+  search language); these are CLI-only.
 - Format conversion outside the EPUB and Kindle paths above.
-- PDF metadata and text extraction.
-- calibre's plugin system, content server/OPDS, annotations, full-text search,
-  custom columns, virtual libraries, saved searches and the complete search
-  language.
+- PDF text extraction, PDF metadata stored in compressed object streams or
+  XMP, and CBR/CB7 comic archives.
+- Downloading metadata and covers from online sources.
+- Notes on authors/series/tags, composite (template) custom columns, and
+  custom values in `metadata.opf` (calibre rewrites them there itself).
+- calibre's plugin system, content server/OPDS and annotations.
 - Full ebook editor (only EPUB unpack/repack today), cover cropping and
   thumbnail generation, DRM.
 - Opening libraries older than schema 28 without an upgrade step.

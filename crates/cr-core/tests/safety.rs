@@ -197,10 +197,10 @@ fn reading_prefers_a_supported_format() {
     assert!(matches!(error, Error::UnsupportedFormat(_)));
     assert!(error.to_string().contains("only has PDF"), "{error}");
 
-    // AZW sorts before TXT alphabetically; an unreadable-first choice would fail.
-    let docx = temp.path().join("paper.docx");
-    fs::write(&docx, b"zip").unwrap();
-    library.replace_format(id, "DOCX", &docx).unwrap();
+    // LIT sorts before TXT alphabetically; an unreadable-first choice would fail.
+    let lit = temp.path().join("paper.lit");
+    fs::write(&lit, b"ITOLITLS").unwrap();
+    library.replace_format(id, "LIT", &lit).unwrap();
     library
         .replace_format(id, "TXT", &text_book(temp.path(), "paper.txt"))
         .unwrap();
