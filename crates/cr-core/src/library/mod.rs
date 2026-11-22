@@ -549,6 +549,28 @@ impl Library {
         )
     }
 
+    /// Id, uuid, title and first author of every book, for matching the
+    /// files on a device back to the library.
+    pub fn book_identities(&self) -> Result<Vec<(i64, String, String, String)>> {
+        let mut statement = self.conn.prepare(
+            "SELECT b.id, COALESCE(b.uuid, ''), b.title, COALESCE((
+                 SELECT a.name FROM books_authors_link l
+                 JOIN authors a ON a.id = l.author
+                 WHERE l.book = b.id ORDER BY l.id LIMIT 1), '')
+             FROM books b",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let author: String = row.get(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                author.replace('|', ","),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn all_book_ids(&self) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare("SELECT id FROM books ORDER BY id")?;
         let ids = stmt

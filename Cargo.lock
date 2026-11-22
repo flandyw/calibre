@@ -422,6 +422,7 @@ dependencies = [
  "html-escape",
  "image",
  "kindling-mobi",
+ "libc",
  "mtp-rs",
  "percent-encoding",
  "quick-xml 0.37.5",

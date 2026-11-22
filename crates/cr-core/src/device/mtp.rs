@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -10,6 +10,7 @@ use super::{
     prepare_book, Device, DeviceKind, PreparedBook, SendOptions, SendReport, SentBook, Transport,
 };
 use crate::error::{Error, Result};
+use crate::jobs::JobContext;
 use crate::library::Library;
 
 const AMAZON: u16 = 0x1949;
@@ -63,6 +64,10 @@ pub(super) fn send(
     };
     let mut books = Vec::new();
     for &id in ids {
+        if options.job.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
         if let Some(book) = prepare_book(library, device, id, options, &mut report)? {
             books.push((id, book));
         }
@@ -71,6 +76,18 @@ pub(super) fn send(
         return Ok(report);
     }
 
+    let job = options.job.clone();
+    block_on(async {
+        let connection = open(device, kindle).await?;
+        let transfer = upload_books(&connection, device, books, &mut report, &job).await;
+        let close = connection.close().await;
+        transfer?;
+        close.map_err(|err| Error::Device(format!("Could not close Kindle session: {err}")))?;
+        Ok(report)
+    })
+}
+
+async fn open(device: &Device, kindle: &Kindle) -> Result<MtpDevice> {
     let still_connected = kindle_info()?.any(|info| {
         info.location_id == kindle.location
             && info.product_id == kindle.product
@@ -82,23 +99,83 @@ pub(super) fn send(
             device.name
         )));
     }
+    MtpDevice::builder()
+        .known_devices(KINDLE_IDS)
+        .open_by_location(kindle.location)
+        .await
+        .map_err(|err| {
+            Error::Device(format!(
+                "Could not open {}. Unlock the Kindle and close other USB file-transfer apps. ({err})",
+                device.name
+            ))
+        })
+}
 
+/// Book files under the Kindle's documents folder: path, size and handle.
+async fn book_objects(connection: &MtpDevice) -> Result<(Storage, Vec<(String, ObjectInfo)>)> {
+    let (storage, folder) = documents_folder(connection).await?;
+    let listing = storage
+        .collect_objects_recursive(Some(folder.handle))
+        .await
+        .map_err(|err| Error::Device(format!("Could not list Kindle documents: {err}")))?;
+    let folders: HashMap<ObjectHandle, (ObjectHandle, String)> = listing
+        .objects
+        .iter()
+        .filter(|object| object.is_folder())
+        .map(|object| (object.handle, (object.parent, object.filename.clone())))
+        .collect();
+    let books = listing
+        .objects
+        .into_iter()
+        .filter(|object| !object.is_folder() && super::is_book_file(&object.filename))
+        .map(|object| {
+            let mut path = object.filename.clone();
+            let mut parent = object.parent;
+            while let Some((next, name)) = folders.get(&parent) {
+                path = format!("{name}/{path}");
+                parent = *next;
+            }
+            (format!("{}/{path}", folder.filename), object)
+        })
+        .collect();
+    Ok((storage, books))
+}
+
+/// Path and size of every book on the Kindle.
+pub(super) fn books(device: &Device, kindle: &Kindle) -> Result<Vec<(String, u64)>> {
     block_on(async {
-        let connection = MtpDevice::builder()
-            .known_devices(KINDLE_IDS)
-            .open_by_location(kindle.location)
-            .await
-            .map_err(|err| {
-                Error::Device(format!(
-                    "Could not open {}. Unlock the Kindle and close other USB file-transfer apps. ({err})",
-                    device.name
-                ))
-            })?;
-        let transfer = upload_books(&connection, device, books, &mut report).await;
-        let close = connection.close().await;
-        transfer?;
-        close.map_err(|err| Error::Device(format!("Could not close Kindle session: {err}")))?;
-        Ok(report)
+        let connection = open(device, kindle).await?;
+        let listed = book_objects(&connection).await;
+        let _ = connection.close().await;
+        Ok(listed?
+            .1
+            .into_iter()
+            .map(|(path, object)| (path, object.size))
+            .collect())
+    })
+}
+
+/// Delete books by the paths `books` reported; returns the ones deleted.
+pub(super) fn remove(device: &Device, kindle: &Kindle, paths: &[String]) -> Result<Vec<String>> {
+    block_on(async {
+        let connection = open(device, kindle).await?;
+        let outcome = async {
+            let (storage, books) = book_objects(&connection).await?;
+            let mut removed = Vec::new();
+            for (path, object) in books {
+                if paths.contains(&path) {
+                    storage
+                        .delete(object.handle)
+                        .await
+                        .map_err(|err| Error::Device(format!("Could not delete {path}: {err}")))?;
+                    removed.push(path);
+                }
+            }
+            Ok(removed)
+        }
+        .await;
+        let _ = connection.close().await;
+        outcome
     })
 }
 
@@ -107,6 +184,7 @@ async fn upload_books(
     device: &Device,
     books: Vec<(i64, PreparedBook)>,
     report: &mut SendReport,
+    job: &JobContext,
 ) -> Result<()> {
     let (storage, folder) = documents_folder(connection).await?;
     let listing = storage
@@ -123,7 +201,13 @@ async fn upload_books(
         .into_iter()
         .map(|file| file.filename.to_lowercase())
         .collect();
-    for (id, book) in books {
+    let total = books.len();
+    for (index, (id, book)) in books.into_iter().enumerate() {
+        if job.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
+        job.report(index, total, book.meta.title.clone());
         // Leave room for the extension, collision suffix and folder name.
         let mut counter = 1;
         let mut filename = book.file_name(counter, Some(210));
@@ -133,6 +217,13 @@ async fn upload_books(
         }
         let file = File::open(&book.source)?;
         let size = file.metadata()?.len();
+        let free = storage.info().free_space;
+        if !report.dry_run && free > 0 && size > free {
+            return Err(Error::Device(format!(
+                "{} is full: {} needs {size} bytes but {free} are free.",
+                device.name, book.meta.title
+            )));
+        }
         if !report.dry_run {
             upload_file(&storage, folder.handle, &filename, size, file).await?;
         }
@@ -142,6 +233,7 @@ async fn upload_books(
             format: book.format,
             path: device.root.join(&folder.filename).join(filename),
             bytes: size,
+            converted_from: book.converted_from.clone(),
         });
     }
     Ok(())

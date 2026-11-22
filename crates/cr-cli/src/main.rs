@@ -364,6 +364,21 @@ enum Command {
         /// Show what would be copied without writing anything
         #[arg(long)]
         dry_run: bool,
+        /// Skip books with no format the device reads instead of converting them
+        #[arg(long)]
+        no_convert: bool,
+        /// File name on the device: {title}, {author}, {series}, {series_index}, {id}; / makes folders
+        #[arg(long)]
+        template: Option<String>,
+    },
+    /// Work with a connected e-reader: books, rm PATH..., or status
+    Device {
+        action: String,
+        /// rm: paths as shown by `cr device books`
+        args: Vec<String>,
+        /// Mount path or MTP identifier from `cr devices` (auto-detected when omitted)
+        #[arg(long)]
+        device: Option<PathBuf>,
     },
     /// Show library statistics
     Info,
@@ -1285,13 +1300,26 @@ fn run(cli: Cli) -> Result<()> {
             device: device_path,
             format,
             dry_run,
+            no_convert,
+            template,
         } => {
             if ids.is_empty() {
                 bail!("no book ids given");
             }
             let library = Library::open(&library_path)?;
             let device = resolve_device(device_path)?;
-            let report = device::send(&library, &device, &ids, &SendOptions { format, dry_run })?;
+            let report = device::send(
+                &library,
+                &device,
+                &ids,
+                &SendOptions {
+                    format,
+                    dry_run,
+                    no_convert,
+                    template,
+                    ..SendOptions::default()
+                },
+            )?;
             if cli.json {
                 print_json(&json!({
                     "device": device.name,
@@ -1301,6 +1329,7 @@ fn run(cli: Cli) -> Result<()> {
                         "id": sent.id,
                         "title": sent.title,
                         "format": sent.format,
+                        "converted_from": sent.converted_from,
                         "path": sent.path,
                         "bytes": sent.bytes,
                     })).collect::<Vec<_>>(),
@@ -1312,10 +1341,14 @@ fn run(cli: Cli) -> Result<()> {
             } else {
                 for sent in &report.sent {
                     println!(
-                        "{}{} -> {}",
+                        "{}{} -> {}{}",
                         if dry_run { "[dry-run] " } else { "" },
                         sent.title,
-                        sent.path.display()
+                        sent.path.display(),
+                        sent.converted_from
+                            .as_ref()
+                            .map(|from| format!(" (converted from {from})"))
+                            .unwrap_or_default()
                     );
                 }
                 for (id, reason) in &report.skipped {
@@ -1328,6 +1361,104 @@ fn run(cli: Cli) -> Result<()> {
                         if dry_run { " (not written)" } else { "" }
                     );
                 }
+            }
+        }
+        Command::Device {
+            action,
+            args,
+            device: device_path,
+        } => {
+            let device = resolve_device(device_path)?;
+            match action.as_str() {
+                "books" => {
+                    // Without a library the books are listed unmatched.
+                    let library = Library::open(&library_path).ok();
+                    let books = device::books(library.as_ref(), &device)?;
+                    if cli.json {
+                        print_json(&json!(books
+                            .iter()
+                            .map(|book| json!({
+                                "path": book.path,
+                                "title": book.title,
+                                "format": book.format,
+                                "bytes": book.bytes,
+                                "book_id": book.book_id,
+                                "state": book.state.as_str(),
+                            }))
+                            .collect::<Vec<_>>()))?;
+                    } else if books.is_empty() {
+                        println!("No books on {}.", device.name);
+                    } else {
+                        for book in &books {
+                            println!(
+                                "{:<6} {:<14} {:<6} {:>10}  {}",
+                                book.book_id
+                                    .map(|id| format!("#{id}"))
+                                    .unwrap_or_else(|| "-".into()),
+                                book.state.as_str(),
+                                book.format,
+                                human_size(book.bytes),
+                                book.path
+                            );
+                        }
+                    }
+                }
+                "rm" => {
+                    if args.is_empty() {
+                        bail!("rm needs one or more paths from `cr device books`");
+                    }
+                    for path in device::remove(&device, &args)? {
+                        println!("Removed {path}");
+                    }
+                }
+                "status" => {
+                    let reading = device::reading(&device)?;
+                    if cli.json {
+                        print_json(&json!(reading
+                            .iter()
+                            .map(|book| json!({
+                                "title": book.title,
+                                "author": book.author,
+                                "percent": book.percent,
+                                "finished": book.finished,
+                                "last_read": book.last_read,
+                                "annotations": book.annotations.iter().map(|note| json!({
+                                    "text": note.text,
+                                    "note": note.note,
+                                    "location": note.location,
+                                    "created": note.created,
+                                })).collect::<Vec<_>>(),
+                            }))
+                            .collect::<Vec<_>>()))?;
+                    } else if reading.is_empty() {
+                        println!("{} has no reading progress or highlights.", device.name);
+                    } else {
+                        for book in &reading {
+                            let progress = match (book.finished, book.percent) {
+                                (true, _) => "finished".to_string(),
+                                (false, Some(percent)) => format!("{percent:.0}%"),
+                                (false, None) => "-".to_string(),
+                            };
+                            println!(
+                                "{}{}  [{progress}]",
+                                book.title,
+                                book.author
+                                    .as_ref()
+                                    .map(|author| format!(" - {author}"))
+                                    .unwrap_or_default()
+                            );
+                            for note in &book.annotations {
+                                if !note.text.is_empty() {
+                                    println!("    \"{}\"", note.text);
+                                }
+                                if let Some(text) = &note.note {
+                                    println!("    note: {text}");
+                                }
+                            }
+                        }
+                    }
+                }
+                other => bail!("unknown action {other}; use books, rm or status"),
             }
         }
         Command::Info => {
