@@ -26,10 +26,12 @@ use crate::text;
 mod fts;
 mod manage;
 mod organize;
+mod reading;
 mod search;
 pub use fts::*;
 pub use manage::*;
 pub use organize::*;
+pub use reading::*;
 
 pub const DB_FILE: &str = "metadata.db";
 pub const METADATA_FILE: &str = "metadata.opf";

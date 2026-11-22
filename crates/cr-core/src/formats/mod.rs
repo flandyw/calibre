@@ -7,10 +7,11 @@ pub mod epub;
 pub mod fb2;
 pub mod html;
 mod mobi;
+pub mod reading;
 pub mod txt;
 
 pub use conversion::{
-    convert, convert_with, ConvertOptions, Profile, INPUT_FORMATS, OUTPUT_FORMATS,
+    convert, convert_with, read_document, ConvertOptions, Profile, INPUT_FORMATS, OUTPUT_FORMATS,
 };
 
 use std::fs::File;

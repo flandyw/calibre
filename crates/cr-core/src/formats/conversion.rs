@@ -91,6 +91,19 @@ fn is_kindle(format: &str) -> bool {
     matches!(format, "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC")
 }
 
+/// Read a book of any convertible format into the document model.
+pub fn read_document(input: &Path, split_chapters: bool) -> Result<document::Document> {
+    let source = detect_format(input);
+    let options = document::ReadOptions { split_chapters };
+    if is_kindle(&source) {
+        let mut epub = tempfile::Builder::new().suffix(".epub").tempfile()?;
+        mobi::write_epub(input, epub.as_file_mut())?;
+        epub.as_file_mut().flush()?;
+        return document::read(epub.path(), "EPUB", options);
+    }
+    document::read(input, &source, options)
+}
+
 /// Convert a book with the default settings. See [`convert_with`].
 pub fn convert(input: &Path, output: &Path) -> Result<()> {
     convert_with(input, output, &ConvertOptions::default())
