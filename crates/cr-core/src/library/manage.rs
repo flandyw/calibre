@@ -478,7 +478,11 @@ impl Library {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
         if let Some(custom) = custom {
-            self.apply_custom_values(restored.id, &custom);
+            // The trashed copy stays until everything is back.
+            if let Err(error) = self.apply_custom_values(restored.id, &custom) {
+                let _ = self.remove_book(restored.id, true);
+                return Err(error);
+            }
         }
         let extras = trash.join(DATA_DIR);
         if extras.is_dir() {
@@ -637,7 +641,11 @@ impl Library {
             keep_uuid: true,
         };
         let copied = target.insert_book(meta, &files, options)?;
-        target.apply_custom_values(copied.id, &self.custom_values(id)?);
+        let custom = self.custom_values(id)?;
+        if let Err(error) = target.apply_custom_values(copied.id, &custom) {
+            let _ = target.remove_book(copied.id, true);
+            return Err(error);
+        }
         let extras = safe_join(&self.root, &self.book_path(id)?)?.join(DATA_DIR);
         if extras.is_dir() {
             copy_tree(

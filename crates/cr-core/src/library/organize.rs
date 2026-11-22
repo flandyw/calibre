@@ -473,10 +473,17 @@ impl Library {
         &mut self,
         book: i64,
         values: &BTreeMap<String, Vec<String>>,
-    ) {
+    ) -> Result<()> {
         for (label, values) in values {
-            let _ = self.set_custom_value(book, label, &values.join(","));
+            if self.custom_column(label).is_err() {
+                continue;
+            }
+            match self.set_custom_value(book, label, &values.join(",")) {
+                Ok(()) | Err(Error::InvalidMetadata(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
+        Ok(())
     }
 
     /// Set a book's value in a custom column; an empty value clears it.
