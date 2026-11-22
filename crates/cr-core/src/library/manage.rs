@@ -111,7 +111,9 @@ pub fn scan_sources(paths: &[PathBuf], recursive: bool) -> Vec<PathBuf> {
         let mut inside: Vec<PathBuf> = walkdir::WalkDir::new(path)
             .max_depth(depth)
             .into_iter()
-            .filter_entry(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .filter_entry(|entry| {
+                entry.depth() == 0 || !entry.file_name().to_string_lossy().starts_with('.')
+            })
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_file() && is_importable(entry.path()))
             .map(|entry| entry.into_path())
