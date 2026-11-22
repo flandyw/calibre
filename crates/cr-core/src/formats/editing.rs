@@ -28,8 +28,9 @@ static ITEMREF: LazyLock<Regex> = LazyLock::new(|| {
 static XML_ENCODING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^(\s*<\?xml\b[^>]*?\bencoding\s*=\s*["'])[^"']*(["'])"#).unwrap()
 });
-static STYLE_ELEMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?is)<style\b[^<>]*>(.*?)</style\s*>").unwrap());
+static STYLE_ELEMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?is)<(?:\w+:)?style\b[^<>]*>(.*?)</(?:\w+:)?style\s*>").unwrap()
+});
 static CSS_IMPORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"@import\s+["']([^"']+)["']"#).unwrap());
 static NAV_TOC: LazyLock<Regex> = LazyLock::new(|| {
@@ -1424,8 +1425,9 @@ fn retarget(
                 .map(|found| (found.get(1).unwrap().range(), false)),
         );
         for tag in TAG.find_iter(text) {
-            for (name, _, range) in attributes(tag.as_str()) {
-                if name == "style" {
+            // Also SVG presentation attributes such as fill="url(...)".
+            for (name, value, range) in attributes(tag.as_str()) {
+                if name == "style" || value.contains("url(") {
                     styles.push((tag.start() + range.start..tag.start() + range.end, true));
                 }
             }

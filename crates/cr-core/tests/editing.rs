@@ -290,7 +290,7 @@ fn edits_keep_what_they_do_not_own() {
     let image_href = image.path.rsplit_once("OEBPS/").unwrap().1.to_string();
     let styled = text.replace(
         "</body>",
-        &format!("<p style=\"background: url({image_href})\">x</p><p>write url({image_href}) in CSS</p></body>"),
+        &format!("<p style=\"background: url({image_href})\">x</p><p>write url({image_href}) in CSS</p><svg xmlns=\"http://www.w3.org/2000/svg\"><rect fill=\"url({image_href}#g)\"/></svg></body>"),
     );
     fs::write(&path, styled).unwrap();
     let css = temp.path().join("extra.css");
@@ -341,6 +341,7 @@ fn edits_keep_what_they_do_not_own() {
 
     // Prose that mentions url() is not a reference.
     let chapter = fs::read_to_string(book.root().join(&moved)).unwrap();
+    assert!(chapter.contains("fill=\"url(../art/new.png#g)\""));
     assert!(chapter.contains(&format!("write url({image_href}) in CSS")));
 
     // Names that need escaping stay well-formed, in either quote style.
