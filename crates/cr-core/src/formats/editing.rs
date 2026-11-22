@@ -1426,8 +1426,20 @@ fn retarget(
         );
         for tag in TAG.find_iter(text) {
             // Also SVG presentation attributes such as fill="url(...)".
-            for (name, value, range) in attributes(tag.as_str()) {
-                if name == "style" || value.contains("url(") {
+            for (name, _, range) in attributes(tag.as_str()) {
+                if matches!(
+                    name.as_str(),
+                    "style"
+                        | "fill"
+                        | "stroke"
+                        | "filter"
+                        | "mask"
+                        | "clip-path"
+                        | "marker"
+                        | "marker-start"
+                        | "marker-mid"
+                        | "marker-end"
+                ) {
                     styles.push((tag.start() + range.start..tag.start() + range.end, true));
                 }
             }
