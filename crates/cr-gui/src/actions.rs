@@ -55,6 +55,7 @@ actions!(
         CropCover,
         EditEpub,
         RepackEpub,
+        CheckEpub,
         OpenInDefaultApp,
         RevealInFileManager,
         CopyBookInfo,

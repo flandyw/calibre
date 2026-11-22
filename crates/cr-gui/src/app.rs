@@ -8,12 +8,12 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cr_core::device::{self, Device, SendOptions};
-use cr_core::formats::epub as epub_formats;
+use cr_core::formats::editing::{EpubDir, Severity};
 use cr_core::formats::reading::{Book, Hit, Locator};
 use cr_core::jobs::{self, Canceller, JobContext, Progress};
 use cr_core::library::{
     AddOutcome, Annotation, AnnotationKind, BookSort, BookUpdate, DuplicatePolicy, ExportOptions,
-    ImportOptions, Library, ListOptions,
+    ImportOptions, Library, ListOptions, SaveOutcome,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, BookSummary, Metadata};
 use cr_core::text::{self, split_authors};
@@ -2818,31 +2818,41 @@ impl CalibreApp {
             cx.notify();
             return false;
         }
-        let output =
-            std::env::temp_dir().join(format!("calibre-rust-repack-{id}-{}.epub", temp_stamp()));
-        let outcome = epub_formats::repack(&dir, &output)
-            .map_err(|err| format!("Could not repack EPUB: {err}"))
-            .and_then(|count| {
-                self.library
-                    .as_mut()
-                    .ok_or_else(|| "Open a library first.".to_string())?
-                    .replace_format(id, "EPUB", &output)
-                    .map_err(|err| format!("Could not replace the library EPUB: {err}"))?;
-                Ok(count)
-            });
-        let _ = std::fs::remove_file(&output);
+        // Checked first, written atomically, and the first save keeps the
+        // old file as ORIGINAL_EPUB.
+        let outcome = match self.library.as_mut() {
+            Some(library) => library
+                .save_edited_book(id, &dir, false)
+                .map_err(|err| format!("Could not save the EPUB: {err}")),
+            None => Err("Open a library first.".to_string()),
+        };
         let ok = match outcome {
-            Ok(count) => {
+            Ok(SaveOutcome::Invalid { errors }) => {
+                let first = errors
+                    .first()
+                    .map(|issue| format!("{}: {}", issue.file, issue.message))
+                    .unwrap_or_default();
+                self.announce(
+                    format!("Not saved: {} error(s). {first}", errors.len()),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
+                false
+            }
+            Ok(saved) => {
                 self.discard_epub_editor();
                 self.load_book(id, window, cx);
                 self.refresh_all();
                 window.focus(&self.list_focus, cx);
-                self.announce(
-                    format!("Repacked {count} files into the library EPUB."),
-                    Tone::Success,
-                    window,
-                    cx,
-                );
+                let message = match saved {
+                    SaveOutcome::Saved { changes } => format!(
+                        "Saved {} changed file(s); the original is kept as ORIGINAL_EPUB.",
+                        changes.len()
+                    ),
+                    _ => "Nothing changed; the library EPUB was left as it is.".to_string(),
+                };
+                self.announce(message, Tone::Success, window, cx);
                 true
             }
             Err(err) => {
@@ -2853,6 +2863,48 @@ impl CalibreApp {
         window.set_window_edited(self.has_unsaved_changes());
         cx.notify();
         ok
+    }
+
+    /// Check the book being edited and report what is wrong with it.
+    pub fn check_epub(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dir) = self.epub_dir.clone() else {
+            return;
+        };
+        if let Err(err) = self.save_current_epub_file(cx) {
+            self.announce(err, Tone::Error, window, cx);
+            return;
+        }
+        match EpubDir::open(&dir) {
+            Ok(book) => {
+                let issues = book.check();
+                let errors = issues
+                    .iter()
+                    .filter(|issue| issue.severity == Severity::Error)
+                    .count();
+                match issues.first() {
+                    None => self.announce("No problems found.", Tone::Success, window, cx),
+                    Some(first) => {
+                        let line = first
+                            .line
+                            .map(|line| format!(":{line}"))
+                            .unwrap_or_default();
+                        self.announce(
+                            format!(
+                                "{errors} error(s), {} warning(s). First: {}{line}: {}",
+                                issues.len() - errors,
+                                first.file,
+                                first.message
+                            ),
+                            if errors > 0 { Tone::Error } else { Tone::Info },
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
+            Err(err) => self.announce(format!("Cannot check: {err}"), Tone::Error, window, cx),
+        }
+        cx.notify();
     }
 
     pub fn close_epub_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3157,6 +3209,7 @@ impl CalibreApp {
             .on_action(
                 cx.listener(|this, _: &EditEpub, window, cx| this.begin_epub_edit(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &CheckEpub, window, cx| this.check_epub(window, cx)))
             .on_action(cx.listener(|this, _: &RepackEpub, window, cx| {
                 this.repack_epub(window, cx);
             }))

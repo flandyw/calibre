@@ -132,6 +132,32 @@ and highlights. Publisher CSS, embedded fonts and paged mode are not applied.
   `cr annotations import-calibre --book ID` copies its highlights in.
   Nothing is written back to calibre.
 
+### Editing EPUBs
+
+`cr epub ACTION TARGET` works on a library book ID, an `.epub` file or an
+unpacked directory (`cr edit ID --extract DIR`):
+
+- `check` reports missing or unlisted files, bad media types, markup that is
+  not well-formed (with the line), broken links, images and anchors, spine
+  and cover problems and a missing table of contents. `fix` repairs the ones
+  that need no judgement. `check` exits non-zero when there are errors.
+- `search PATTERN` and `replace PATTERN REPLACEMENT` across markup, styles
+  and the package document, with `--regex`, `--case` and `--file`.
+- `toc` shows the table of contents; `toc --generate --depth N` rebuilds the
+  navigation document and/or NCX from the headings.
+- `files`, `add SOURCE PATH`, `rm PATH`, `mv FROM TO` (every reference to the
+  file is updated) and `spine PATH POSITION` manage files and reading order.
+- `compress` re-encodes and scales down JPEG and PNG images.
+- `diff` lists what changed (two EPUB files, or a library book against its
+  kept original); `restore ID` puts the original back.
+
+Saving to a library book checks it first and refuses a book with errors
+(`--force` overrides), writes the file atomically, does nothing when the
+content is unchanged, and keeps the first replaced file as `ORIGINAL_EPUB`.
+The GUI editor's Check Book and Check & Save to Library buttons use the same
+checks and save path. Not included: live preview, spell check, HTML tidy,
+font subsetting, EPUBCheck, and editing AZW3 or KEPUB directly.
+
 ### Conversion
 
 `cr convert INPUT OUTPUT` selects the target by the output extension.
@@ -309,6 +335,13 @@ cr read 12 --toc
 cr read 12 --search "white whale"
 cr annotations add --book 12 --find "Call me Ishmael" --note "opening"
 cr annotations export --book 12 --format markdown
+
+# Check and edit an EPUB in the library
+cr epub check 12
+cr epub replace 12 "colour" "color"
+cr epub toc 12 --generate --depth 2
+cr epub diff 12
+cr epub restore 12
 
 # Convert and optionally store the result on an existing library book
 cr convert book.epub book.azw3
