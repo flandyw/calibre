@@ -3,6 +3,7 @@
 mod conversion;
 pub mod document;
 mod documents;
+pub mod editing;
 pub mod epub;
 pub mod fb2;
 pub mod html;
