@@ -10,25 +10,113 @@ use percent_encoding::percent_decode_str;
 use regex::Regex;
 use tempfile::NamedTempFile;
 
-use super::{detect_format, epub, extract_text, mobi};
+use super::document;
+use super::{detect_format, epub, mobi};
 use crate::error::{Error, Result};
+use crate::metadata::Metadata;
 use crate::text::format_from_path;
 
-/// Convert an EPUB to AZW3 or MOBI, or a Kindle book to EPUB or TXT.
-///
-/// The output extension selects the target format. An existing file is
-/// preserved, and failed conversions leave no output file behind.
+/// Formats a conversion can start from, best source first.
+pub const INPUT_FORMATS: [&str; 11] = [
+    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "DOCX", "HTML", "RTF", "TXT",
+];
+/// Formats a conversion can produce.
+pub const OUTPUT_FORMATS: [&str; 5] = ["EPUB", "AZW3", "MOBI", "HTMLZ", "TXT"];
+
+/// The screen a conversion targets; larger images are scaled down to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Profile {
+    /// Keep images as they are.
+    #[default]
+    Generic,
+    Kindle,
+    Kobo,
+    Tablet,
+}
+
+impl Profile {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "generic" | "default" => Some(Self::Generic),
+            "kindle" => Some(Self::Kindle),
+            "kobo" => Some(Self::Kobo),
+            "tablet" => Some(Self::Tablet),
+            _ => None,
+        }
+    }
+
+    /// Screen width and height in pixels.
+    pub fn screen(self) -> Option<(u32, u32)> {
+        match self {
+            Self::Generic => None,
+            Self::Kindle => Some((1072, 1448)),
+            Self::Kobo => Some((1264, 1680)),
+            Self::Tablet => Some((1600, 2560)),
+        }
+    }
+}
+
+/// Settings for one conversion.
+#[derive(Debug, Clone)]
+pub struct ConvertOptions {
+    /// Metadata to put in the output instead of what the source file holds.
+    pub metadata: Option<Metadata>,
+    /// Cover to put in the output instead of the one in the source file.
+    pub cover: Option<Vec<u8>>,
+    /// Start a new section at chapter headings (`h1`/`h2`, `Heading 1`,
+    /// "Chapter ..." lines in plain text).
+    pub split_chapters: bool,
+    pub profile: Profile,
+}
+
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            metadata: None,
+            cover: None,
+            split_chapters: true,
+            profile: Profile::Generic,
+        }
+    }
+}
+
+impl ConvertOptions {
+    /// Whether the source's own content can be used as it is.
+    fn keeps_source(&self) -> bool {
+        self.metadata.is_none() && self.cover.is_none() && self.profile == Profile::Generic
+    }
+}
+
+fn is_kindle(format: &str) -> bool {
+    matches!(format, "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC")
+}
+
+/// Convert a book with the default settings. See [`convert_with`].
 pub fn convert(input: &Path, output: &Path) -> Result<()> {
+    convert_with(input, output, &ConvertOptions::default())
+}
+
+/// Convert a book; the output extension selects the target format.
+///
+/// EPUB to Kindle and Kindle to EPUB keep the book's own files (styles and
+/// fonts included). Everything else is read into a [`document::Document`] and written
+/// from it. An existing output file is preserved, and a failed conversion
+/// leaves no output file behind.
+pub fn convert_with(input: &Path, output: &Path, options: &ConvertOptions) -> Result<()> {
     if !input.is_file() {
         return Err(Error::Other(format!("not a file: {}", input.display())));
     }
     let source = detect_format(input);
     let target = format_from_path(output).unwrap_or_default();
-    let kindle_input = matches!(source.as_str(), "AZW3" | "AZW" | "MOBI" | "PRC");
-    let kindle_output = source == "EPUB" && matches!(target.as_str(), "AZW3" | "MOBI");
-    if !kindle_output && !(kindle_input && matches!(target.as_str(), "EPUB" | "TXT")) {
+    let same = source == target || (is_kindle(&source) && is_kindle(&target));
+    if same
+        || !INPUT_FORMATS.contains(&source.as_str())
+        || !OUTPUT_FORMATS.contains(&target.as_str())
+    {
         return Err(Error::UnsupportedFormat(format!(
-            "cannot convert {source} to {target}; use EPUB to AZW3/MOBI or Kindle to EPUB/TXT"
+            "cannot convert {source} to {target}; inputs are {}, outputs are {}",
+            INPUT_FORMATS.join(", "),
+            OUTPUT_FORMATS.join(", ")
         )));
     }
     if output.symlink_metadata().is_ok() {
@@ -42,14 +130,57 @@ pub fn convert(input: &Path, output: &Path) -> Result<()> {
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let mut temporary = NamedTempFile::new_in(parent)?;
-    if kindle_output {
-        write_kindle(input, temporary.path(), target == "AZW3")?;
-    } else if target == "EPUB" {
-        mobi::write_epub(input, temporary.as_file_mut())?;
+
+    // A Kindle book is read through its EPUB form.
+    let mut unpacked = None;
+    let (input, source) = if is_kindle(&source) {
+        if target == "EPUB" && options.keeps_source() {
+            mobi::write_epub(input, temporary.as_file_mut())?;
+            temporary
+                .persist_noclobber(output)
+                .map_err(|err| err.error)?;
+            return Ok(());
+        }
+        let mut epub = tempfile::Builder::new().suffix(".epub").tempfile()?;
+        mobi::write_epub(input, epub.as_file_mut())?;
+        epub.as_file_mut().flush()?;
+        (unpacked.insert(epub).path(), "EPUB")
     } else {
-        let text = extract_text(input, Some(&source))?;
-        for chapter in text.chapters {
-            writeln!(temporary, "{}\n\n{}\n", chapter.title, chapter.text)?;
+        (input, source.as_str())
+    };
+
+    if source == "EPUB" && is_kindle(&target) && options.keeps_source() {
+        write_kindle(input, temporary.path(), target == "AZW3")?;
+    } else {
+        let mut document = document::read(
+            input,
+            source,
+            document::ReadOptions {
+                split_chapters: options.split_chapters,
+            },
+        )?;
+        if let Some(metadata) = &options.metadata {
+            document.metadata = metadata.clone();
+            if let Some(cover) = document.metadata.cover.take() {
+                document.cover = Some(cover);
+            }
+        }
+        if let Some(cover) = &options.cover {
+            document.cover = Some(cover.clone());
+        }
+        if let Some((width, height)) = options.profile.screen() {
+            document.fit_images(width, height);
+        }
+        match target.as_str() {
+            "EPUB" => document::write_epub(&document, temporary.as_file_mut())?,
+            "HTMLZ" => document::write_htmlz(&document, temporary.as_file_mut())?,
+            "TXT" => document::write_txt(&document, temporary.as_file_mut())?,
+            _ => {
+                let mut epub = tempfile::Builder::new().suffix(".epub").tempfile()?;
+                document::write_epub(&document, epub.as_file_mut())?;
+                epub.as_file_mut().flush()?;
+                write_kindle(epub.path(), temporary.path(), target == "AZW3")?;
+            }
         }
     }
     temporary

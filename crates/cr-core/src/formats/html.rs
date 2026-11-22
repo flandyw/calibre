@@ -242,7 +242,7 @@ fn normalize_text(raw: &str) -> String {
     lines.join("\n")
 }
 
-fn tag_name(tag: &str) -> String {
+pub(super) fn tag_name(tag: &str) -> String {
     let tag = tag.trim_start_matches('/').trim_start();
     tag.split(|c: char| c.is_ascii_whitespace() || c == '/' || c == '>')
         .next()
@@ -250,7 +250,7 @@ fn tag_name(tag: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn attr_value(tag: &str, name: &str) -> Option<String> {
+pub(super) fn attr_value(tag: &str, name: &str) -> Option<String> {
     let bytes = tag.as_bytes();
     let mut i = 0usize;
     // Skip the tag name.
@@ -310,7 +310,7 @@ fn attr_value(tag: &str, name: &str) -> Option<String> {
     None
 }
 
-fn find_tag_end(input: &str) -> Option<usize> {
+pub(super) fn find_tag_end(input: &str) -> Option<usize> {
     let bytes = input.as_bytes();
     let mut quote: Option<u8> = None;
     for (i, &b) in bytes.iter().enumerate() {

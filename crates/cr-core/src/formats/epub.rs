@@ -16,18 +16,18 @@ use crate::opf;
 use crate::xml;
 
 #[derive(Debug, Clone)]
-struct ManifestItem {
-    href: String,
-    media_type: String,
+pub(super) struct ManifestItem {
+    pub(super) href: String,
+    pub(super) media_type: String,
     properties: String,
 }
 
 #[derive(Debug)]
-struct Package {
-    metadata: Metadata,
-    cover: Option<Vec<u8>>,
-    manifest: HashMap<String, ManifestItem>,
-    spine: Vec<String>,
+pub(super) struct Package {
+    pub(super) metadata: Metadata,
+    pub(super) cover: Option<Vec<u8>>,
+    pub(super) manifest: HashMap<String, ManifestItem>,
+    pub(super) spine: Vec<String>,
 }
 
 /// Read metadata and the cover image from an EPUB.
@@ -146,7 +146,7 @@ pub fn repack(directory: &Path, output: &Path) -> Result<usize> {
     Ok(count)
 }
 
-fn read_package(path: &Path) -> Result<Package> {
+pub(super) fn read_package(path: &Path) -> Result<Package> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
@@ -253,7 +253,7 @@ pub(super) fn package_path(container: &[u8]) -> Result<String> {
         .ok_or_else(|| Error::InvalidEpub("rootfile has no full-path".into()))
 }
 
-fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
+pub(super) fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     let mut entry = archive
         .by_name(name)
         .map_err(|_| Error::InvalidEpub(format!("missing entry: {name}")))?;
@@ -262,7 +262,7 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn is_html_media_type(media_type: &str) -> bool {
+pub(super) fn is_html_media_type(media_type: &str) -> bool {
     matches!(
         media_type,
         "application/xhtml+xml" | "text/html" | "application/xml" | "text/xml" | ""
