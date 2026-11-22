@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/cr-core", "crates/cr-cli"]
+# The GPUI desktop app has heavy native dependencies, so it builds on its own:
+#   cd crates/cr-gui && cargo run
+exclude = ["crates/cr-gui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/calibre-rust/calibre-rust"
+description = "A small, fast, Rust reimplementation of calibre's core ebook management"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive", "env"] }
+encoding_rs = "0.8"
+html-escape = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+percent-encoding = "2"
+quick-xml = "0.37"
+rusqlite = { version = "0.43", features = ["bundled", "functions", "backup"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

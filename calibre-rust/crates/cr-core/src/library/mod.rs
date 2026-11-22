@@ -1,0 +1,1456 @@
+//! The library engine: a calibre-compatible `metadata.db` plus the on-disk
+//! book directory layout (`Author Sort/Title (id)/...`).
+//!
+//! The schema is calibre's own (version 28), including its triggers. Custom
+//! SQLite functions (`title_sort`, `uuid4`, ...) are registered on every
+//! connection so calibre's triggers work unmodified, and so a library created
+//! here can be opened by calibre itself.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use rusqlite::functions::FunctionFlags;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+
+use crate::error::{Error, Result};
+use crate::formats::{self, BookText};
+use crate::metadata::{format_datetime, now, parse_datetime, BookSummary, Metadata};
+use crate::opf;
+use crate::text;
+
+pub const DB_FILE: &str = "metadata.db";
+pub const METADATA_FILE: &str = "metadata.opf";
+pub const COVER_FILE: &str = "cover.jpg";
+const SCHEMA: &str = include_str!("schema.sql");
+
+/// Result of adding a book.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddResult {
+    pub id: i64,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub formats: Vec<String>,
+    pub path: String,
+}
+
+/// Library-wide counts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LibraryStats {
+    pub books: usize,
+    pub authors: usize,
+    pub series: usize,
+    pub tags: usize,
+    pub publishers: usize,
+    pub total_bytes: u64,
+    pub formats: BTreeMap<String, usize>,
+}
+
+/// Fields to change in one metadata edit. `None` means "keep"; for optional
+/// fields `Some(None)` clears the value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BookUpdate {
+    pub title: Option<String>,
+    pub authors: Option<Vec<String>>,
+    pub publisher: Option<Option<String>>,
+    pub series: Option<Option<String>>,
+    pub series_index: Option<f64>,
+    pub tags: Option<Vec<String>>,
+    pub rating: Option<Option<u8>>,
+    pub comments: Option<Option<String>>,
+    pub identifiers: Option<BTreeMap<String, String>>,
+    pub languages: Option<Vec<String>>,
+    pub pubdate: Option<Option<DateTime<Utc>>>,
+    pub cover: Option<Option<Vec<u8>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookSort {
+    Title,
+    Author,
+    Date,
+    Pubdate,
+    Series,
+    Rating,
+}
+
+impl BookSort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "title" => Some(Self::Title),
+            "author" | "authors" => Some(Self::Author),
+            "date" | "timestamp" | "added" => Some(Self::Date),
+            "pubdate" | "published" => Some(Self::Pubdate),
+            "series" => Some(Self::Series),
+            "rating" => Some(Self::Rating),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Author => "author",
+            Self::Date => "date",
+            Self::Pubdate => "pubdate",
+            Self::Series => "series",
+            Self::Rating => "rating",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ListOptions {
+    pub query: Option<String>,
+    pub sort: Option<BookSort>,
+    pub descending: bool,
+    pub limit: Option<usize>,
+}
+
+/// A calibre library rooted at a directory containing `metadata.db`.
+pub struct Library {
+    root: PathBuf,
+    conn: Connection,
+}
+
+impl Library {
+    /// Create a new, empty library.
+    pub fn create(root: &Path) -> Result<Self> {
+        fs::create_dir_all(root)?;
+        let db_path = root.join(DB_FILE);
+        if db_path.exists() {
+            return Err(Error::InvalidLibrary(format!(
+                "{} already contains metadata.db",
+                root.display()
+            )));
+        }
+        let conn = Connection::open(&db_path)?;
+        configure_connection(&conn)?;
+        conn.execute_batch(SCHEMA)?;
+        conn.execute(
+            "INSERT INTO library_id (uuid) VALUES (?1)",
+            [uuid::Uuid::new_v4().to_string()],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO preferences (key, val) VALUES ('calibre_rust_version', ?1)",
+            [env!("CARGO_PKG_VERSION")],
+        )?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            conn,
+        })
+    }
+
+    /// Open an existing library.
+    pub fn open(root: &Path) -> Result<Self> {
+        let db_path = root.join(DB_FILE);
+        if !db_path.is_file() {
+            return Err(Error::InvalidLibrary(root.display().to_string()));
+        }
+        let conn = Connection::open(&db_path)?;
+        configure_connection(&conn)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version == 0 {
+            return Err(Error::InvalidLibrary(format!(
+                "{} is not a calibre database",
+                db_path.display()
+            )));
+        }
+        Ok(Self {
+            root: root.to_path_buf(),
+            conn,
+        })
+    }
+
+    pub fn open_or_create(root: &Path) -> Result<Self> {
+        if root.join(DB_FILE).is_file() {
+            Self::open(root)
+        } else {
+            Self::create(root)
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    pub fn library_id(&self) -> Result<String> {
+        Ok(self.conn.query_row(
+            "SELECT uuid FROM library_id ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Add a file to the library, copying it into a calibre book directory and
+    /// writing `metadata.opf` / `cover.jpg`.
+    pub fn add_book(&mut self, source: &Path) -> Result<AddResult> {
+        let imported = formats::import(source)?;
+        let format = imported.format.clone();
+        let mut meta = imported.metadata;
+        meta.normalize();
+        let timestamp = now();
+        meta.timestamp.get_or_insert(timestamp);
+        let pubdate = meta.pubdate.unwrap_or(timestamp);
+        let author_sort = meta.computed_author_sort();
+        meta.author_sort = Some(author_sort.clone());
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO books (title, timestamp, pubdate, series_index, author_sort, path, has_cover, last_modified)
+             VALUES (?1, ?2, ?3, ?4, ?5, '', 0, ?6)",
+            params![
+                meta.title,
+                format_datetime(&timestamp),
+                format_datetime(&pubdate),
+                meta.series_index,
+                author_sort,
+                format_datetime(&timestamp),
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        let relative = text::book_dir_name(id, &meta.title, &author_sort);
+        let directory = safe_join(&self.root, &relative)?;
+        let _cleanup = DirGuard::new(directory.clone());
+        fs::create_dir_all(&directory)?;
+
+        let stem = text::format_file_stem(&meta.title, meta.first_author());
+        let extension = format.to_ascii_lowercase();
+        let destination = directory.join(format!("{stem}.{extension}"));
+        if source != destination {
+            fs::copy(source, &destination)?;
+        }
+        let size = fs::metadata(&destination).map(|m| m.len()).unwrap_or(0);
+        tx.execute(
+            "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+            params![id, format, size as i64, stem],
+        )?;
+
+        let uuid: Option<String> =
+            tx.query_row("SELECT uuid FROM books WHERE id=?1", [id], |row| row.get(0))?;
+        meta.uuid = uuid;
+
+        let has_cover = if let Some(cover) = &meta.cover {
+            fs::write(directory.join(COVER_FILE), cover)?;
+            true
+        } else {
+            false
+        };
+
+        replace_links(&tx, id, &meta)?;
+        fs::write(directory.join(METADATA_FILE), opf::metadata_to_opf(&meta))?;
+        tx.execute(
+            "UPDATE books SET path=?1, has_cover=?2 WHERE id=?3",
+            params![relative, has_cover as i64, id],
+        )?;
+        tx.commit()?;
+        // The book is committed; keep the directory.
+        _cleanup.disarm();
+
+        Ok(AddResult {
+            id,
+            title: meta.title,
+            authors: meta.authors,
+            formats: vec![format],
+            path: relative,
+        })
+    }
+
+    /// Full metadata for one book.
+    pub fn get_metadata(&self, id: i64) -> Result<Metadata> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT title, sort, author_sort, series_index, timestamp, pubdate, path, uuid,
+                        has_cover, last_modified
+                 FROM books WHERE id=?1",
+                [id],
+                |row| {
+                    Ok(BookRow {
+                        title: row.get(0)?,
+                        title_sort: row.get(1)?,
+                        author_sort: row.get(2)?,
+                        series_index: row.get(3)?,
+                        timestamp: row.get(4)?,
+                        pubdate: row.get(5)?,
+                        path: row.get(6)?,
+                        uuid: row.get(7)?,
+                        has_cover: row.get::<_, i64>(8)? != 0,
+                        last_modified: row.get(9)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Err(Error::BookNotFound(id));
+        };
+
+        let mut meta = Metadata::default();
+        meta.title = row.title;
+        meta.title_sort = row.title_sort;
+        meta.author_sort = row.author_sort;
+        meta.series_index = row.series_index;
+        meta.timestamp = row.timestamp.as_deref().and_then(parse_datetime);
+        meta.pubdate = row.pubdate.as_deref().and_then(parse_datetime);
+        meta.last_modified = row.last_modified.as_deref().and_then(parse_datetime);
+        meta.uuid = row.uuid;
+        meta.authors = self.names_for(id, "authors", "author", "books_authors_link")?;
+        meta.tags = self.names_for(id, "tags", "tag", "books_tags_link")?;
+        meta.publisher = self
+            .conn
+            .query_row(
+                "SELECT p.name FROM publishers p
+                 JOIN books_publishers_link l ON l.publisher=p.id WHERE l.book=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        meta.series = self
+            .conn
+            .query_row(
+                "SELECT s.name FROM series s
+                 JOIN books_series_link l ON l.series=s.id WHERE l.book=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        meta.rating = self
+            .conn
+            .query_row(
+                "SELECT r.rating FROM ratings r
+                 JOIN books_ratings_link l ON l.rating=r.id WHERE l.book=?1",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .and_then(|r| u8::try_from(r).ok());
+        meta.comments = self
+            .conn
+            .query_row("SELECT text FROM comments WHERE book=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        meta.languages = self.languages_for(id)?;
+        meta.identifiers = self.identifiers_for(id)?;
+        let formats = self.formats(id)?;
+        meta.format = formats.first().cloned();
+        if row.has_cover {
+            if let Ok(directory) = safe_join(&self.root, &row.path) {
+                meta.cover = fs::read(directory.join(COVER_FILE)).ok();
+            }
+        }
+        meta.normalize();
+        Ok(meta)
+    }
+
+    /// A lightweight summary for lists and JSON output.
+    pub fn get_summary(&self, id: i64) -> Result<BookSummary> {
+        let mut books = self.query_summaries(
+            "b.id = ?",
+            &[id.to_string()],
+            BookSort::Title,
+            false,
+            Some(1),
+        )?;
+        books.pop().ok_or(Error::BookNotFound(id))
+    }
+
+    /// Search/list books. See `ListOptions` and the `query` mini-language:
+    /// `title:`, `author:`, `tag:`, `series:`, `publisher:`, `format:`,
+    /// `language:`, `identifier:`, `rating:`, `id:` and `sort:`.
+    pub fn list_books(&self, options: &ListOptions) -> Result<Vec<BookSummary>> {
+        let parsed = parse_query(options.query.as_deref().unwrap_or_default());
+        let sort = options.sort.or(parsed.sort).unwrap_or(BookSort::Title);
+        let descending = options.descending || parsed.descending;
+        self.query_summaries(
+            &parsed.where_sql,
+            &parsed.params,
+            sort,
+            descending,
+            options.limit,
+        )
+    }
+
+    pub fn all_book_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM books ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
+    /// Update metadata, renaming the book directory and format files if the
+    /// author/title changed, then rewriting `metadata.opf`.
+    pub fn update_book(&mut self, id: i64, patch: &BookUpdate) -> Result<()> {
+        let mut meta = self.get_metadata(id)?;
+        let old_relative = self.book_path(id)?;
+        let authors_changed = patch.authors.is_some();
+
+        if let Some(title) = &patch.title {
+            let title = title.trim();
+            if title.is_empty() {
+                return Err(Error::InvalidMetadata("title cannot be empty".into()));
+            }
+            meta.title = title.to_string();
+        }
+        if let Some(authors) = &patch.authors {
+            meta.authors = authors.clone();
+        }
+        if let Some(publisher) = &patch.publisher {
+            meta.publisher = publisher.clone();
+        }
+        if let Some(series) = &patch.series {
+            meta.series = series.clone();
+        }
+        if let Some(index) = patch.series_index {
+            meta.series_index = index;
+        }
+        if let Some(tags) = &patch.tags {
+            meta.tags = tags.clone();
+        }
+        if let Some(rating) = &patch.rating {
+            meta.rating = *rating;
+        }
+        if let Some(comments) = &patch.comments {
+            meta.comments = comments.clone();
+        }
+        if let Some(identifiers) = &patch.identifiers {
+            meta.identifiers = identifiers.clone();
+        }
+        if let Some(languages) = &patch.languages {
+            meta.languages = languages.clone();
+        }
+        if let Some(pubdate) = &patch.pubdate {
+            meta.pubdate = *pubdate;
+        }
+        if authors_changed {
+            meta.author_sort = None;
+        }
+        meta.normalize();
+        let author_sort = meta.computed_author_sort();
+        meta.author_sort = Some(author_sort.clone());
+
+        let new_relative = text::book_dir_name(id, &meta.title, &author_sort);
+        let old_directory = safe_join(&self.root, &old_relative)?;
+        let new_directory = safe_join(&self.root, &new_relative)?;
+        if old_relative != new_relative {
+            if let Some(parent) = new_directory.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if old_directory.is_dir() {
+                if new_directory.exists() {
+                    return Err(Error::Other(format!(
+                        "cannot rename book directory: {} already exists",
+                        new_directory.display()
+                    )));
+                }
+                fs::rename(&old_directory, &new_directory)?;
+            } else {
+                fs::create_dir_all(&new_directory)?;
+            }
+        } else {
+            fs::create_dir_all(&new_directory)?;
+        }
+
+        let new_stem = text::format_file_stem(&meta.title, meta.first_author());
+        let entries = self.format_entries(id)?;
+        for (format, old_name) in &entries {
+            let extension = format.to_ascii_lowercase();
+            let old_file =
+                find_file_ignore_case(&new_directory, &format!("{old_name}.{extension}"))
+                    .unwrap_or_else(|| new_directory.join(format!("{old_name}.{extension}")));
+            let new_file = new_directory.join(format!("{new_stem}.{extension}"));
+            if old_file != new_file && old_file.is_file() {
+                fs::rename(&old_file, &new_file)?;
+            }
+        }
+
+        match &patch.cover {
+            None => {}
+            Some(None) => {
+                let cover_path = new_directory.join(COVER_FILE);
+                if cover_path.exists() {
+                    fs::remove_file(cover_path)?;
+                }
+                meta.cover = None;
+            }
+            Some(Some(bytes)) => {
+                let normalized = formats::normalize_cover(bytes).ok_or_else(|| {
+                    Error::InvalidMetadata("unsupported cover image format".into())
+                })?;
+                fs::write(new_directory.join(COVER_FILE), &normalized)?;
+                meta.cover = Some(normalized);
+            }
+        }
+        let has_cover = new_directory.join(COVER_FILE).is_file();
+        fs::write(
+            new_directory.join(METADATA_FILE),
+            opf::metadata_to_opf(&meta),
+        )?;
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE books SET title=?1, author_sort=?2, series_index=?3, pubdate=?4,
+                              path=?5, has_cover=?6, last_modified=?7
+             WHERE id=?8",
+            params![
+                meta.title,
+                author_sort,
+                meta.series_index,
+                meta.pubdate.as_ref().map(format_datetime),
+                new_relative,
+                has_cover as i64,
+                format_datetime(&now()),
+                id,
+            ],
+        )?;
+        replace_links(&tx, id, &meta)?;
+        for (format, _) in &entries {
+            tx.execute(
+                "UPDATE data SET name=?1 WHERE book=?2 AND format=?3 COLLATE NOCASE",
+                params![new_stem, id, format],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_cover(&mut self, id: i64, cover: Option<&[u8]>) -> Result<()> {
+        let mut patch = BookUpdate::default();
+        patch.cover = Some(cover.map(|c| c.to_vec()));
+        self.update_book(id, &patch)
+    }
+
+    pub fn remove_book(&mut self, id: i64, delete_files: bool) -> Result<()> {
+        let relative = self.book_path(id)?;
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM books_pages_link WHERE book=?1", [id])?;
+        tx.execute("DELETE FROM book_storage WHERE book=?1", [id])?;
+        let changed = tx.execute("DELETE FROM books WHERE id=?1", [id])?;
+        if changed == 0 {
+            return Err(Error::BookNotFound(id));
+        }
+        tx.commit()?;
+        if delete_files && !relative.is_empty() {
+            let directory = safe_join(&self.root, &relative)?;
+            if directory.is_dir() {
+                fs::remove_dir_all(directory)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn formats(&self, id: i64) -> Result<Vec<String>> {
+        self.ensure_exists(id)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT format FROM data WHERE book=?1 ORDER BY format")?;
+        let formats = stmt
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(formats)
+    }
+
+    /// Absolute path to a format file, with a case-insensitive fallback.
+    pub fn format_path(&self, id: i64, format: &str) -> Result<Option<PathBuf>> {
+        let relative = self.book_path(id)?;
+        let directory = safe_join(&self.root, &relative)?;
+        let found: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT name, format FROM data WHERE book=?1 AND format=?2 COLLATE NOCASE",
+                params![id, format],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((name, stored_format)) = found else {
+            return Ok(None);
+        };
+        let extension = stored_format.to_ascii_lowercase();
+        let canonical = directory.join(format!("{name}.{extension}"));
+        if canonical.is_file() {
+            return Ok(Some(canonical));
+        }
+        Ok(find_file_ignore_case(
+            &directory,
+            &format!("{name}.{extension}"),
+        ))
+    }
+
+    pub fn book_path(&self, id: i64) -> Result<String> {
+        let path: Option<String> = self
+            .conn
+            .query_row("SELECT path FROM books WHERE id=?1", [id], |row| row.get(0))
+            .optional()?;
+        path.ok_or(Error::BookNotFound(id))
+    }
+
+    pub fn read_book(&self, id: i64, format: Option<&str>) -> Result<BookText> {
+        let format = match format {
+            Some(format) => format.to_ascii_uppercase(),
+            None => self
+                .formats(id)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::Other(format!("book {id} has no formats")))?,
+        };
+        let path = self
+            .format_path(id, &format)?
+            .ok_or_else(|| Error::Other(format!("book {id} has no {format} file")))?;
+        formats::extract_text(&path, Some(&format))
+    }
+
+    pub fn cover(&self, id: i64) -> Result<Option<Vec<u8>>> {
+        let relative = self.book_path(id)?;
+        let directory = safe_join(&self.root, &relative)?;
+        Ok(fs::read(directory.join(COVER_FILE)).ok())
+    }
+
+    /// Extract an EPUB into a directory for editing.
+    pub fn unpack_book(&self, id: i64, format: &str, destination: &Path) -> Result<usize> {
+        let format = format.to_ascii_uppercase();
+        if format != "EPUB" {
+            return Err(Error::UnsupportedFormat(format!(
+                "editing {format} files is not implemented; only EPUB"
+            )));
+        }
+        let path = self
+            .format_path(id, &format)?
+            .ok_or_else(|| Error::Other(format!("book {id} has no {format} file")))?;
+        formats::epub::unpack(&path, destination)
+    }
+
+    /// Replace (or add) a format file from an edited copy.
+    pub fn replace_format(&mut self, id: i64, format: &str, source: &Path) -> Result<()> {
+        let format = format.to_ascii_uppercase();
+        let relative = self.book_path(id)?;
+        let directory = safe_join(&self.root, &relative)?;
+        let meta = self.get_metadata(id)?;
+        let existing = self.format_path(id, &format)?;
+        let stem = existing
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| text::format_file_stem(&meta.title, meta.first_author()));
+        let extension = format.to_ascii_lowercase();
+        let destination = directory.join(format!("{stem}.{extension}"));
+        if source != destination {
+            fs::copy(source, &destination)?;
+        }
+        let size = fs::metadata(&destination).map(|m| m.len()).unwrap_or(0) as i64;
+        self.conn.execute(
+            "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(book, format) DO UPDATE SET uncompressed_size=excluded.uncompressed_size,
+                                                     name=excluded.name",
+            params![id, format, size, stem],
+        )?;
+        self.sync_book(id)?;
+        Ok(())
+    }
+
+    /// Copy books out of the library using a template. Placeholders:
+    /// `{author}`, `{authors}`, `{author_sort}`, `{title}`, `{series}`,
+    /// `{series_index}`, `{id}`.
+    pub fn export_books(
+        &self,
+        ids: &[i64],
+        destination: &Path,
+        template: &str,
+        format: Option<&str>,
+    ) -> Result<Vec<PathBuf>> {
+        let mut written = Vec::new();
+        for &id in ids {
+            let meta = self.get_metadata(id)?;
+            for current in self.formats(id)? {
+                if let Some(wanted) = format {
+                    if !wanted.eq_ignore_ascii_case(&current) {
+                        continue;
+                    }
+                }
+                let Some(source) = self.format_path(id, &current)? else {
+                    continue;
+                };
+                let rendered = render_template(template, &meta, id);
+                let mut target = destination.to_path_buf();
+                for component in rendered.split('/') {
+                    if component.is_empty() {
+                        continue;
+                    }
+                    target.push(text::sanitize_component(component));
+                }
+                let extension = current.to_ascii_lowercase();
+                let file_name = target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Unknown".to_string());
+                target.set_file_name(format!("{file_name}.{extension}"));
+                target = unique_path(target);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&source, &target)?;
+                written.push(target);
+            }
+        }
+        Ok(written)
+    }
+
+    /// Rewrite `metadata.opf` for one book.
+    pub fn sync_book(&mut self, id: i64) -> Result<()> {
+        let meta = self.get_metadata(id)?;
+        let relative = self.book_path(id)?;
+        let directory = safe_join(&self.root, &relative)?;
+        fs::create_dir_all(&directory)?;
+        fs::write(directory.join(METADATA_FILE), opf::metadata_to_opf(&meta))?;
+        Ok(())
+    }
+
+    /// Rewrite every book's `metadata.opf` (e.g. after copying a library).
+    pub fn sync_all(&mut self) -> Result<usize> {
+        let ids = self.all_book_ids()?;
+        for &id in &ids {
+            self.sync_book(id)?;
+        }
+        Ok(ids.len())
+    }
+
+    pub fn stats(&self) -> Result<LibraryStats> {
+        // Count entities actually linked to a book; editing metadata can
+        // leave orphaned rows in calibre's lookup tables.
+        let count_used = |link: &str, column: &str| -> Result<usize> {
+            let sql = format!("SELECT COUNT(DISTINCT {column}) FROM {link}");
+            Ok(self.conn.query_row(&sql, [], |row| row.get::<_, i64>(0))? as usize)
+        };
+        let mut formats = BTreeMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT format, COUNT(*) FROM data GROUP BY format ORDER BY format")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                formats.insert(row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize);
+            }
+        }
+        let total_bytes: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(uncompressed_size), 0) FROM data",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(LibraryStats {
+            books: self
+                .conn
+                .query_row("SELECT COUNT(*) FROM books", [], |row| row.get::<_, i64>(0))?
+                as usize,
+            authors: count_used("books_authors_link", "author")?,
+            series: count_used("books_series_link", "series")?,
+            tags: count_used("books_tags_link", "tag")?,
+            publishers: count_used("books_publishers_link", "publisher")?,
+            total_bytes: total_bytes.max(0) as u64,
+            formats,
+        })
+    }
+
+    fn ensure_exists(&self, id: i64) -> Result<()> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row("SELECT id FROM books WHERE id=?1", [id], |row| row.get(0))
+            .optional()?;
+        if exists.is_some() {
+            Ok(())
+        } else {
+            Err(Error::BookNotFound(id))
+        }
+    }
+
+    fn names_for(&self, id: i64, table: &str, column: &str, link: &str) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT t.name FROM {link} l JOIN {table} t ON t.id=l.{column}
+             WHERE l.book=?1 ORDER BY l.id"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let values = stmt
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(values)
+    }
+
+    fn languages_for(&self, id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lang.lang_code FROM books_languages_link l
+             JOIN languages lang ON lang.id=l.lang_code
+             WHERE l.book=?1 ORDER BY l.item_order, l.id",
+        )?;
+        let values = stmt
+            .query_map([id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(values)
+    }
+
+    fn identifiers_for(&self, id: i64) -> Result<BTreeMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT type, val FROM identifiers WHERE book=?1 ORDER BY type")?;
+        let mut map = BTreeMap::new();
+        let mut rows = stmt.query([id])?;
+        while let Some(row) = rows.next()? {
+            map.insert(row.get::<_, String>(0)?, row.get::<_, String>(1)?);
+        }
+        Ok(map)
+    }
+
+    fn format_entries(&self, id: i64) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT format, name FROM data WHERE book=?1 ORDER BY format")?;
+        let entries = stmt
+            .query_map([id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(entries)
+    }
+
+    fn query_summaries(
+        &self,
+        where_sql: &str,
+        params: &[String],
+        sort: BookSort,
+        descending: bool,
+        limit: Option<usize>,
+    ) -> Result<Vec<BookSummary>> {
+        let direction = if descending { "DESC" } else { "ASC" };
+        let order = match sort {
+            BookSort::Title => format!("b.sort COLLATE NOCASE {direction}"),
+            BookSort::Author => {
+                format!("b.author_sort COLLATE NOCASE {direction}, b.sort COLLATE NOCASE")
+            }
+            BookSort::Date => format!("b.timestamp {direction}"),
+            BookSort::Pubdate => format!("b.pubdate {direction}"),
+            BookSort::Series => {
+                format!("series COLLATE NOCASE {direction}, b.series_index {direction}")
+            }
+            BookSort::Rating => format!("rating {direction}"),
+        };
+        let mut sql = String::from(
+            "SELECT b.id, b.title, b.author_sort, b.series_index, b.timestamp, b.pubdate,
+                    b.path, b.has_cover,
+                    (SELECT s.name FROM series s JOIN books_series_link l ON l.series=s.id
+                     WHERE l.book=b.id LIMIT 1) AS series,
+                    (SELECT r.rating FROM ratings r JOIN books_ratings_link l ON l.rating=r.id
+                     WHERE l.book=b.id LIMIT 1) AS rating,
+                    (SELECT p.name FROM publishers p JOIN books_publishers_link l ON l.publisher=p.id
+                     WHERE l.book=b.id LIMIT 1) AS publisher
+             FROM books b",
+        );
+        if !where_sql.trim().is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(where_sql);
+        }
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&order);
+        sql.push_str(", b.id ASC");
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params_from_iter(params.iter()), |row| {
+                Ok(SummaryRow {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    author_sort: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    series_index: row.get(3)?,
+                    timestamp: row
+                        .get::<_, Option<String>>(4)?
+                        .as_deref()
+                        .and_then(parse_datetime),
+                    pubdate: row
+                        .get::<_, Option<String>>(5)?
+                        .as_deref()
+                        .and_then(parse_datetime),
+                    path: row.get(6)?,
+                    has_cover: row.get::<_, i64>(7)? != 0,
+                    series: row.get(8)?,
+                    rating: row
+                        .get::<_, Option<i64>>(9)?
+                        .and_then(|r| u8::try_from(r).ok()),
+                    publisher: row.get(10)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let authors = self.batch_strings(
+            &format!(
+                "SELECT l.book, a.name FROM books_authors_link l JOIN authors a ON a.id=l.author
+                 WHERE l.book IN ({placeholders}) ORDER BY l.id"
+            ),
+            &ids,
+        )?;
+        let tags = self.batch_strings(
+            &format!(
+                "SELECT l.book, t.name FROM books_tags_link l JOIN tags t ON t.id=l.tag
+                 WHERE l.book IN ({placeholders}) ORDER BY l.id"
+            ),
+            &ids,
+        )?;
+        let formats = self.batch_strings(
+            &format!(
+                "SELECT book, format FROM data WHERE book IN ({placeholders}) ORDER BY format"
+            ),
+            &ids,
+        )?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| BookSummary {
+                authors: authors.get(&row.id).cloned().unwrap_or_default(),
+                tags: tags.get(&row.id).cloned().unwrap_or_default(),
+                formats: formats.get(&row.id).cloned().unwrap_or_default(),
+                id: row.id,
+                title: row.title,
+                author_sort: row.author_sort,
+                publisher: row.publisher,
+                series: row.series,
+                series_index: row.series_index,
+                rating: row.rating,
+                has_cover: row.has_cover,
+                timestamp: row.timestamp,
+                pubdate: row.pubdate,
+                path: row.path,
+            })
+            .collect())
+    }
+
+    fn batch_strings(&self, sql: &str, ids: &[i64]) -> Result<HashMap<i64, Vec<String>>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut map: HashMap<i64, Vec<String>> = HashMap::new();
+        let mut rows = stmt.query(params_from_iter(ids.iter()))?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let value: String = row.get(1)?;
+            map.entry(id).or_default().push(value);
+        }
+        Ok(map)
+    }
+}
+
+#[derive(Debug)]
+struct BookRow {
+    title: String,
+    title_sort: Option<String>,
+    author_sort: Option<String>,
+    series_index: f64,
+    timestamp: Option<String>,
+    pubdate: Option<String>,
+    path: String,
+    uuid: Option<String>,
+    has_cover: bool,
+    last_modified: Option<String>,
+}
+
+#[derive(Debug)]
+struct SummaryRow {
+    id: i64,
+    title: String,
+    author_sort: String,
+    series_index: f64,
+    timestamp: Option<DateTime<Utc>>,
+    pubdate: Option<DateTime<Utc>>,
+    path: String,
+    has_cover: bool,
+    series: Option<String>,
+    rating: Option<u8>,
+    publisher: Option<String>,
+}
+
+fn configure_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_secs(10))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+
+    conn.create_scalar_function(
+        "title_sort",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let title: String = ctx.get(0)?;
+            Ok(text::title_sort(&title))
+        },
+    )?;
+    conn.create_scalar_function(
+        "author_to_author_sort",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let author: String = ctx.get(0)?;
+            Ok(text::author_sort(&author))
+        },
+    )?;
+    conn.create_scalar_function("uuid4", 0, FunctionFlags::SQLITE_UTF8, |_| {
+        Ok(uuid::Uuid::new_v4().to_string())
+    })?;
+    conn.create_scalar_function("books_list_filter", 1, FunctionFlags::SQLITE_UTF8, |_| {
+        Ok(1i64)
+    })?;
+    Ok(())
+}
+
+fn replace_links(conn: &Connection, id: i64, meta: &Metadata) -> Result<()> {
+    conn.execute("DELETE FROM books_authors_link WHERE book=?1", [id])?;
+    for author in &meta.authors {
+        let sort = text::author_sort(author);
+        conn.execute(
+            "INSERT OR IGNORE INTO authors (name, sort) VALUES (?1, ?2)",
+            params![author, sort],
+        )?;
+        conn.execute(
+            "UPDATE authors SET sort=?1 WHERE name=?2 AND (sort IS NULL OR sort='')",
+            params![sort, author],
+        )?;
+        let author_id: i64 =
+            conn.query_row("SELECT id FROM authors WHERE name=?1", [author], |row| {
+                row.get(0)
+            })?;
+        conn.execute(
+            "INSERT OR IGNORE INTO books_authors_link (book, author) VALUES (?1, ?2)",
+            params![id, author_id],
+        )?;
+    }
+
+    conn.execute("DELETE FROM books_tags_link WHERE book=?1", [id])?;
+    for tag in &meta.tags {
+        conn.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", [tag])?;
+        let tag_id: i64 =
+            conn.query_row("SELECT id FROM tags WHERE name=?1", [tag], |row| row.get(0))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO books_tags_link (book, tag) VALUES (?1, ?2)",
+            params![id, tag_id],
+        )?;
+    }
+
+    conn.execute("DELETE FROM books_publishers_link WHERE book=?1", [id])?;
+    if let Some(publisher) = &meta.publisher {
+        conn.execute(
+            "INSERT OR IGNORE INTO publishers (name, sort) VALUES (?1, ?2)",
+            params![publisher, publisher],
+        )?;
+        let publisher_id: i64 = conn.query_row(
+            "SELECT id FROM publishers WHERE name=?1",
+            [publisher],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO books_publishers_link (book, publisher) VALUES (?1, ?2)",
+            params![id, publisher_id],
+        )?;
+    }
+
+    conn.execute("DELETE FROM books_series_link WHERE book=?1", [id])?;
+    if let Some(series) = &meta.series {
+        conn.execute("INSERT OR IGNORE INTO series (name) VALUES (?1)", [series])?;
+        let series_id: i64 =
+            conn.query_row("SELECT id FROM series WHERE name=?1", [series], |row| {
+                row.get(0)
+            })?;
+        conn.execute(
+            "INSERT OR IGNORE INTO books_series_link (book, series) VALUES (?1, ?2)",
+            params![id, series_id],
+        )?;
+    }
+
+    conn.execute("DELETE FROM books_ratings_link WHERE book=?1", [id])?;
+    if let Some(rating) = meta.rating.filter(|r| (1..=10).contains(r)) {
+        conn.execute(
+            "INSERT OR IGNORE INTO ratings (rating) VALUES (?1)",
+            [rating],
+        )?;
+        let rating_id: i64 =
+            conn.query_row("SELECT id FROM ratings WHERE rating=?1", [rating], |row| {
+                row.get(0)
+            })?;
+        conn.execute(
+            "INSERT OR IGNORE INTO books_ratings_link (book, rating) VALUES (?1, ?2)",
+            params![id, rating_id],
+        )?;
+    }
+
+    conn.execute("DELETE FROM comments WHERE book=?1", [id])?;
+    if let Some(comments) = &meta.comments {
+        conn.execute(
+            "INSERT INTO comments (book, text) VALUES (?1, ?2)",
+            params![id, comments],
+        )?;
+    }
+
+    conn.execute("DELETE FROM identifiers WHERE book=?1", [id])?;
+    for (kind, value) in &meta.identifiers {
+        conn.execute(
+            "INSERT OR REPLACE INTO identifiers (book, type, val) VALUES (?1, ?2, ?3)",
+            params![id, kind, value],
+        )?;
+    }
+
+    conn.execute("DELETE FROM books_languages_link WHERE book=?1", [id])?;
+    for (order, language) in meta.languages.iter().enumerate() {
+        conn.execute(
+            "INSERT OR IGNORE INTO languages (lang_code) VALUES (?1)",
+            [language],
+        )?;
+        let language_id: i64 = conn.query_row(
+            "SELECT id FROM languages WHERE lang_code=?1",
+            [language],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO books_languages_link (book, lang_code, item_order)
+             VALUES (?1, ?2, ?3)",
+            params![id, language_id, order as i64],
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct DirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl DirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut entries) = fs::read_dir(&self.path) {
+                // Only remove directories this call created and left empty,
+                // never a pre-existing book directory.
+                if entries.next().is_none() {
+                    let _ = fs::remove_dir(&self.path);
+                }
+            }
+        }
+    }
+}
+
+fn safe_join(root: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.trim().is_empty() {
+        return Err(Error::Other("empty book path".into()));
+    }
+    let mut out = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            _ => {
+                return Err(Error::Other(format!(
+                    "unsafe path outside library: {relative}"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn find_file_ignore_case(directory: &Path, file_name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(directory).ok()?;
+    for entry in entries.filter_map(std::result::Result::ok) {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(file_name)
+        {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn unique_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let extension = path
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    for counter in 2..10_000 {
+        let candidate = if extension.is_empty() {
+            parent.join(format!("{stem} ({counter})"))
+        } else {
+            parent.join(format!("{stem} ({counter}).{extension}"))
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
+fn render_template(template: &str, meta: &Metadata, id: i64) -> String {
+    let mut rendered = template.to_string();
+    let replacements = [
+        ("{author}", meta.first_author().to_string()),
+        ("{authors}", meta.authors.join(" & ")),
+        ("{author_sort}", meta.computed_author_sort()),
+        ("{title}", meta.title.clone()),
+        ("{series}", meta.series.clone().unwrap_or_default()),
+        (
+            "{series_index}",
+            text::format_series_index(meta.series_index),
+        ),
+        ("{id}", id.to_string()),
+    ];
+    for (key, value) in replacements {
+        rendered = rendered.replace(key, &value);
+    }
+    rendered
+}
+
+// ---------------------------------------------------------------------------
+// Search query mini-language
+// ---------------------------------------------------------------------------
+
+struct ParsedQuery {
+    where_sql: String,
+    params: Vec<String>,
+    sort: Option<BookSort>,
+    descending: bool,
+}
+
+fn parse_query(query: &str) -> ParsedQuery {
+    let mut clauses = Vec::new();
+    let mut params = Vec::new();
+    let mut sort = None;
+    let mut descending = false;
+
+    for raw_token in tokenize(query) {
+        let (negated, token) = strip_negation(&raw_token);
+        let (field, value) = match token.split_once(':') {
+            Some((field, value)) if !field.is_empty() && !value.is_empty() => {
+                (field.to_ascii_lowercase(), value.to_string())
+            }
+            _ => (String::new(), token.to_string()),
+        };
+
+        if field == "sort" {
+            let (desc, name) = match value.strip_prefix('-') {
+                Some(name) => (true, name),
+                None => (false, value.as_str()),
+            };
+            if let Some(parsed) = BookSort::parse(name) {
+                sort = Some(parsed);
+                descending = desc;
+            }
+            continue;
+        }
+
+        let mut clause_params = Vec::new();
+        let clause = if field.is_empty() {
+            free_text_clause(&value, &mut clause_params)
+        } else if let Some(clause) = field_clause(&field, &value, &mut clause_params) {
+            clause
+        } else {
+            free_text_clause(&token, &mut clause_params)
+        };
+        let clause = if negated {
+            format!("NOT ({clause})")
+        } else {
+            clause
+        };
+        clauses.push(clause);
+        params.extend(clause_params);
+    }
+
+    ParsedQuery {
+        where_sql: clauses.join(" AND "),
+        params,
+        sort,
+        descending,
+    }
+}
+
+fn tokenize(query: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in query.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn strip_negation(token: &str) -> (bool, &str) {
+    if let Some(rest) = token.strip_prefix('!') {
+        if !rest.is_empty() {
+            return (true, rest);
+        }
+    }
+    if let Some(rest) = token.strip_prefix('-') {
+        if !rest.is_empty() && !rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            return (true, rest);
+        }
+    }
+    (false, token)
+}
+
+fn field_clause(field: &str, value: &str, params: &mut Vec<String>) -> Option<String> {
+    let like = like_pattern(value);
+    let clause = match field {
+        "title" => {
+            params.push(like);
+            "b.title LIKE ? ESCAPE '\\'"
+        }
+        "author" | "authors" => {
+            params.push(like);
+            "EXISTS (SELECT 1 FROM books_authors_link l JOIN authors a ON a.id=l.author
+                     WHERE l.book=b.id AND a.name LIKE ? ESCAPE '\\')"
+        }
+        "tag" | "tags" => {
+            params.push(like);
+            "EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag
+                     WHERE l.book=b.id AND t.name LIKE ? ESCAPE '\\')"
+        }
+        "series" => {
+            params.push(like);
+            "EXISTS (SELECT 1 FROM books_series_link l JOIN series s ON s.id=l.series
+                     WHERE l.book=b.id AND s.name LIKE ? ESCAPE '\\')"
+        }
+        "publisher" => {
+            params.push(like);
+            "EXISTS (SELECT 1 FROM books_publishers_link l JOIN publishers p ON p.id=l.publisher
+                     WHERE l.book=b.id AND p.name LIKE ? ESCAPE '\\')"
+        }
+        "format" => {
+            params.push(value.trim().to_ascii_uppercase());
+            "EXISTS (SELECT 1 FROM data d WHERE d.book=b.id AND d.format = ?)"
+        }
+        "language" | "lang" => {
+            params.push(like);
+            "EXISTS (SELECT 1 FROM books_languages_link l JOIN languages lang ON lang.id=l.lang_code
+                     WHERE l.book=b.id AND lang.lang_code LIKE ? ESCAPE '\\')"
+        }
+        "identifier" => {
+            if let Some((kind, id_value)) = value.split_once(':') {
+                params.push(kind.to_ascii_lowercase());
+                params.push(like_pattern(id_value));
+                "EXISTS (SELECT 1 FROM identifiers i WHERE i.book=b.id
+                         AND LOWER(i.type)=? AND i.val LIKE ? ESCAPE '\\')"
+            } else {
+                params.push(like);
+                "EXISTS (SELECT 1 FROM identifiers i WHERE i.book=b.id
+                         AND i.val LIKE ? ESCAPE '\\')"
+            }
+        }
+        "rating" => {
+            params.push(value.trim().to_string());
+            "EXISTS (SELECT 1 FROM books_ratings_link l JOIN ratings r ON r.id=l.rating
+                     WHERE l.book=b.id AND r.rating = CAST(? AS INTEGER))"
+        }
+        "id" => {
+            params.push(value.trim().to_string());
+            "b.id = CAST(? AS INTEGER)"
+        }
+        _ => return None,
+    };
+    Some(clause.to_string())
+}
+
+fn free_text_clause(value: &str, params: &mut Vec<String>) -> String {
+    let like = like_pattern(value);
+    params.push(like.clone());
+    params.push(like.clone());
+    params.push(like);
+    "(b.title LIKE ? ESCAPE '\\'
+      OR EXISTS (SELECT 1 FROM books_authors_link l JOIN authors a ON a.id=l.author
+                 WHERE l.book=b.id AND a.name LIKE ? ESCAPE '\\')
+      OR EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag
+                 WHERE l.book=b.id AND t.name LIKE ? ESCAPE '\\'))"
+        .to_string()
+}
+
+fn like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('%');
+    for ch in value.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('%');
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_search_queries() {
+        let parsed = parse_query("author:tolkien tag:fantasy the hobbit sort:-series");
+        assert_eq!(parsed.params.len(), 8);
+        assert!(parsed.where_sql.contains("a.name LIKE"));
+        assert!(parsed.where_sql.contains("t.name LIKE"));
+        assert_eq!(parsed.sort, Some(BookSort::Series));
+        assert!(parsed.descending);
+    }
+
+    #[test]
+    fn supports_negation_and_quoted_values() {
+        let parsed = parse_query("!tag:romance title:\"the hobbit\"");
+        assert!(parsed.where_sql.starts_with("NOT ("));
+        assert_eq!(parsed.params[0], "%romance%");
+        assert_eq!(parsed.params[1], "%the hobbit%");
+    }
+
+    #[test]
+    fn builds_safe_like_patterns() {
+        assert_eq!(like_pattern("100%_safe"), "%100\\%\\_safe%");
+    }
+
+    #[test]
+    fn renders_templates() {
+        let mut meta = Metadata::new("The Hobbit");
+        meta.authors = vec!["J. R. R. Tolkien".into()];
+        meta.series = Some("Middle Earth".into());
+        assert_eq!(
+            render_template("{author_sort}/{title} ({id})", &meta, 7),
+            "Tolkien, J. R. R./The Hobbit (7)"
+        );
+    }
+}
