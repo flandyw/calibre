@@ -447,17 +447,20 @@ fn pdf_info_dictionary(data: &[u8]) -> Option<&[u8]> {
     let object: u32 = parts.next()?.parse().ok()?;
     let generation: u32 = parts.next()?.parse().ok()?;
     let header = format!("{object} {generation} obj");
+    // An updated file appends a new version of the object: the last wins.
+    let mut newest = None;
     let mut from = 0;
     while let Some(at) = find(data, header.as_bytes(), from) {
         // `12 0 obj` must not match inside `112 0 obj`.
         if at == 0 || !data[at - 1].is_ascii_digit() {
             let start = at + header.len();
-            let end = find(data, b"endobj", start)?;
-            return Some(&data[start..end]);
+            if let Some(end) = find(data, b"endobj", start) {
+                newest = Some(&data[start..end]);
+            }
         }
         from = at + 1;
     }
-    None
+    newest
 }
 
 fn pdf_string(dictionary: &[u8], key: &str) -> Option<String> {
@@ -563,5 +566,12 @@ mod tests {
         assert_eq!(pdf_string(info, "/Author").unwrap(), "Lem");
         assert!(pdf_string(info, "/Subject").is_none());
         assert!(pdf_info_dictionary(b"%PDF-1.7 no trailer").is_none());
+
+        let mut updated = pdf.to_vec();
+        updated.extend_from_slice(
+            b"\n1 0 obj\n<< /Title (Revised) >>\nendobj\ntrailer\n<< /Info 1 0 R >>\n",
+        );
+        let info = pdf_info_dictionary(&updated).unwrap();
+        assert_eq!(pdf_string(info, "/Title").unwrap(), "Revised");
     }
 }
