@@ -207,3 +207,30 @@ fn reading_prefers_a_supported_format() {
     assert_eq!(library.preferred_readable_format(id).unwrap(), "TXT");
     assert!(!library.read_book(id, None).unwrap().is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn metadata_files_are_not_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("library");
+    let source = text_book(temp.path(), "Dune.txt");
+    let mut library = Library::create(&root).unwrap();
+    let id = library.add_book(&source).unwrap().id;
+    let opf = |library: &Library| {
+        root.join(library.book_path(id).unwrap())
+            .join("metadata.opf")
+    };
+    let path = opf(&library);
+    let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_ne!(mode & 0o044, 0, "new OPF is {mode:o}");
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    let patch = BookUpdate {
+        comments: Some(Some("A note".into())),
+        ..Default::default()
+    };
+    library.update_book(id, &patch).unwrap();
+    let mode = fs::metadata(opf(&library)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o664);
+}

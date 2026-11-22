@@ -1437,11 +1437,28 @@ impl FsUndo {
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let directory = path.parent().unwrap_or(Path::new("."));
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    let mut temporary = shared_temporary(directory)?;
     temporary.write_all(bytes)?;
+    if let Ok(existing) = fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(existing.permissions())?;
+    }
     temporary.as_file().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// A temporary file with ordinary (umask-governed) permissions rather than
+/// the owner-only default, so shared libraries stay readable by others.
+fn shared_temporary(directory: &Path) -> Result<tempfile::NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    Ok(builder.tempfile_in(directory)?)
 }
 
 pub(crate) fn copy_atomic(source: &Path, destination: &Path) -> Result<()> {
