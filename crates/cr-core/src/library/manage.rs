@@ -565,6 +565,15 @@ impl Library {
                         added.push(format.clone());
                     }
                 }
+                // Extra files come along unless the name is already taken.
+                let have = target.extra_files(into)?;
+                let extras = safe_join(&self.root, &self.book_path(id)?)?.join(DATA_DIR);
+                let wanted = safe_join(&target.root, &target.book_path(into)?)?.join(DATA_DIR);
+                for name in self.extra_files(id)? {
+                    if !have.contains(&name) {
+                        copy_atomic(&safe_join(&extras, &name)?, &safe_join(&wanted, &name)?)?;
+                    }
+                }
                 return Ok(AddOutcome::Merged {
                     id: into,
                     added: !added.is_empty(),
