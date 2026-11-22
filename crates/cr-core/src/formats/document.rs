@@ -813,10 +813,11 @@ fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
     let anchor_of = |base: &str, target: &str| {
         let (file, fragment) = target.split_once('#').unwrap_or((target, ""));
         let number = *index.get(epub::resolve_href(base, file).as_str())?;
+        let fragment = percent_encoding::percent_decode_str(fragment).decode_utf8_lossy();
         Some(if fragment.is_empty() {
             format!("cr-doc-{number}")
         } else {
-            unique(fragment, number)
+            unique(&fragment, number)
         })
     };
     let mut contents: Vec<&epub::ManifestItem> = package
