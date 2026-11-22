@@ -43,6 +43,12 @@ pub enum Error {
     Json(#[from] serde_json::Error),
 
     #[error("{0}")]
+    ReadOnly(String),
+
+    #[error("cancelled")]
+    Cancelled,
+
+    #[error("{0}")]
     Other(String),
 }
 

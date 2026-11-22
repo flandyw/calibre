@@ -37,3 +37,25 @@ jobs:
             echo "| Binary | \`target/release/cr\` (${binary_size}) |"
             echo "| Toolchain | \`${rust_version}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Test core and CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace
+
+  gui:
+    name: Check and test GUI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libfontconfig1-dev libfreetype-dev libxcb1-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+      - name: Test GUI
+        working-directory: crates/cr-gui
+        run: cargo test

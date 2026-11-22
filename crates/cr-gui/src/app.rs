@@ -5,10 +5,11 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cr_core::device::{self, Device, SendOptions};
 use cr_core::formats::epub as epub_formats;
+use cr_core::jobs::{self, Canceller, JobContext, Progress};
 use cr_core::library::{BookSort, BookUpdate, Library, ListOptions};
 use cr_core::metadata::{htmlize_comments, parse_user_date, BookSummary, Metadata};
 use cr_core::text::{self, split_authors};
@@ -179,8 +180,17 @@ const RECENTLY_ADDED_LIMIT: usize = 50;
 /// Formats tried first when opening or dragging a book out of the app.
 const PREFERRED_FORMATS: &[&str] = &["EPUB", "PDF", "AZW3", "MOBI", "FB2", "TXT"];
 
+/// A long operation running off the UI thread, shown in the status bar.
+pub struct RunningJob {
+    pub label: String,
+    pub progress: Progress,
+    pub cancelling: bool,
+    canceller: Canceller,
+}
+
 pub struct CalibreApp {
     pub settings: Settings,
+    pub job: Option<RunningJob>,
     pub library: Option<Library>,
     pub devices: Vec<Device>,
     pub scanning_devices: bool,
@@ -319,6 +329,7 @@ impl CalibreApp {
 
         let mut app = Self {
             settings,
+            job: None,
             library: None,
             devices: Vec::new(),
             scanning_devices: false,
@@ -428,6 +439,86 @@ impl CalibreApp {
         };
         window.push_notification(note, cx);
         self.set_status(message, tone);
+    }
+
+    /// Runs `body` on a background thread, showing its progress in the status
+    /// bar, then hands the result to `finish` on the UI thread. One job runs
+    /// at a time.
+    fn run_job<T: Send + 'static>(
+        &mut self,
+        label: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        body: impl FnOnce(&JobContext) -> cr_core::Result<T> + Send + 'static,
+        finish: impl FnOnce(&mut Self, cr_core::Result<T>, &mut Window, &mut Context<Self>) + 'static,
+    ) {
+        if let Some(job) = &self.job {
+            let message = format!("Wait for “{}” to finish first.", job.label);
+            self.announce(message, Tone::Info, window, cx);
+            cx.notify();
+            return;
+        }
+        let label = label.into();
+        let mut handle = jobs::spawn(label.clone(), body);
+        self.job = Some(RunningJob {
+            label,
+            progress: Progress::default(),
+            cancelling: false,
+            canceller: handle.canceller(),
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            while !handle.is_finished() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(60))
+                    .await;
+                let progress = handle.progress().clone();
+                let updated = this.update(cx, |this, cx| {
+                    if let Some(job) = this.job.as_mut() {
+                        if job.progress != progress {
+                            job.progress = progress;
+                            cx.notify();
+                        }
+                    }
+                });
+                if updated.is_err() {
+                    handle.cancel();
+                    return;
+                }
+            }
+            let result = handle.join();
+            this.update_in(cx, |this, window, cx| {
+                this.job = None;
+                finish(this, result, window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn cancel_job(&mut self, cx: &mut Context<Self>) {
+        if let Some(job) = self.job.as_mut() {
+            job.canceller.cancel();
+            job.cancelling = true;
+            cx.notify();
+        }
+    }
+
+    /// The open library's folder, or a status message when it cannot be changed.
+    fn writable_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<PathBuf> {
+        let Some(library) = &self.library else {
+            self.set_status("Open a library first.", Tone::Info);
+            cx.notify();
+            return None;
+        };
+        if let Some(reason) = library.read_only_reason() {
+            let reason = capitalize(reason);
+            self.announce(reason, Tone::Error, window, cx);
+            cx.notify();
+            return None;
+        }
+        Some(library.root().to_path_buf())
     }
 
     /// Moves focus into the main view when nothing in it has focus, so window
@@ -843,14 +934,21 @@ impl CalibreApp {
         self.settings_changed(cx);
         self.sync_window_chrome(window);
         window.focus(&self.list_focus, cx);
-        self.set_status(
-            format!(
-                "Opened {} — {} book(s).",
-                path.display(),
-                self.all_books.len()
+        let read_only = self
+            .library
+            .as_ref()
+            .and_then(|library| library.read_only_reason().map(capitalize));
+        match read_only {
+            Some(reason) => self.announce(reason, Tone::Error, window, cx),
+            None => self.set_status(
+                format!(
+                    "Opened {} — {} book(s).",
+                    path.display(),
+                    self.all_books.len()
+                ),
+                Tone::Info,
             ),
-            Tone::Info,
-        );
+        }
         self.scan_devices(window, cx);
         cx.notify();
     }
@@ -1049,45 +1147,65 @@ impl CalibreApp {
             cx.notify();
             return;
         }
-        let mut added = 0usize;
-        let mut last_id = None;
-        let mut errors = Vec::new();
-        if let Some(library) = self.library.as_mut() {
-            for path in paths {
-                match library.add_book(&path) {
-                    Ok(book) => {
-                        added += 1;
-                        last_id = Some(book.id);
-                    }
-                    Err(err) => errors.push(format!("{}: {err}", display_name(&path))),
-                }
-            }
-        }
-        // Show the new books: clear filters that might hide them.
-        self.shelf = Shelf::All;
-        self.query.clear();
-        set_input(&self.search, String::new(), window, cx);
-        self.refresh_all();
-        if let Some(id) = last_id {
-            self.load_book(id, window, cx);
-            if let Some(index) = self.selected_index() {
-                self.scroll_to(index);
-            }
-        }
-        let (message, tone) = match (added, errors.last()) {
-            (0, Some(err)) => (format!("No books added. {err}"), Tone::Error),
-            (_, Some(err)) => (
-                format!(
-                    "Added {added} book(s); {} failed. Last error: {err}",
-                    errors.len()
-                ),
-                Tone::Error,
-            ),
-            (1, None) => ("Added 1 book.".to_string(), Tone::Success),
-            (_, None) => (format!("Added {added} books."), Tone::Success),
+        let Some(root) = self.writable_root(window, cx) else {
+            return;
         };
-        self.announce(message, tone, window, cx);
-        cx.notify();
+        let label = match paths.len() {
+            1 => "Adding 1 book".to_string(),
+            count => format!("Adding {count} books"),
+        };
+        self.run_job(
+            label,
+            window,
+            cx,
+            move |context| Ok(Library::open(&root)?.add_books(&paths, context)),
+            |this, result, window, cx| {
+                let results = match result {
+                    Ok(results) => results,
+                    Err(err) => {
+                        this.announce(format!("Add failed: {err}"), Tone::Error, window, cx);
+                        return;
+                    }
+                };
+                let last_id = results
+                    .iter()
+                    .rev()
+                    .find_map(|item| item.result.as_ref().ok().map(|book| book.id));
+                let added = results.iter().filter(|item| item.result.is_ok()).count();
+                let errors: Vec<String> = results
+                    .iter()
+                    .filter_map(|item| {
+                        let err = item.result.as_ref().err()?;
+                        Some(format!("{}: {err}", display_name(&item.item)))
+                    })
+                    .collect();
+                // Show the new books: clear filters that might hide them.
+                this.shelf = Shelf::All;
+                this.query.clear();
+                set_input(&this.search, String::new(), window, cx);
+                this.refresh_all();
+                if let Some(id) = last_id {
+                    this.load_book(id, window, cx);
+                    if let Some(index) = this.selected_index() {
+                        this.scroll_to(index);
+                    }
+                }
+                let (message, tone) = match (added, errors.last()) {
+                    (0, Some(err)) => (format!("No books added. {err}"), Tone::Error),
+                    (_, Some(err)) => (
+                        format!(
+                            "Added {added} book(s); {} failed. Last error: {err}",
+                            errors.len()
+                        ),
+                        Tone::Error,
+                    ),
+                    (0, None) => ("Adding books was cancelled.".to_string(), Tone::Info),
+                    (1, None) => ("Added 1 book.".to_string(), Tone::Success),
+                    (_, None) => (format!("Added {added} books."), Tone::Success),
+                };
+                this.announce(message, tone, window, cx);
+            },
+        );
     }
 
     fn prompt_export(&mut self, ids: Vec<i64>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1122,37 +1240,72 @@ impl CalibreApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(root) = self.library.as_ref().map(|l| l.root().to_path_buf()) else {
+            self.set_status("Open a library first.", Tone::Info);
+            cx.notify();
+            return;
+        };
         let book_count = ids.len();
-        let result = self
-            .library
-            .as_ref()
-            .map(|library| library.export_books(&ids, &destination, EXPORT_TEMPLATE, None));
-        match result {
-            Some(Ok(paths)) if paths.is_empty() => self.announce(
-                "Nothing to export: these books have no format files.",
-                Tone::Info,
-                window,
-                cx,
-            ),
-            Some(Ok(paths)) => {
-                self.announce(
-                    format!(
-                        "Exported {} file(s) from {book_count} book(s) to {}.",
-                        paths.len(),
-                        destination.display()
+        let target = destination.clone();
+        self.run_job(
+            format!("Exporting {book_count} book(s)"),
+            window,
+            cx,
+            move |context| {
+                let library = Library::open(&root)?;
+                Ok(library.export_each(&ids, &target, EXPORT_TEMPLATE, None, context))
+            },
+            move |this, result, window, cx| {
+                let results = match result {
+                    Ok(results) => results,
+                    Err(err) => {
+                        this.announce(format!("Export failed: {err}"), Tone::Error, window, cx);
+                        return;
+                    }
+                };
+                let files: usize = results
+                    .iter()
+                    .filter_map(|item| item.result.as_ref().ok().map(Vec::len))
+                    .sum();
+                let errors: Vec<String> = results
+                    .iter()
+                    .filter_map(|item| {
+                        let err = item.result.as_ref().err()?;
+                        Some(format!("book {}: {err}", item.item))
+                    })
+                    .collect();
+                match (files, errors.last()) {
+                    (_, Some(err)) => this.announce(
+                        format!(
+                            "Exported {files} file(s); {} book(s) failed. Last error: {err}",
+                            errors.len()
+                        ),
+                        Tone::Error,
+                        window,
+                        cx,
                     ),
-                    Tone::Success,
-                    window,
-                    cx,
-                );
-                cx.reveal_path(&destination);
-            }
-            Some(Err(err)) => {
-                self.announce(format!("Export failed: {err}"), Tone::Error, window, cx)
-            }
-            None => self.set_status("Open a library first.", Tone::Info),
-        }
-        cx.notify();
+                    (0, None) => this.announce(
+                        "Nothing exported: these books have no format files.",
+                        Tone::Info,
+                        window,
+                        cx,
+                    ),
+                    (_, None) => this.announce(
+                        format!(
+                            "Exported {files} file(s) from {} book(s) to {}.",
+                            results.len(),
+                            destination.display()
+                        ),
+                        Tone::Success,
+                        window,
+                        cx,
+                    ),
+                }
+                if files > 0 {
+                    cx.reveal_path(&destination);
+                }
+            },
+        );
     }
 
     fn confirm_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2838,6 +2991,14 @@ pub fn default_library_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Calibre Library")
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 pub fn display_name(path: &Path) -> String {
