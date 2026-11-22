@@ -116,6 +116,25 @@ const INLINE: [(&str, Style); 11] = [
     ("sub", Style::Subscript),
 ];
 
+/// Elements that end the block before them.
+const BLOCK_TAGS: [&str; 15] = [
+    "p",
+    "div",
+    "figure",
+    "figcaption",
+    "caption",
+    "dt",
+    "dd",
+    "table",
+    "blockquote",
+    "pre",
+    "ul",
+    "ol",
+    "li",
+    "tr",
+    "img",
+];
+
 struct Layout<'a> {
     images: &'a HashMap<&'a str, usize>,
     blocks: Vec<Block>,
@@ -208,6 +227,11 @@ impl Layout<'_> {
     }
 
     fn open_tag(&mut self, name: &str, tag: &str) {
+        // An anchor on a block belongs to that block, not to text before it.
+        let heading = name.len() == 2 && name.starts_with('h');
+        if heading || BLOCK_TAGS.contains(&name) {
+            self.flush(None);
+        }
         if let Some(id) = attr_value(tag, "id") {
             self.pending_anchors.push(id);
         }

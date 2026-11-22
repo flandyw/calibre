@@ -70,6 +70,12 @@ fn layout_keeps_structure_styles_and_links() {
     assert_eq!(styled(&Style::Link("#two".into())), Some("link"));
     let target = book.resolve_link("#two").unwrap();
     assert_eq!((target.section, target.block), (1, 0));
+    // An anchor on a block points at it, not at loose text before it.
+    let loose = temp.path().join("loose.html");
+    fs::write(&loose, "<body>Loose text<p id=\"mark\">Marked</p></body>").unwrap();
+    let loose = Book::open(&loose).unwrap();
+    let mark = loose.resolve_link("#mark").unwrap();
+    assert_eq!(loose.block(mark).unwrap().text, "Marked");
     assert!(book.resolve_link("https://example.com/").is_none());
 
     let toc: Vec<(&str, u8)> = book
