@@ -75,6 +75,26 @@ pub struct RebuildReport {
     pub backup: Option<PathBuf>,
 }
 
+/// Whether two existing paths are one file or folder. Names that differ only
+/// in case are the same on some filesystems and different on others.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(a), fs::metadata(b)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (fs::canonicalize(a), fs::canonicalize(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        }
+    }
+}
+
 fn subdirectories(directory: &Path) -> Vec<(String, PathBuf)> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
@@ -351,10 +371,6 @@ impl Library {
         let target = safe_join(&self.root, &restored.path)?;
         // The book may now live under another name; remove only the copies
         // that are safely in the new place and keep anything else.
-        // Names differing only in case are one file on some filesystems.
-        let same_name = |a: &Path, b: &Path| {
-            a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
-        };
         let mut seen = HashSet::new();
         for (format, source) in &files {
             let kept = target.join(format!(
@@ -365,11 +381,11 @@ impl Library {
                 ),
                 format.to_ascii_lowercase()
             ));
-            if seen.insert(format.clone()) && !same_name(source, &kept) && kept.is_file() {
+            if seen.insert(format.clone()) && kept.is_file() && !same_file(source, &kept) {
                 let _ = fs::remove_file(source);
             }
         }
-        if !same_name(&target, folder) {
+        if !same_file(&target, folder) {
             let extras = folder.join(DATA_DIR);
             if extras.is_dir() {
                 let _ = fs::rename(&extras, target.join(DATA_DIR));
