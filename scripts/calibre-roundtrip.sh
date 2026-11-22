@@ -36,9 +36,15 @@ cr --json list > before.json
 cr set 1 --title "Dune Messiah" --tag "sf,epic" --rating 8 >/dev/null
 cr add added.txt >/dev/null
 cr rm 2 --delete-files >/dev/null
+cr list '#genre:=desert and #read:true' --json > custom_search.json
+cr set-custom 1 genre "space opera, politics" >/dev/null
+cr columns add pages --name Pages --type int >/dev/null
+cr set-custom 1 pages 412 >/dev/null
+cr searches save epics "tag:epic or #pages:>400" >/dev/null
 
 # 3. Upstream calibre reads the result.
-cdb list -f title,authors,tags,series,rating,formats,*genre,*read --for-machine > after.json
+cdb list -f title,authors,tags,series,rating,formats,*genre,*read,*pages --for-machine > after.json
+cdb list -s 'search:epics' -f title --for-machine > saved_search.json
 cdb check_library --csv > check.csv
 
 python3 - "$lib" <<'PY'
@@ -58,7 +64,10 @@ assert dune["title"] == "Dune Messiah", dune
 assert dune["authors"] == "Frank Herbert & Brian Herbert", dune
 assert sorted(dune["tags"]) == ["epic", "sf"], dune
 assert dune["series"] == "Dune Saga" and dune["rating"] == 8, dune
-assert dune["*genre"] == ["space opera", "desert"] and dune["*read"] is True, dune
+assert dune["*genre"] == ["space opera", "politics"] and dune["*read"] is True, dune
+assert dune["*pages"] == 412, dune
+assert [b["id"] for b in json.load(open("custom_search.json"))] == [1]
+assert [b["id"] for b in json.load(open("saved_search.json"))] == [1]
 assert len(dune["formats"]) == 2, dune
 for book in after.values():
     for path in book["formats"]:
