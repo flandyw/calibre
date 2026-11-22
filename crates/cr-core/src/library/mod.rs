@@ -333,6 +333,10 @@ impl Library {
             ],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(sort) = meta.title_sort.as_deref().filter(|_| options.keep_uuid) {
+            // The insert trigger computed a sort; a carried-over one wins.
+            tx.execute("UPDATE books SET sort=?1 WHERE id=?2", params![sort, id])?;
+        }
         let relative = text::book_dir_name(id, &meta.title, meta.first_author());
         let directory = safe_join(&self.root, &relative)?;
         let mut cleanup = DirGuard::new(directory.clone());
