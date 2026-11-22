@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
@@ -26,6 +26,8 @@ use crate::metadata::BookSummary;
 const PAGE_SIZE: usize = 50;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_HEAD_BYTES: u64 = 16 * 1024;
+/// The whole request head must arrive within this time.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
 const SECURITY: &str = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 #[derive(Debug, Clone)]
@@ -163,11 +165,31 @@ impl Server {
     }
 }
 
+/// Reads from a connection until a fixed time, however slowly bytes arrive.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buffer)
+    }
+}
+
 impl State {
     fn connection(&self, stream: TcpStream) -> io::Result<()> {
-        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
-        let mut reader = BufReader::new((&stream).take(MAX_HEAD_BYTES));
+        let head = Deadline {
+            stream: &stream,
+            until: Instant::now() + HEAD_TIMEOUT,
+        };
+        let mut reader = BufReader::new(head.take(MAX_HEAD_BYTES));
         let mut request = String::new();
         reader.read_line(&mut request)?;
         let mut authorization = None;
