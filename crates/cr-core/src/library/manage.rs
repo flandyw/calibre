@@ -993,3 +993,8 @@ impl Default for ExportOptions {
         }
     }
 }
+
+/// Compile a file-name pattern for [`ImportOptions::filename_pattern`].
+pub fn filename_pattern(pattern: &str) -> Result<Regex> {
+    Regex::new(pattern).map_err(|error| Error::InvalidMetadata(format!("bad pattern: {error}")))
+}
