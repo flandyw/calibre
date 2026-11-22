@@ -290,3 +290,49 @@ fn empty_records_take_formats_later() {
     assert!(!library.add_format(id, &txt, false).unwrap());
     assert_eq!(library.formats(id).unwrap(), ["TXT"]);
 }
+
+#[test]
+fn merged_moves_keep_extra_files_and_refuse_the_same_library() {
+    let temp = tempdir().unwrap();
+    let mut source = Library::create(&temp.path().join("a")).unwrap();
+    let mut target = Library::create(&temp.path().join("b")).unwrap();
+    let txt = write(temp.path(), "Dune.txt", "Spice.\n");
+    let id = source.add_book(&txt).unwrap().id;
+    source
+        .add_extra_file(id, &write(temp.path(), "map.txt", "Arrakis"))
+        .unwrap();
+    let existing = target.add_book(&txt).unwrap().id;
+
+    let context = JobContext::detached();
+    let moved = source.transfer_books(&[id], &mut target, DuplicatePolicy::Merge, true, &context);
+    assert!(matches!(
+        moved[0].result.as_ref().unwrap(),
+        AddOutcome::Merged { .. }
+    ));
+    assert_eq!(target.extra_files(existing).unwrap(), ["map.txt"]);
+
+    // The same library reached through a different path is still the same.
+    let alias = temp.path().join("b").join("..").join("b");
+    let mut again = Library::open(&alias).unwrap();
+    let result = target.copy_book_to(existing, &mut again, DuplicatePolicy::Merge);
+    assert!(result.is_err());
+}
+
+#[test]
+fn restore_keeps_sort_keys_and_scans_start_at_dot_folders() {
+    let temp = tempdir().unwrap();
+    let mut library = Library::create(&temp.path().join("library")).unwrap();
+    let mut meta = Metadata::new("The Long Title");
+    meta.authors = vec!["Frank Herbert".into(), "Brian Herbert".into()];
+    let id = library.add_empty(meta).unwrap().id;
+    let before = library.get_metadata(id).unwrap();
+    library.trash_book(id).unwrap();
+    library.restore_book(id).unwrap();
+    let after = library.get_metadata(id).unwrap();
+    assert_eq!(after.author_sort, before.author_sort);
+    assert_eq!(after.title_sort, before.title_sort);
+
+    let hidden = temp.path().join(".inbox");
+    write(&hidden, "Dune.txt", "Spice.\n");
+    assert_eq!(scan_sources(&[hidden], true).len(), 1);
+}

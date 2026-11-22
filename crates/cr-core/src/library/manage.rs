@@ -579,7 +579,11 @@ impl Library {
                 let wanted = safe_join(&target.root, &target.book_path(into)?)?.join(DATA_DIR);
                 for name in self.extra_files(id)? {
                     if !have.contains(&name) {
-                        copy_atomic(&safe_join(&extras, &name)?, &safe_join(&wanted, &name)?)?;
+                        let destination = safe_join(&wanted, &name)?;
+                        if let Some(parent) = destination.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        copy_atomic(&safe_join(&extras, &name)?, &destination)?;
                     }
                 }
                 return Ok(AddOutcome::Merged {
