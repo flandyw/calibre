@@ -499,10 +499,18 @@ fn prepare_book(
                 .path()
                 .join(format!("book.{}", target.to_ascii_lowercase()));
             // Only a conversion that reads back as a book is sent.
-            let checked = crate::formats::convert(&original, &converted)
-                .and_then(|()| crate::formats::read_document(&converted, false));
+            // A format with no reader (HTMLZ) is only checked for content.
+            let readable = crate::formats::INPUT_FORMATS.contains(&target.as_str());
+            let checked = crate::formats::convert(&original, &converted).and_then(|()| {
+                if readable {
+                    let document = crate::formats::read_document(&converted, false)?;
+                    Ok(!document.sections.is_empty())
+                } else {
+                    Ok(fs::metadata(&converted)?.len() > 0)
+                }
+            });
             return match checked {
-                Ok(document) if !document.sections.is_empty() => Ok(Some(PreparedBook {
+                Ok(true) => Ok(Some(PreparedBook {
                     source: converted,
                     meta,
                     format: target,
@@ -511,7 +519,7 @@ fn prepare_book(
                     converted_from: Some(from.clone()),
                     _scratch: Some(scratch),
                 })),
-                Ok(_) => skip(format!(
+                Ok(false) => skip(format!(
                     "converting {from} to {target} produced an empty book"
                 )),
                 Err(err) => skip(format!("could not convert {from} to {target}: {err}")),
