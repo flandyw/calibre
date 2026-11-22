@@ -360,8 +360,8 @@ impl Parser<'_> {
                 _ => self.number(&single, value, 1.0),
             },
             "bool" => match value.to_ascii_lowercase().as_str() {
-                "true" | "yes" | "checked" => format!("{single}=1"),
-                "false" | "no" | "unchecked" => format!("{single}=0"),
+                "true" | "yes" | "checked" => format!("COALESCE({single}=1, 0)"),
+                "false" | "no" | "unchecked" => format!("COALESCE({single}=0, 0)"),
                 "empty" | "blank" => format!("{single} IS NULL"),
                 _ => FALSE.to_string(),
             },
@@ -426,7 +426,9 @@ impl Parser<'_> {
             return FALSE.to_string();
         };
         self.params.push((number * scale).to_string());
-        format!("{column} {operator} CAST(? AS REAL)")
+        // An unset value fails the test rather than making it unknown, so
+        // that negating the term matches the book.
+        format!("COALESCE({column} {operator} CAST(? AS REAL), 0)")
     }
 
     fn date(&mut self, column: &str, value: &str) -> String {
@@ -438,7 +440,7 @@ impl Parser<'_> {
         let (start, end) = (start.to_string(), end.to_string());
         let mut compare = |test: &str, bound: String| {
             self.params.push(bound);
-            format!("{day} {test} ?")
+            format!("COALESCE({day} {test} ?, 0)")
         };
         match operator {
             ">" => compare(">=", end),
