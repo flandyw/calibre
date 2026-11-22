@@ -28,11 +28,15 @@ static ITEMREF: LazyLock<Regex> = LazyLock::new(|| {
 static XML_ENCODING: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"^(\s*<\?xml\b[^>]*?\bencoding\s*=\s*["'])[^"']*(["'])"#).unwrap()
 });
+static STYLE_ELEMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<style\b[^<>]*>(.*?)</style\s*>").unwrap());
 static CSS_IMPORT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"@import\s+["']([^"']+)["']"#).unwrap());
 static NAV_TOC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?is)<nav\b[^>]*\bepub:type\s*=\s*["'][^"']*\btoc\b[^"']*["'][^>]*>.*?</nav\s*>"#)
-        .unwrap()
+    Regex::new(
+        r#"(?is)(<nav\b[^>]*\bepub:type\s*=\s*["'][^"']*\btoc\b[^"']*["'][^>]*>).*?</nav\s*>"#,
+    )
+    .unwrap()
 });
 static CSS_URL: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"url\(\s*["']?([^"')]+)["']?\s*\)"#).unwrap());
@@ -130,6 +134,7 @@ fn escape(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 fn directory_of(path: &str) -> &str {
@@ -767,7 +772,11 @@ impl EpubDir {
         } else {
             format!("id_{stem}")
         };
-        let used: HashSet<String> = self.items().into_iter().map(|item| item.id).collect();
+        // Every id in the package, including remote items and metadata.
+        let used: HashSet<String> = TAG
+            .find_iter(&self.opf)
+            .filter_map(|tag| attribute(tag.as_str(), "id"))
+            .collect();
         let mut id = stem.clone();
         let mut number = 1;
         while used.contains(&id) {
@@ -1234,9 +1243,9 @@ impl EpubDir {
                 .filter(|text| NAV_TOC.is_match(text));
             let document = match kept {
                 Some(text) => {
-                    let nav = format!(
-                        "<nav epub:type=\"toc\" id=\"toc\">\n<h1>Contents</h1>\n{list}</nav>"
-                    );
+                    // The element's own tag stays, with its namespaces and id.
+                    let open = NAV_TOC.captures(&text).unwrap()[1].to_string();
+                    let nav = format!("{open}\n<h1>Contents</h1>\n{list}</nav>");
                     NAV_TOC.replace(&text, regex::NoExpand(&nav)).into_owned()
                 }
                 None => document,
@@ -1405,14 +1414,41 @@ fn retarget(
         (updated != reference).then_some(updated)
     };
     let mut edits: Vec<(Range<usize>, String)> = Vec::new();
-    // Stylesheets, and styles inside markup (style attributes and elements).
-    for found in CSS_URL
-        .captures_iter(text)
-        .chain(CSS_IMPORT.captures_iter(text))
-    {
-        let reference = found.get(1).unwrap();
-        if let Some(updated) = rewrite(reference.as_str()) {
-            edits.push((reference.range(), updated));
+    // Styles: a whole stylesheet, or the style elements and attributes of
+    // markup. Attribute values are entity-encoded; other text is not touched.
+    let mut styles: Vec<(Range<usize>, bool)> = Vec::new();
+    if markup {
+        styles.extend(
+            STYLE_ELEMENT
+                .captures_iter(text)
+                .map(|found| (found.get(1).unwrap().range(), false)),
+        );
+        for tag in TAG.find_iter(text) {
+            for (name, _, range) in attributes(tag.as_str()) {
+                if name == "style" {
+                    styles.push((tag.start() + range.start..tag.start() + range.end, true));
+                }
+            }
+        }
+    } else {
+        styles.push((0..text.len(), false));
+    }
+    for (style, encoded) in styles {
+        let css = &text[style.clone()];
+        for found in CSS_URL
+            .captures_iter(css)
+            .chain(CSS_IMPORT.captures_iter(css))
+        {
+            let reference = found.get(1).unwrap();
+            let range = style.start + reference.start()..style.start + reference.end();
+            if encoded {
+                let decoded = html_escape::decode_html_entities(reference.as_str());
+                if let Some(updated) = rewrite(&decoded) {
+                    edits.push((range, escape(&updated)));
+                }
+            } else if let Some(updated) = rewrite(reference.as_str()) {
+                edits.push((range, updated));
+            }
         }
     }
     if markup {

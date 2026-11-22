@@ -290,7 +290,7 @@ fn edits_keep_what_they_do_not_own() {
     let image_href = image.path.rsplit_once("OEBPS/").unwrap().1.to_string();
     let styled = text.replace(
         "</body>",
-        &format!("<p style=\"background: url({image_href})\">x</p></body>"),
+        &format!("<p style=\"background: url({image_href})\">x</p><p>write url({image_href}) in CSS</p></body>"),
     );
     fs::write(&path, styled).unwrap();
     let css = temp.path().join("extra.css");
@@ -339,6 +339,43 @@ fn edits_keep_what_they_do_not_own() {
     );
     assert_eq!(book.check(), []);
 
+    // Prose that mentions url() is not a reference.
+    let chapter = fs::read_to_string(book.root().join(&moved)).unwrap();
+    assert!(chapter.contains(&format!("write url({image_href}) in CSS")));
+
+    // Names that need escaping stay well-formed, in either quote style.
+    let chapter = chapter.replace(
+        "style=\"background: url(../art/new.png)\"",
+        "style='background: url(../art/new.png)'",
+    );
+    assert!(chapter.contains("style='"));
+    fs::write(book.root().join(&moved), chapter).unwrap();
+    let odd = format!("{directory}/art/a&b's.png");
+    book.rename_file(&format!("{directory}/art/new.png"), &odd)
+        .unwrap();
+    assert_eq!(book.check(), []);
+    book.rename_file(&odd, &format!("{directory}/art/new.png"))
+        .unwrap();
+    assert_eq!(book.check(), []);
+
+    // A new file never takes an id the package already uses.
+    let package = fs::read_to_string(&opf).unwrap();
+    fs::write(&opf, package.replace("id=\"remote\"", "id=\"more_css\"")).unwrap();
+    let mut book = EpubDir::open(book.root()).unwrap();
+    book.add_file(
+        &temp.path().join("extra.css"),
+        &format!("{directory}/more.css"),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(&opf)
+            .unwrap()
+            .matches("id=\"more_css\"")
+            .count(),
+        1
+    );
+    book.remove_file(&format!("{directory}/more.css")).unwrap();
+
     // Regenerating the contents keeps the rest of the navigation document.
     if let Some(nav) = book
         .items()
@@ -348,16 +385,21 @@ fn edits_keep_what_they_do_not_own() {
         let path = book.root().join(&nav.path);
         let text = fs::read_to_string(&path).unwrap();
         let landmarks = "<nav epub:type=\"landmarks\"><ol><li><a epub:type=\"bodymatter\" href=\"text/start.xhtml\">Start</a></li></ol></nav>";
-        fs::write(
-            &path,
-            text.replace("</body>", &format!("{landmarks}</body>")),
-        )
-        .unwrap();
+        // The epub prefix is bound on the elements themselves.
+        let bound = "<nav xmlns:epub=\"http://www.idpf.org/2007/ops\" ";
+        let landmarks = &landmarks.replace("<nav ", bound);
+        let text = text
+            .replacen(" xmlns:epub=\"http://www.idpf.org/2007/ops\"", "", 1)
+            .replacen("<nav ", bound, 1)
+            .replace("</body>", &format!("{landmarks}</body>"));
+        fs::write(&path, text).unwrap();
+        assert_eq!(book.check(), []);
         book.generate_toc(2).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains(landmarks));
         assert_eq!(text.matches("epub:type=\"toc\"").count(), 1);
         assert_eq!(book.toc().unwrap().len(), 3);
+        assert_eq!(book.check(), []);
     } else {
         panic!("converted books have a navigation document");
     }
