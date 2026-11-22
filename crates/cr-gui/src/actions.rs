@@ -76,6 +76,11 @@ actions!(
         DecreaseFontSize,
         ResetFontSize,
         ToggleChapterList,
+        ToggleBookmark,
+        ToggleHighlight,
+        FindInBook,
+        NextMatch,
+        PreviousMatch,
     ]
 );
 
@@ -166,6 +171,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("-"), DecreaseFontSize, reader),
         KeyBinding::new(primary!("0"), ResetFontSize, reader),
         KeyBinding::new(primary!("alt-s"), ToggleChapterList, reader),
+        KeyBinding::new(primary!("d"), ToggleBookmark, reader),
+        KeyBinding::new(primary!("h"), ToggleHighlight, reader),
+        KeyBinding::new(primary!("f"), FindInBook, reader),
+        KeyBinding::new(primary!("g"), NextMatch, reader),
+        KeyBinding::new(primary!("shift-g"), PreviousMatch, reader),
     ];
 
     if cfg!(target_os = "macos") {

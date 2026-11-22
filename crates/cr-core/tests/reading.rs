@@ -238,3 +238,36 @@ fn calibre_highlights_and_positions_are_read() {
     // calibre's rows are untouched.
     assert_eq!(library.calibre_annotations(id).unwrap().len(), 1);
 }
+
+#[test]
+fn epub_keeps_its_contents_images_and_source() {
+    let temp = tempdir().unwrap();
+    let image = image::RgbImage::from_pixel(8, 4, image::Rgb([200, 30, 30]));
+    image.save(temp.path().join("pic.png")).unwrap();
+    let html = temp.path().join("reader.html");
+    fs::write(
+        &html,
+        PAGE.replace("<hr>", "<p><img src=\"pic.png\" alt=\"A picture\"></p>"),
+    )
+    .unwrap();
+    let epub = temp.path().join("reader.epub");
+    cr_core::formats::convert(&html, &epub).unwrap();
+    let before = fs::read(&epub).unwrap();
+
+    let book = Book::open(&epub).unwrap();
+    let titles: Vec<&str> = book.toc.iter().map(|entry| entry.title.as_str()).collect();
+    assert_eq!(titles, ["One", "Two"]);
+    assert_eq!(book.toc[1].target.section, 1);
+    let picture = book.sections[0]
+        .blocks
+        .iter()
+        .find_map(|block| match block.kind {
+            BlockKind::Image(index) => Some((index, block.text.as_str())),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(picture.1, "A picture");
+    assert!(book.images[picture.0].data.starts_with(&[0x89, b'P']));
+    assert!(book.resolve_link("#two").is_some());
+    assert_eq!(fs::read(&epub).unwrap(), before);
+}

@@ -107,6 +107,31 @@ rewrites `metadata.opf`, exactly as calibre expects.
 `--list` shows chapters and word counts, `--chapter N` reads one, `--all` reads
 everything, and `--width` controls wrapping.
 
+The GUI reader lays the book out from its own markup instead of extracted
+text: headings, bold/italic/underline/code, lists, quotations, tables,
+preformatted text, images and links (links inside the book jump, others open
+in the browser), for every format that converts (EPUB, Kindle, FB2, DOCX,
+HTML, RTF, TXT). The side panel shows the book's real table of contents
+(EPUB 3 navigation document or NCX, nested), search results, and bookmarks
+and highlights. Publisher CSS, embedded fonts and paged mode are not applied.
+
+- **Position**: the place is saved when you move or close the book and
+  restored on reopening; a book last read in calibre's viewer resumes at
+  calibre's recorded progress.
+- **Search**: `cr read ID --search TEXT` and `--toc` on the command line;
+  Find in the GUI.
+- **Bookmarks and highlights**: `cr annotations add --book ID --find TEXT
+  [--bookmark] [--note ...]`, `list`, `search`, `note`, `rm`, and
+  `export --format markdown|json`. A highlight covers text within one
+  paragraph; the GUI highlights the clicked paragraph.
+- **Storage**: reading state lives in `cr-reading.db` beside `metadata.db`.
+  Book files and calibre's tables are never written. Highlights are anchored
+  by their text, so they follow it when the book file is edited.
+- **calibre's annotations**: `cr annotations list --book ID` also shows
+  bookmarks and highlights made in calibre's viewer, and
+  `cr annotations import-calibre --book ID` copies its highlights in.
+  Nothing is written back to calibre.
+
 ### Conversion
 
 `cr convert INPUT OUTPUT` selects the target by the output extension.
@@ -280,6 +305,10 @@ cr copy 3 4 --to ~/Other\ Library --move
 # Read
 cr read 12 --list
 cr read 12 --chapter 3 --width 88
+cr read 12 --toc
+cr read 12 --search "white whale"
+cr annotations add --book 12 --find "Call me Ishmael" --note "opening"
+cr annotations export --book 12 --format markdown
 
 # Convert and optionally store the result on an existing library book
 cr convert book.epub book.azw3

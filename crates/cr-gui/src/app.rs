@@ -9,14 +9,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cr_core::device::{self, Device, SendOptions};
 use cr_core::formats::epub as epub_formats;
+use cr_core::formats::reading::{Book, Hit, Locator};
 use cr_core::jobs::{self, Canceller, JobContext, Progress};
 use cr_core::library::{
-    AddOutcome, BookSort, BookUpdate, DuplicatePolicy, ExportOptions, ImportOptions, Library,
-    ListOptions,
+    AddOutcome, Annotation, AnnotationKind, BookSort, BookUpdate, DuplicatePolicy, ExportOptions,
+    ImportOptions, Library, ListOptions,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, BookSummary, Metadata};
 use cr_core::text::{self, split_authors};
-use cr_core::Chapter;
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::*;
@@ -217,8 +217,20 @@ pub struct CalibreApp {
     pub cover_path: Option<PathBuf>,
     pub selected_formats: Vec<String>,
     pub selected_path: Option<String>,
-    pub chapters: Vec<Chapter>,
-    pub chapter_index: usize,
+    pub book: Option<Rc<Book>>,
+    pub reader_book_id: i64,
+    pub section_index: usize,
+    /// Decoded once per book; `None` for images that cannot be shown.
+    pub reader_images: Vec<Option<std::sync::Arc<Image>>>,
+    pub reader_search: Entity<InputState>,
+    pub reader_hits: Vec<Hit>,
+    pub reader_hit: usize,
+    pub reader_annotations: Vec<Annotation>,
+    /// The block of the current section that actions apply to.
+    pub reader_block: Option<usize>,
+    /// A block to scroll to once the section is laid out.
+    pub reader_jump: Cell<Option<usize>>,
+    pub reader_panel: ReaderPanel,
     pub reader_title: String,
     pub chapter_list_visible: bool,
     pub screen: Screen,
@@ -273,6 +285,14 @@ pub struct CalibreApp {
     _subscriptions: Vec<Subscription>,
 }
 
+/// What the reader's side panel shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderPanel {
+    Contents,
+    Notes,
+    Search,
+}
+
 impl CalibreApp {
     pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = text_input("Search", window, cx);
@@ -288,12 +308,20 @@ impl CalibreApp {
         let pubdate_input = text_input("YYYY-MM-DD", window, cx);
         let comments_input = text_area("Description", 8, window, cx);
         let epub_editor = text_area("EPUB source", 20, window, cx);
+        let reader_search = text_input("Find in book", window, cx);
         let crop_left = text_input("Left %", window, cx);
         let crop_top = text_input("Top %", window, cx);
         let crop_width = text_input("Width %", window, cx);
         let crop_height = text_input("Height %", window, cx);
 
         let subscriptions = vec![
+            cx.subscribe_in(&reader_search, window, |this, state, event, _, cx| {
+                if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
+                    let query = state.read(cx).value().to_string();
+                    let fresh = matches!(event, InputEvent::Change);
+                    this.search_book(&query, fresh, cx);
+                }
+            }),
             cx.subscribe_in(&search, window, |this, state, event, window, cx| {
                 match event {
                     InputEvent::Change => {
@@ -357,8 +385,17 @@ impl CalibreApp {
             cover_path: None,
             selected_formats: Vec::new(),
             selected_path: None,
-            chapters: Vec::new(),
-            chapter_index: 0,
+            book: None,
+            reader_book_id: 0,
+            section_index: 0,
+            reader_images: Vec::new(),
+            reader_search,
+            reader_hits: Vec::new(),
+            reader_hit: 0,
+            reader_annotations: Vec::new(),
+            reader_block: None,
+            reader_jump: Cell::new(None),
+            reader_panel: ReaderPanel::Contents,
             reader_title: String::new(),
             chapter_list_visible: true,
             screen: Screen::Library,
@@ -1990,37 +2027,109 @@ impl CalibreApp {
         if self.editing {
             return;
         }
-        let result = self
-            .library
-            .as_ref()
-            .map(|library| library.read_book(id, None));
-        match result {
-            Some(Ok(book)) if !book.chapters.is_empty() => {
-                self.chapters = book.chapters;
-                self.chapter_index = 0;
-                self.reader_title = self.selected_title();
-                self.screen = Screen::Reader;
-                self.reader_scroll.set_offset(point(px(0.), px(0.)));
-                window.focus(&self.reader_focus, cx);
-                self.set_status(
-                    format!("Reading {} chapter(s).", self.chapters.len()),
-                    Tone::Info,
-                );
-                self.sync_window_chrome(window);
+        let Some(library) = self.library.as_ref() else {
+            self.set_status("Open a library first.", Tone::Info);
+            return;
+        };
+        let book = match library.open_book(id, None) {
+            Ok(book)
+                if book
+                    .sections
+                    .iter()
+                    .any(|section| !section.blocks.is_empty()) =>
+            {
+                book
             }
-            Some(Ok(_)) => self.announce("No readable text in this file.", Tone::Info, window, cx),
-            Some(Err(err)) => self.announce(
-                format!("Cannot read this book: {err}"),
-                Tone::Error,
-                window,
-                cx,
-            ),
-            None => self.set_status("Open a library first.", Tone::Info),
-        }
+            Ok(_) => {
+                self.announce("No readable text in this file.", Tone::Info, window, cx);
+                return;
+            }
+            Err(err) => {
+                self.announce(
+                    format!("Cannot read this book: {err}"),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        };
+        // Annotations follow their text if the file changed since.
+        let _ = library.relocate_annotations(id, &book);
+        self.reader_annotations = library.annotations(Some(id)).unwrap_or_default();
+        let position = library.reading_position(id, &book).ok().flatten();
+        self.reader_images = book
+            .images
+            .iter()
+            .map(|image| {
+                let format = match image.data.as_slice() {
+                    [0xff, 0xd8, ..] => ImageFormat::Jpeg,
+                    [0x89, b'P', ..] => ImageFormat::Png,
+                    [b'G', b'I', b'F', ..] => ImageFormat::Gif,
+                    [b'R', b'I', b'F', b'F', ..] => ImageFormat::Webp,
+                    _ => return None,
+                };
+                Some(std::sync::Arc::new(Image::from_bytes(
+                    format,
+                    image.data.clone(),
+                )))
+            })
+            .collect();
+        self.reader_title = book.title.clone();
+        let sections = book.sections.len();
+        self.book = Some(Rc::new(book));
+        self.reader_book_id = id;
+        self.reader_hits.clear();
+        self.reader_hit = 0;
+        self.screen = Screen::Reader;
+        self.go_to(
+            position
+                .map(|position| position.locator)
+                .unwrap_or_default(),
+            cx,
+        );
+        window.focus(&self.reader_focus, cx);
+        self.set_status(
+            match position {
+                Some(position) => format!("Resumed at {:.0}%.", position.fraction * 100.0),
+                None => format!("Reading {sections} section(s)."),
+            },
+            Tone::Info,
+        );
+        self.sync_window_chrome(window);
         cx.notify();
     }
 
+    /// The block at the top of the reader, as a place in the book.
+    pub fn reader_locator(&self) -> Locator {
+        let blocks = self
+            .book
+            .as_ref()
+            .and_then(|book| book.sections.get(self.section_index))
+            .map_or(0, |section| section.blocks.len());
+        Locator {
+            section: self.section_index,
+            block: self.reader_scroll.top_item().min(blocks.saturating_sub(1)),
+            offset: 0,
+        }
+    }
+
+    fn save_reading_position(&self) {
+        if let (Some(library), Some(book)) = (self.library.as_ref(), self.book.as_ref()) {
+            if library.read_only_reason().is_none() {
+                let _ =
+                    library.set_reading_position(self.reader_book_id, book, self.reader_locator());
+            }
+        }
+    }
+
     pub fn close_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_reading_position();
+        self.book = None;
+        self.reader_images.clear();
+        self.reader_annotations.clear();
+        self.reader_hits.clear();
+        self.reader_block = None;
         self.screen = Screen::Library;
         self.reader_title.clear();
         self.sync_window_chrome(window);
@@ -2031,22 +2140,150 @@ impl CalibreApp {
         cx.notify();
     }
 
-    pub fn step_chapter(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.chapters.is_empty() {
+    /// Show a place in the book.
+    pub fn go_to(&mut self, locator: Locator, cx: &mut Context<Self>) {
+        let Some(book) = self.book.as_ref() else {
+            return;
+        };
+        if locator.section >= book.sections.len() {
             return;
         }
-        let next = self.chapter_index as isize + delta;
-        if next >= 0 && (next as usize) < self.chapters.len() {
-            self.set_chapter(next as usize, cx);
+        if locator.section != self.section_index {
+            self.reader_block = None;
+        }
+        self.section_index = locator.section;
+        self.reader_scroll.set_offset(point(px(0.), px(0.)));
+        self.reader_jump
+            .set((locator.block > 0).then_some(locator.block));
+        self.save_reading_position_at(locator);
+        cx.notify();
+    }
+
+    fn save_reading_position_at(&self, locator: Locator) {
+        if let (Some(library), Some(book)) = (self.library.as_ref(), self.book.as_ref()) {
+            if library.read_only_reason().is_none() {
+                let _ = library.set_reading_position(self.reader_book_id, book, locator);
+            }
         }
     }
 
-    pub fn set_chapter(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.chapters.len() {
-            self.chapter_index = index;
-            self.reader_scroll.set_offset(point(px(0.), px(0.)));
-            cx.notify();
+    pub fn step_chapter(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let next = self.section_index as isize + delta;
+        if next >= 0 {
+            self.go_to(
+                Locator {
+                    section: next as usize,
+                    ..Locator::default()
+                },
+                cx,
+            );
         }
+    }
+
+    /// Follow a link: inside the book, or in the browser.
+    pub fn follow_link(&mut self, href: &str, cx: &mut Context<Self>) {
+        let target = self.book.as_ref().and_then(|book| book.resolve_link(href));
+        match target {
+            Some(locator) => self.go_to(locator, cx),
+            None if href.starts_with("http://")
+                || href.starts_with("https://")
+                || href.starts_with("mailto:") =>
+            {
+                cx.open_url(href)
+            }
+            None => {}
+        }
+    }
+
+    /// Search the book; Return in the field moves to the next match.
+    fn search_book(&mut self, query: &str, fresh: bool, cx: &mut Context<Self>) {
+        let Some(book) = self.book.clone() else {
+            return;
+        };
+        if fresh {
+            self.reader_hits = book.search(query, 500);
+            self.reader_hit = 0;
+            self.reader_panel = ReaderPanel::Search;
+            cx.notify();
+        } else {
+            self.step_hit(1, cx);
+        }
+    }
+
+    pub fn step_hit(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let total = self.reader_hits.len() as isize;
+        if total > 0 {
+            let next = (self.reader_hit as isize + delta).rem_euclid(total) as usize;
+            self.show_hit(next, cx);
+        }
+    }
+
+    pub fn show_hit(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(hit) = self.reader_hits.get(index) {
+            let start = hit.start;
+            self.reader_hit = index;
+            self.go_to(start, cx);
+            self.reader_block = Some(start.block);
+        }
+    }
+
+    pub fn select_reader_block(&mut self, block: usize, cx: &mut Context<Self>) {
+        self.reader_block = (self.reader_block != Some(block)).then_some(block);
+        cx.notify();
+    }
+
+    /// Bookmark or highlight the selected block (the block at the top of the
+    /// page when none is selected). An existing one of that kind is removed.
+    pub fn annotate(&mut self, highlight: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(library), Some(book)) = (self.library.as_ref(), self.book.clone()) else {
+            return;
+        };
+        if library.read_only_reason().is_some() {
+            self.announce("This library is read-only.", Tone::Info, window, cx);
+            return;
+        }
+        let mut start = self.reader_locator();
+        if let Some(block) = self.reader_block {
+            start.block = block;
+        }
+        let kind = if highlight {
+            AnnotationKind::Highlight
+        } else {
+            AnnotationKind::Bookmark
+        };
+        let existing = self
+            .reader_annotations
+            .iter()
+            .find(|a| {
+                a.kind == kind && a.start.section == start.section && a.start.block == start.block
+            })
+            .map(|a| a.id);
+        let result = match existing {
+            Some(id) => library.remove_annotation(id),
+            None => {
+                let end = highlight.then(|| book.block(start).map_or(0, |block| block.text.len()));
+                library
+                    .add_annotation(self.reader_book_id, &book, start, end, "")
+                    .map(|_| ())
+            }
+        };
+        self.reader_annotations = library
+            .annotations(Some(self.reader_book_id))
+            .unwrap_or_default();
+        if let Err(err) = result {
+            self.announce(format!("Could not save: {err}"), Tone::Error, window, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn remove_annotation(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(library) = self.library.as_ref() {
+            let _ = library.remove_annotation(id);
+            self.reader_annotations = library
+                .annotations(Some(self.reader_book_id))
+                .unwrap_or_default();
+        }
+        cx.notify();
     }
 
     fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
@@ -2962,6 +3199,25 @@ impl CalibreApp {
                 cx.listener(|this, _: &DecreaseFontSize, _, cx| this.change_font_size(-1.0, cx)),
             )
             .on_action(cx.listener(|this, _: &ResetFontSize, _, cx| this.change_font_size(0.0, cx)))
+            .on_action(
+                cx.listener(|this, _: &ToggleBookmark, window, cx| {
+                    this.annotate(false, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleHighlight, window, cx| {
+                    this.annotate(true, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &FindInBook, window, cx| {
+                this.chapter_list_visible = true;
+                this.reader_panel = ReaderPanel::Search;
+                let handle = this.reader_search.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_hit(1, cx)))
+            .on_action(cx.listener(|this, _: &PreviousMatch, _, cx| this.step_hit(-1, cx)))
             .on_action(cx.listener(|this, _: &ToggleChapterList, _, cx| {
                 this.chapter_list_visible = !this.chapter_list_visible;
                 cx.notify();
