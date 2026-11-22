@@ -136,7 +136,7 @@ pub fn extract_text(path: &Path, format: Option<&str>) -> Result<BookText> {
         "FB2" => fb2::text(path),
         "TXT" => txt::text(path),
         "HTML" => txt::html_text(path),
-        "AZW3" | "AZW" | "MOBI" | "PRC" => mobi::text(path),
+        "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC" => mobi::text(path),
         other => Err(Error::UnsupportedFormat(format!(
             "{other} text extraction is not implemented yet"
         ))),
