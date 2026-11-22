@@ -22,6 +22,9 @@ use crate::metadata::{format_datetime, now, parse_datetime, BookSummary, Metadat
 use crate::opf;
 use crate::text;
 
+mod manage;
+pub use manage::*;
+
 pub const DB_FILE: &str = "metadata.db";
 pub const METADATA_FILE: &str = "metadata.opf";
 pub const COVER_FILE: &str = "cover.jpg";
@@ -60,6 +63,15 @@ pub struct AddResult {
     pub authors: Vec<String>,
     pub formats: Vec<String>,
     pub path: String,
+}
+
+/// How [`Library::insert_book`] creates a record.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct NewBook {
+    /// Reuse this id (restoring from the trash) instead of the next free one.
+    pub id: Option<i64>,
+    /// Keep the metadata's uuid rather than minting a new one.
+    pub keep_uuid: bool,
 }
 
 /// Library-wide counts.
@@ -284,52 +296,82 @@ impl Library {
     /// writing `metadata.opf` / `cover.jpg`.
     pub fn add_book(&mut self, source: &Path) -> Result<AddResult> {
         self.writable()?;
-        let fault = self.fault.take();
         let imported = formats::import(source)?;
-        let format = imported.format.clone();
-        let mut meta = imported.metadata;
+        let files = [(imported.format, source.to_path_buf())];
+        self.insert_book(imported.metadata, &files, NewBook::default())
+    }
+
+    /// Create a book record from metadata and format files, atomically: on
+    /// failure neither rows nor files remain.
+    pub(crate) fn insert_book(
+        &mut self,
+        mut meta: Metadata,
+        files: &[(String, PathBuf)],
+        options: NewBook,
+    ) -> Result<AddResult> {
+        self.writable()?;
+        let fault = self.fault.take();
         meta.normalize();
-        let timestamp = now();
-        meta.timestamp.get_or_insert(timestamp);
+        let created = now();
+        let timestamp = *meta.timestamp.get_or_insert(created);
         let pubdate = meta.pubdate.unwrap_or(timestamp);
         let author_sort = meta.computed_author_sort();
         meta.author_sort = Some(author_sort.clone());
 
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO books (title, timestamp, pubdate, series_index, author_sort, path, has_cover, last_modified)
-             VALUES (?1, ?2, ?3, ?4, ?5, '', 0, ?6)",
+            "INSERT INTO books (id, title, timestamp, pubdate, series_index, author_sort, path, has_cover, last_modified)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0, ?7)",
             params![
+                options.id,
                 meta.title,
                 format_datetime(&timestamp),
                 format_datetime(&pubdate),
                 meta.series_index,
                 author_sort,
-                format_datetime(&timestamp),
+                format_datetime(&created),
             ],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(sort) = meta.title_sort.as_deref().filter(|_| options.keep_uuid) {
+            // The insert trigger computed a sort; a carried-over one wins.
+            tx.execute("UPDATE books SET sort=?1 WHERE id=?2", params![sort, id])?;
+        }
         let relative = text::book_dir_name(id, &meta.title, meta.first_author());
         let directory = safe_join(&self.root, &relative)?;
         let mut cleanup = DirGuard::new(directory.clone());
         fs::create_dir_all(&directory)?;
 
         let stem = text::format_file_stem(&meta.title, meta.first_author());
-        let extension = format.to_ascii_lowercase();
-        let destination = directory.join(format!("{stem}.{extension}"));
-        if source != destination {
-            cleanup.track(&destination);
-            copy_atomic(source, &destination)?;
+        let mut stored = Vec::new();
+        for (format, source) in files {
+            let format = format.to_ascii_uppercase();
+            if stored.contains(&format) {
+                continue;
+            }
+            let extension = format.to_ascii_lowercase();
+            let destination = directory.join(format!("{stem}.{extension}"));
+            if *source != destination {
+                cleanup.track(&destination);
+                copy_atomic(source, &destination)?;
+            }
+            let size = fs::metadata(&destination)?.len();
+            tx.execute(
+                "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
+                params![id, format, size as i64, stem],
+            )?;
+            stored.push(format);
         }
-        let size = fs::metadata(&destination)?.len();
-        tx.execute(
-            "INSERT INTO data (book, format, uncompressed_size, name) VALUES (?1, ?2, ?3, ?4)",
-            params![id, format, size as i64, stem],
-        )?;
 
-        let uuid: Option<String> =
-            tx.query_row("SELECT uuid FROM books WHERE id=?1", [id], |row| row.get(0))?;
-        meta.uuid = uuid;
+        match meta.uuid.as_deref().filter(|_| options.keep_uuid) {
+            Some(uuid) => {
+                tx.execute("UPDATE books SET uuid=?1 WHERE id=?2", params![uuid, id])?;
+            }
+            None => {
+                meta.uuid =
+                    tx.query_row("SELECT uuid FROM books WHERE id=?1", [id], |row| row.get(0))?;
+            }
+        }
 
         let has_cover = if let Some(cover) = &meta.cover {
             cleanup.track(&directory.join(COVER_FILE));
@@ -360,7 +402,7 @@ impl Library {
             id,
             title: meta.title,
             authors: meta.authors,
-            formats: vec![format],
+            formats: stored,
             path: relative,
         })
     }
@@ -816,7 +858,8 @@ impl Library {
 
     /// Copy books out of the library using a template. Placeholders:
     /// `{author}`, `{authors}`, `{author_sort}`, `{title}`, `{series}`,
-    /// `{series_index}`, `{id}`.
+    /// `{series_index}`, `{publisher}`, `{year}`, `{language}`, `{tags}`,
+    /// `{rating}`, `{id}`.
     pub fn export_books(
         &self,
         ids: &[i64],
@@ -824,58 +867,16 @@ impl Library {
         template: &str,
         format: Option<&str>,
     ) -> Result<Vec<PathBuf>> {
+        let options = ExportOptions {
+            template: template.to_string(),
+            formats: format.iter().map(|f| f.to_string()).collect(),
+            ..Default::default()
+        };
         let mut written = Vec::new();
         for &id in ids {
-            let meta = self.get_metadata(id)?;
-            for current in self.formats(id)? {
-                if let Some(wanted) = format {
-                    if !wanted.eq_ignore_ascii_case(&current) {
-                        continue;
-                    }
-                }
-                let Some(source) = self.format_path(id, &current)? else {
-                    continue;
-                };
-                let rendered = render_template(template, &meta, id);
-                let mut target = destination.to_path_buf();
-                for component in rendered.split('/') {
-                    if component.is_empty() {
-                        continue;
-                    }
-                    target.push(text::sanitize_component(component));
-                }
-                let extension = current.to_ascii_lowercase();
-                let file_name = target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "Unknown".to_string());
-                target.set_file_name(format!("{file_name}.{extension}"));
-                target = unique_path(target);
-                if let Some(parent) = target.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                copy_atomic(&source, &target)?;
-                written.push(target);
-            }
+            written.extend(self.export_book(id, destination, &options)?);
         }
         Ok(written)
-    }
-
-    /// [`Library::export_books`] as a job with per-book results.
-    pub fn export_each(
-        &self,
-        ids: &[i64],
-        destination: &Path,
-        template: &str,
-        format: Option<&str>,
-        context: &JobContext,
-    ) -> Vec<ItemResult<i64, Vec<PathBuf>>> {
-        jobs::for_each(
-            context,
-            ids.iter().copied(),
-            |id| format!("Exporting book {id}"),
-            |id| self.export_books(&[*id], destination, template, format),
-        )
     }
 
     /// Rewrite `metadata.opf` for one book.
@@ -1562,6 +1563,22 @@ fn render_template(template: &str, meta: &Metadata, id: i64) -> String {
         (
             "{series_index}",
             text::format_series_index(meta.series_index),
+        ),
+        ("{publisher}", meta.publisher.clone().unwrap_or_default()),
+        (
+            "{year}",
+            meta.pubdate
+                .map(|date| date.format("%Y").to_string())
+                .unwrap_or_default(),
+        ),
+        (
+            "{language}",
+            meta.languages.first().cloned().unwrap_or_default(),
+        ),
+        ("{tags}", meta.tags.join(", ")),
+        (
+            "{rating}",
+            meta.rating.map(|r| r.to_string()).unwrap_or_default(),
         ),
         ("{id}", id.to_string()),
     ];

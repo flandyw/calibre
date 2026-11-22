@@ -10,7 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use cr_core::device::{self, Device, SendOptions};
 use cr_core::formats::epub as epub_formats;
 use cr_core::jobs::{self, Canceller, JobContext, Progress};
-use cr_core::library::{BookSort, BookUpdate, Library, ListOptions};
+use cr_core::library::{
+    AddOutcome, BookSort, BookUpdate, DuplicatePolicy, ExportOptions, ImportOptions, Library,
+    ListOptions,
+};
 use cr_core::metadata::{htmlize_comments, parse_user_date, BookSummary, Metadata};
 use cr_core::text::{self, split_authors};
 use cr_core::Chapter;
@@ -205,6 +208,11 @@ pub struct CalibreApp {
     pub shelf: Shelf,
     pub expanded_sections: HashSet<ShelfSection>,
     pub selected: Option<i64>,
+    /// Every selected book, including `selected` (the one shown in the
+    /// inspector). Batch actions apply to all of them.
+    pub marked: HashSet<i64>,
+    /// Where a Shift-click range starts.
+    anchor: Option<usize>,
     pub metadata: Option<Metadata>,
     pub cover_path: Option<PathBuf>,
     pub selected_formats: Vec<String>,
@@ -343,6 +351,8 @@ impl CalibreApp {
             shelf: Shelf::All,
             expanded_sections: HashSet::new(),
             selected: None,
+            marked: HashSet::new(),
+            anchor: None,
             metadata: None,
             cover_path: None,
             selected_formats: Vec::new(),
@@ -737,6 +747,8 @@ impl CalibreApp {
 
     fn clear_selection(&mut self) {
         self.selected = None;
+        self.marked.clear();
+        self.anchor = None;
         self.metadata = None;
         self.cover_path = None;
         self.selected_formats.clear();
@@ -825,6 +837,77 @@ impl CalibreApp {
         cx.notify();
     }
 
+    /// A click on a book: plain selects only it, Ctrl/Cmd toggles it, Shift
+    /// extends the selection from the last plain click.
+    pub fn click_index(
+        &mut self,
+        index: usize,
+        toggle: bool,
+        extend: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.books.get(index).map(|book| book.id) else {
+            return;
+        };
+        if extend {
+            let anchor = self.anchor.or(self.selected_index()).unwrap_or(index);
+            // The list may have shrunk since the anchor was set.
+            let anchor = anchor.min(self.books.len() - 1);
+            let (from, to) = (anchor.min(index), anchor.max(index));
+            self.marked = self.books[from..=to].iter().map(|book| book.id).collect();
+            self.anchor = Some(anchor);
+        } else if toggle {
+            if let Some(current) = self.selected {
+                self.marked.insert(current);
+            }
+            if !self.marked.insert(id) {
+                self.marked.remove(&id);
+                // Keep the inspector on a book that is still selected.
+                if self.selected == Some(id) && !self.editing {
+                    let next = self.books.iter().position(|b| self.marked.contains(&b.id));
+                    match next {
+                        Some(next) => self.select_index(next, window, cx),
+                        None => self.clear_selection(),
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            self.anchor = Some(index);
+        } else {
+            self.marked.clear();
+            self.anchor = Some(index);
+        }
+        self.select_index(index, window, cx);
+        if self.selected == Some(id) {
+            self.marked.insert(id);
+        }
+    }
+
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.marked = self.books.iter().map(|book| book.id).collect();
+        cx.notify();
+    }
+
+    /// The selected books in list order.
+    pub fn selection_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .books
+            .iter()
+            .map(|book| book.id)
+            .filter(|id| self.marked.contains(id) || self.selected == Some(*id))
+            .collect();
+        if ids.is_empty() {
+            ids.extend(self.selected);
+        }
+        ids
+    }
+
+    pub fn is_marked(&self, id: i64) -> bool {
+        self.selected == Some(id) || self.marked.contains(&id)
+    }
+
     fn scroll_to(&self, index: usize) {
         match self.settings.view {
             ViewMode::List => self
@@ -849,7 +932,7 @@ impl CalibreApp {
             Some(index) => (index as isize + delta).clamp(0, last),
             None => 0,
         };
-        self.select_index(next as usize, window, cx);
+        self.click_index(next as usize, false, false, window, cx);
     }
 
     fn fill_form(&self, metadata: &Metadata, window: &mut Window, cx: &mut Context<Self>) {
@@ -1177,7 +1260,14 @@ impl CalibreApp {
             label,
             window,
             cx,
-            move |context| Ok(Library::open(&root)?.add_books(&paths, context)),
+            move |context| {
+                // Another format of a book already here joins that record.
+                let options = ImportOptions {
+                    duplicates: DuplicatePolicy::Merge,
+                    ..Default::default()
+                };
+                Ok(Library::open(&root)?.import_books(&paths, &options, context))
+            },
             |this, result, window, cx| {
                 let results = match result {
                     Ok(results) => results,
@@ -1189,8 +1279,28 @@ impl CalibreApp {
                 let last_id = results
                     .iter()
                     .rev()
-                    .find_map(|item| item.result.as_ref().ok().map(|book| book.id));
-                let added = results.iter().filter(|item| item.result.is_ok()).count();
+                    .find_map(|item| item.result.as_ref().ok().and_then(AddOutcome::book_id));
+                let count = |wanted: fn(&AddOutcome) -> bool| {
+                    results
+                        .iter()
+                        .filter(|item| item.result.as_ref().is_ok_and(wanted))
+                        .count()
+                };
+                let added = count(|outcome| matches!(outcome, AddOutcome::Added(_)));
+                let merged =
+                    count(|outcome| matches!(outcome, AddOutcome::Merged { added: true, .. }));
+                let present =
+                    count(|outcome| matches!(outcome, AddOutcome::Merged { added: false, .. }));
+                let mut summary = match added {
+                    1 => "Added 1 book".to_string(),
+                    _ => format!("Added {added} books"),
+                };
+                if merged > 0 {
+                    summary.push_str(&format!("; {merged} added as formats of existing books"));
+                }
+                if present > 0 {
+                    summary.push_str(&format!("; {present} already in the library"));
+                }
                 let errors: Vec<String> = results
                     .iter()
                     .filter_map(|item| {
@@ -1209,18 +1319,14 @@ impl CalibreApp {
                         this.scroll_to(index);
                     }
                 }
-                let (message, tone) = match (added, errors.last()) {
+                let (message, tone) = match (added + merged + present, errors.last()) {
                     (0, Some(err)) => (format!("No books added. {err}"), Tone::Error),
                     (_, Some(err)) => (
-                        format!(
-                            "Added {added} book(s); {} failed. Last error: {err}",
-                            errors.len()
-                        ),
+                        format!("{summary}; {} failed. Last error: {err}", errors.len()),
                         Tone::Error,
                     ),
                     (0, None) => ("Adding books was cancelled.".to_string(), Tone::Info),
-                    (1, None) => ("Added 1 book.".to_string(), Tone::Success),
-                    (_, None) => (format!("Added {added} books."), Tone::Success),
+                    (_, None) => (format!("{summary}."), Tone::Success),
                 };
                 this.announce(message, tone, window, cx);
             },
@@ -1272,7 +1378,11 @@ impl CalibreApp {
             cx,
             move |context| {
                 let library = Library::open(&root)?;
-                Ok(library.export_each(&ids, &target, EXPORT_TEMPLATE, None, context))
+                let options = ExportOptions {
+                    template: EXPORT_TEMPLATE.to_string(),
+                    ..Default::default()
+                };
+                Ok(library.export_with(&ids, &target, &options, context))
             },
             move |this, result, window, cx| {
                 let results = match result {
@@ -1328,51 +1438,77 @@ impl CalibreApp {
     }
 
     fn confirm_remove(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
+        let ids = self.selection_ids();
+        if ids.is_empty() {
             return;
+        }
+        let question = match ids.len() {
+            1 => format!("Remove “{}” from the library?", self.selected_title()),
+            count => format!("Remove {count} books from the library?"),
         };
-        let title = self.selected_title();
         let receiver = window.prompt(
             PromptLevel::Warning,
-            &format!("Remove “{title}” from the library?"),
+            &question,
             Some(
-                "The book and all of its files are deleted from the library folder. \
-                 This cannot be undone.",
+                "Removed books are kept in the library's trash folder and can be \
+                 restored with `cr trash restore`.",
             ),
             &["Remove", "Cancel"],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(0) = receiver.await {
-                this.update_in(cx, |this, window, cx| this.remove_book(id, window, cx))
+                this.update_in(cx, |this, window, cx| this.remove_books(ids, window, cx))
                     .ok();
             }
         })
         .detach();
     }
 
-    fn remove_book(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+    fn remove_books(&mut self, ids: Vec<i64>, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.selected_index();
         let title = self.selected_title();
-        let result = self
-            .library
-            .as_mut()
-            .map(|library| library.remove_book(id, true));
-        match result {
-            Some(Ok(())) => {
-                self.clear_selection();
-                self.refresh_all();
-                // Select the neighbour so the keyboard keeps working.
-                if let Some(index) = index {
-                    let next = index.min(self.books.len().saturating_sub(1));
-                    self.select_index(next, window, cx);
-                }
-                self.announce(format!("Removed “{title}”."), Tone::Success, window, cx);
+        let Some(library) = self.library.as_mut() else {
+            self.set_status("Open a library first.", Tone::Info);
+            cx.notify();
+            return;
+        };
+        let mut removed = 0usize;
+        let mut errors = Vec::new();
+        for &id in &ids {
+            match library.trash_book(id) {
+                Ok(()) => removed += 1,
+                Err(err) => errors.push(format!("book {id}: {err}")),
             }
-            Some(Err(err)) => {
-                self.announce(format!("Remove failed: {err}"), Tone::Error, window, cx)
+        }
+        if removed > 0 {
+            self.clear_selection();
+            self.refresh_all();
+            // Select the neighbour so the keyboard keeps working.
+            if let Some(index) = index {
+                let next = index.min(self.books.len().saturating_sub(1));
+                self.click_index(next, false, false, window, cx);
             }
-            None => self.set_status("Open a library first.", Tone::Info),
+        }
+        match (removed, errors.last()) {
+            (_, Some(err)) => self.announce(
+                format!(
+                    "Removed {removed} book(s); {} failed. Last error: {err}",
+                    errors.len()
+                ),
+                Tone::Error,
+                window,
+                cx,
+            ),
+            (1, None) if ids.len() == 1 => {
+                self.announce(format!("Removed “{title}”."), Tone::Success, window, cx)
+            }
+            (_, None) => self.announce(
+                format!("Removed {removed} books."),
+                Tone::Success,
+                window,
+                cx,
+            ),
         }
         cx.notify();
     }
@@ -1636,9 +1772,10 @@ impl CalibreApp {
         if self.sending_to_device {
             return;
         }
-        let Some(id) = self.selected else {
+        let ids = self.selection_ids();
+        if ids.is_empty() {
             return;
-        };
+        }
         let Some(device) = self.devices.get(index).cloned() else {
             self.announce(
                 "No e-reader is connected. Connect one in USB file-transfer mode and rescan.",
@@ -1662,7 +1799,7 @@ impl CalibreApp {
         cx.notify();
         let transfer = cx.background_spawn(async move {
             let library = Library::open(&path)?;
-            device::send(&library, &device, &[id], &SendOptions::default())
+            device::send(&library, &device, &ids, &SendOptions::default())
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = transfer.await;
@@ -1670,6 +1807,21 @@ impl CalibreApp {
                 this.sending_to_device = false;
                 match result {
                     Ok(report) => match (report.sent.first(), report.skipped.first()) {
+                        (Some(_), _) if report.sent.len() + report.skipped.len() > 1 => this
+                            .announce(
+                                format!(
+                                    "Sent {} book(s) to {device_name}; {} skipped.",
+                                    report.sent.len(),
+                                    report.skipped.len()
+                                ),
+                                if report.skipped.is_empty() {
+                                    Tone::Success
+                                } else {
+                                    Tone::Info
+                                },
+                                window,
+                                cx,
+                            ),
                         (Some(sent), _) => this.announce(
                             format!(
                                 "Sent “{}” ({}) to {device_name}.",
@@ -2660,7 +2812,7 @@ impl CalibreApp {
                 this.settings_changed(cx);
             }))
             .on_action(cx.listener(|this, _: &ExportSelected, window, cx| {
-                let ids = this.selected.into_iter().collect();
+                let ids = this.selection_ids();
                 this.prompt_export(ids, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ExportAll, window, cx| {
@@ -2788,12 +2940,17 @@ impl CalibreApp {
                     this.move_selection(1, window, cx);
                 }
             }))
-            .on_action(
-                cx.listener(|this, _: &SelectFirst, window, cx| this.select_index(0, window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &SelectFirst, window, cx| {
+                this.click_index(0, false, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
+                if this.screen == Screen::Library {
+                    this.select_all(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SelectLast, window, cx| {
                 let last = this.books.len().saturating_sub(1);
-                this.select_index(last, window, cx);
+                this.click_index(last, false, false, window, cx);
             }))
             // Reader
             .on_action(cx.listener(|this, _: &PreviousChapter, _, cx| this.step_chapter(-1, cx)))

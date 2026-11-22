@@ -7,7 +7,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cr_core::device::{self, Device, SendOptions};
-use cr_core::library::{BookSort, BookUpdate, Library, ListOptions};
+use cr_core::jobs::JobContext;
+use cr_core::library::{
+    filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, Collision,
+    DuplicatePolicy, ExportOptions, ImportOptions, Library, ListOptions, SearchReplace, TextField,
+};
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
 use cr_core::text::{self, split_authors};
 use cr_core::Chapter;
@@ -43,7 +47,59 @@ enum Command {
         path: Option<PathBuf>,
     },
     /// Add ebook files to the library
-    Add { files: Vec<PathBuf> },
+    Add {
+        /// Files, or folders to scan for books
+        files: Vec<PathBuf>,
+        /// Scan folders recursively
+        #[arg(short, long)]
+        recursive: bool,
+        /// When a book with the same title and authors exists: add, skip or merge
+        #[arg(long, default_value = "add")]
+        duplicates: String,
+        /// Read metadata from file names with a regex using the named groups
+        /// title, author, series and series_index
+        #[arg(long)]
+        filename_pattern: Option<String>,
+        /// Create a record without a file, using this title
+        #[arg(long, conflicts_with = "files")]
+        empty: Option<String>,
+    },
+    /// Attach a file to a book as another format
+    AddFormat {
+        id: i64,
+        file: PathBuf,
+        /// Replace the format if the book already has it
+        #[arg(long)]
+        replace: bool,
+    },
+    /// Remove one format from a book (the file goes to the trash)
+    RemoveFormat { id: i64, format: String },
+    /// List, restore or permanently delete removed books
+    Trash {
+        /// list, restore or empty
+        #[arg(default_value = "list")]
+        action: String,
+        /// Books to restore, or to delete permanently with `empty`
+        ids: Vec<i64>,
+        /// With `restore`: put this removed format back on the book
+        #[arg(long)]
+        format: Option<String>,
+    },
+    /// Apply one metadata change to many books
+    Bulk(BulkArgs),
+    /// Copy or move books into another library
+    Copy {
+        ids: Vec<i64>,
+        /// The other library's directory
+        #[arg(long)]
+        to: PathBuf,
+        /// Move instead of copy: the books go to this library's trash
+        #[arg(long = "move")]
+        remove_source: bool,
+        /// When the book exists in the other library: add, skip or merge
+        #[arg(long, default_value = "skip")]
+        duplicates: String,
+    },
     /// List or search books
     List {
         /// Search query, e.g. `author:tolkien tag:fantasy dune`
@@ -66,9 +122,10 @@ enum Command {
     #[command(name = "rm", alias = "remove")]
     Remove {
         ids: Vec<i64>,
-        /// Also delete the book directories and files
-        #[arg(long)]
-        delete_files: bool,
+        /// Delete the books and their files for good instead of moving them
+        /// to the trash
+        #[arg(long, alias = "delete-files")]
+        permanent: bool,
     },
     /// List the formats stored for a book
     Formats { id: i64 },
@@ -138,9 +195,18 @@ enum Command {
         /// Path template ({author_sort}/{title} ({id})/{title} - {author})
         #[arg(long, default_value = DEFAULT_TEMPLATE)]
         template: String,
-        /// Only export this format
+        /// Only export these formats (repeat or comma-separate)
         #[arg(long)]
-        format: Option<String>,
+        format: Vec<String>,
+        /// Also write the cover as a .jpg
+        #[arg(long)]
+        cover: bool,
+        /// Also write the metadata as an .opf
+        #[arg(long)]
+        opf: bool,
+        /// When a file exists: rename, overwrite or skip
+        #[arg(long, default_value = "rename")]
+        collision: String,
     },
     /// List connected e-readers
     Devices,
@@ -159,6 +225,54 @@ enum Command {
     },
     /// Show library statistics
     Info,
+}
+
+#[derive(Debug, Args)]
+struct BulkArgs {
+    /// Books to change (default: every book matching --query)
+    ids: Vec<i64>,
+    /// Select books with a search query instead of ids
+    #[arg(long)]
+    query: Option<String>,
+    #[arg(long = "add-tag")]
+    add_tags: Vec<String>,
+    #[arg(long = "remove-tag")]
+    remove_tags: Vec<String>,
+    #[arg(long)]
+    clear_tags: bool,
+    /// Replace the authors (separate several with &)
+    #[arg(long)]
+    authors: Option<String>,
+    /// Set the publisher (empty clears it)
+    #[arg(long)]
+    publisher: Option<String>,
+    /// Set the series (empty clears it)
+    #[arg(long)]
+    series: Option<String>,
+    /// Number the books in the given order, starting here
+    #[arg(long)]
+    series_start: Option<f64>,
+    /// Set the rating in stars, 0-5 (0 clears it)
+    #[arg(long)]
+    stars: Option<u8>,
+    /// Search and replace in a field: title, authors, publisher, series, tags, comments
+    #[arg(long, requires = "search")]
+    field: Option<String>,
+    #[arg(long, requires = "field")]
+    search: Option<String>,
+    #[arg(long, default_value = "")]
+    replace: String,
+    /// Treat --search as a regular expression
+    #[arg(long)]
+    regex: bool,
+    #[arg(long)]
+    ignore_case: bool,
+    /// Copy one field into another, e.g. `series:tags`
+    #[arg(long)]
+    copy: Option<String>,
+    /// Show the changes without saving them
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Args)]
@@ -266,15 +380,35 @@ fn run(cli: Cli) -> Result<()> {
                 println!("Created library at {}", path.display());
             }
         }
-        Command::Add { files } => {
+        Command::Add {
+            files,
+            recursive,
+            duplicates,
+            filename_pattern: pattern,
+            empty,
+        } => {
+            let mut library = Library::open(&library_path)?;
+            if let Some(title) = empty {
+                let added = library.add_empty(Metadata::new(title))?;
+                println!("#{}\t{}", added.id, added.title);
+                return Ok(());
+            }
             if files.is_empty() {
                 bail!("no files given");
             }
-            let mut library = Library::open(&library_path)?;
+            let options = ImportOptions {
+                duplicates: parse_duplicates(&duplicates)?,
+                filename_pattern: pattern.as_deref().map(filename_pattern).transpose()?,
+            };
+            let sources = scan_sources(&files, recursive);
+            if sources.is_empty() {
+                bail!("no book files found");
+            }
             let mut failures = 0usize;
-            for file in &files {
-                match library.add_book(file) {
-                    Ok(added) => {
+            for item in library.import_books(&sources, &options, &JobContext::detached()) {
+                let file = item.item.display().to_string();
+                match item.result {
+                    Ok(AddOutcome::Added(added)) => {
                         if cli.json {
                             println!(
                                 "{}",
@@ -290,14 +424,145 @@ fn run(cli: Cli) -> Result<()> {
                             println!("#{}\t{}", added.id, added.title);
                         }
                     }
+                    Ok(AddOutcome::Merged { id, format, added }) => {
+                        if cli.json {
+                            println!("{}", json!({"id": id, "merged": format, "added": added}));
+                        } else if added {
+                            println!("#{id}\t+{format}\t{file}");
+                        } else {
+                            println!("#{id}\talready has {format}\t{file}");
+                        }
+                    }
+                    Ok(AddOutcome::Skipped { existing }) => {
+                        if cli.json {
+                            println!("{}", json!({"skipped": file, "existing": existing}));
+                        } else {
+                            println!("skipped\t{file}\t(same as #{})", existing[0]);
+                        }
+                    }
                     Err(err) => {
                         failures += 1;
-                        eprintln!("{}: {err}", file.display());
+                        eprintln!("{file}: {err}");
                     }
                 }
             }
             if failures > 0 {
-                bail!("{failures} file(s) failed to import");
+                bail!("{failures} file(s) could not be added");
+            }
+        }
+        Command::AddFormat { id, file, replace } => {
+            let mut library = Library::open(&library_path)?;
+            if library.add_format(id, &file, replace)? {
+                println!("#{id} now has {}", library.formats(id)?.join(", "));
+            } else {
+                bail!("book {id} already has that format; pass --replace to overwrite it");
+            }
+        }
+        Command::RemoveFormat { id, format } => {
+            let mut library = Library::open(&library_path)?;
+            library.remove_format(id, &format)?;
+            println!("Removed {} from #{id}", format.to_ascii_uppercase());
+        }
+        Command::Trash {
+            action,
+            ids,
+            format,
+        } => {
+            let mut library = Library::open(&library_path)?;
+            match action.as_str() {
+                "list" => {
+                    let entries = library.list_trash()?;
+                    if cli.json {
+                        print_json(&json!(entries
+                            .iter()
+                            .map(|entry| json!({
+                                "id": entry.id,
+                                "book": entry.is_book,
+                                "title": entry.title,
+                                "authors": entry.authors,
+                                "formats": entry.formats,
+                            }))
+                            .collect::<Vec<_>>()))?;
+                        return Ok(());
+                    }
+                    if entries.is_empty() {
+                        println!("The trash is empty.");
+                    }
+                    for entry in entries {
+                        let kind = if entry.is_book { "book" } else { "format" };
+                        println!(
+                            "#{}\t{kind}\t{}\t{}",
+                            entry.id,
+                            entry.formats.join(","),
+                            entry.title
+                        );
+                    }
+                }
+                "restore" => {
+                    if ids.is_empty() {
+                        bail!("no book ids given");
+                    }
+                    for id in ids {
+                        if let Some(format) = &format {
+                            library.restore_format(id, format)?;
+                            println!("Restored {} of #{id}", format.to_ascii_uppercase());
+                            continue;
+                        }
+                        let restored = library.restore_book(id)?;
+                        println!("Restored #{}\t{}", restored.id, restored.title);
+                    }
+                }
+                "empty" => {
+                    let mut removed = 0;
+                    if ids.is_empty() {
+                        removed = library.purge_trash(None)?;
+                    }
+                    for id in ids {
+                        removed += library.purge_trash(Some(id))?;
+                    }
+                    println!("Deleted {removed} item(s) from the trash.");
+                }
+                other => bail!("unknown trash action `{other}` (use list, restore or empty)"),
+            }
+        }
+        Command::Bulk(args) => bulk_edit(&library_path, args)?,
+        Command::Copy {
+            ids,
+            to,
+            remove_source,
+            duplicates,
+        } => {
+            if ids.is_empty() {
+                bail!("no book ids given");
+            }
+            let mut library = Library::open(&library_path)?;
+            let mut target = Library::open(&to)?;
+            let policy = parse_duplicates(&duplicates)?;
+            let mut failures = 0usize;
+            let results = library.transfer_books(
+                &ids,
+                &mut target,
+                policy,
+                remove_source,
+                &JobContext::detached(),
+            );
+            for item in results {
+                match item.result {
+                    Ok(AddOutcome::Added(added)) => println!("#{} -> #{}", item.item, added.id),
+                    Ok(AddOutcome::Merged { id, .. }) => {
+                        println!("#{} merged into #{id}", item.item)
+                    }
+                    Ok(AddOutcome::Skipped { existing }) => {
+                        println!("#{} skipped (same as #{})", item.item, existing[0])
+                    }
+                    Err(err) => {
+                        failures += 1;
+                        eprintln!("#{}: {err}", item.item);
+                    }
+                }
+            }
+            if failures > 0 {
+                bail!("{failures} book(s) could not be copied");
             }
         }
         Command::List {
@@ -353,14 +618,21 @@ fn run(cli: Cli) -> Result<()> {
             let mut library = Library::open(&library_path)?;
             edit_metadata(&mut library, args, cli.json)?;
         }
-        Command::Remove { ids, delete_files } => {
+        Command::Remove { ids, permanent } => {
             if ids.is_empty() {
                 bail!("no book ids given");
             }
             let mut library = Library::open(&library_path)?;
             for id in ids {
-                library.remove_book(id, delete_files)?;
-                println!("Removed #{id}");
+                if permanent {
+                    library.remove_book(id, true)?;
+                    println!("Removed #{id} permanently");
+                } else {
+                    library.trash_book(id)?;
+                    println!(
+                        "Removed #{id} (in the trash; `cr trash restore {id}` brings it back)"
+                    );
+                }
             }
         }
         Command::Formats { id } => {
@@ -422,12 +694,26 @@ fn run(cli: Cli) -> Result<()> {
             destination,
             template,
             format,
+            cover,
+            opf,
+            collision,
         } => {
             if ids.is_empty() {
                 bail!("no book ids given");
             }
             let library = Library::open(&library_path)?;
-            let written = library.export_books(&ids, &destination, &template, format.as_deref())?;
+            let options = ExportOptions {
+                template,
+                formats: split_list(&format),
+                cover,
+                opf,
+                collision: Collision::parse(&collision)
+                    .with_context(|| format!("unknown --collision `{collision}`"))?,
+            };
+            let mut written = Vec::new();
+            for id in ids {
+                written.extend(library.export_book(id, &destination, &options)?);
+            }
             if written.is_empty() {
                 println!("Nothing to export.");
             }
@@ -543,6 +829,121 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_duplicates(value: &str) -> Result<DuplicatePolicy> {
+    DuplicatePolicy::parse(value)
+        .with_context(|| format!("unknown --duplicates `{value}` (use add, skip or merge)"))
+}
+
+fn bulk_edit(library_path: &Path, args: BulkArgs) -> Result<()> {
+    let mut library = Library::open(library_path)?;
+    let ids: Vec<i64> = match (&args.query, args.ids.is_empty()) {
+        (Some(query), true) => library
+            .list_books(&ListOptions {
+                query: Some(query.clone()),
+                ..Default::default()
+            })?
+            .iter()
+            .map(|book| book.id)
+            .collect(),
+        (None, false) => args.ids.clone(),
+        (Some(_), false) => bail!("give book ids or --query, not both"),
+        (None, true) => bail!("no book ids or --query given"),
+    };
+    let field =
+        |name: &str| TextField::parse(name).with_context(|| format!("unknown field `{name}`"));
+    let optional = |value: String| Some(value.trim().to_string()).filter(|v| !v.is_empty());
+    let edit = BulkEdit {
+        authors: args.authors.as_deref().map(split_authors),
+        publisher: args.publisher.map(optional),
+        series: args.series.map(optional),
+        series_start: args.series_start,
+        rating: args
+            .stars
+            .map(|stars| (stars > 0).then_some(stars.min(5) * 2)),
+        languages: None,
+        clear_tags: args.clear_tags,
+        remove_tags: split_list(&args.remove_tags),
+        add_tags: split_list(&args.add_tags),
+        copy: match &args.copy {
+            Some(pair) => {
+                let (from, to) = pair
+                    .split_once(':')
+                    .context("--copy takes `from:to`, e.g. series:tags")?;
+                Some((field(from)?, field(to)?))
+            }
+            None => None,
+        },
+        replace: match (&args.field, args.search) {
+            (Some(name), Some(pattern)) => Some(SearchReplace {
+                field: field(name)?,
+                pattern,
+                replacement: args.replace,
+                regex: args.regex,
+                ignore_case: args.ignore_case,
+            }),
+            _ => None,
+        },
+    };
+    if args.dry_run {
+        for (position, &id) in ids.iter().enumerate() {
+            let patch = library.bulk_patch(id, position, &edit)?;
+            if patch != BookUpdate::default() {
+                println!("#{id}\t{}", describe_patch(&patch));
+            }
+        }
+        return Ok(());
+    }
+    let mut changed = 0usize;
+    let mut failures = 0usize;
+    for item in library.bulk_update(&ids, &edit, &JobContext::detached()) {
+        match item.result {
+            Ok(true) => changed += 1,
+            Ok(false) => {}
+            Err(err) => {
+                failures += 1;
+                eprintln!("#{}: {err}", item.item);
+            }
+        }
+    }
+    println!("Changed {changed} of {} book(s).", ids.len());
+    if failures > 0 {
+        bail!("{failures} book(s) could not be changed");
+    }
+    Ok(())
+}
+
+fn describe_patch(patch: &BookUpdate) -> String {
+    let mut parts = Vec::new();
+    if let Some(title) = &patch.title {
+        parts.push(format!("title={title}"));
+    }
+    if let Some(authors) = &patch.authors {
+        parts.push(format!("authors={}", authors.join(" & ")));
+    }
+    if let Some(publisher) = &patch.publisher {
+        parts.push(format!(
+            "publisher={}",
+            publisher.clone().unwrap_or_default()
+        ));
+    }
+    if let Some(series) = &patch.series {
+        parts.push(format!("series={}", series.clone().unwrap_or_default()));
+    }
+    if let Some(index) = patch.series_index {
+        parts.push(format!("series_index={index}"));
+    }
+    if let Some(tags) = &patch.tags {
+        parts.push(format!("tags={}", tags.join(", ")));
+    }
+    if let Some(rating) = &patch.rating {
+        parts.push(format!("stars={}", rating.unwrap_or(0) / 2));
+    }
+    if patch.comments.is_some() {
+        parts.push("comments".to_string());
+    }
+    parts.join("; ")
 }
 
 fn edit_metadata(library: &mut Library, args: SetArgs, json: bool) -> Result<()> {

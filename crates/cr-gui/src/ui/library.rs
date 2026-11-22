@@ -374,7 +374,7 @@ fn list_row(
     cx: &mut Context<CalibreApp>,
 ) -> AnyElement {
     let theme = cx.theme().clone();
-    let selected = app.selected == Some(book.id);
+    let selected = app.is_marked(book.id);
     let focused = app.list_focus.is_focused(window);
     let authors = if book.authors.is_empty() {
         "Unknown author".to_string()
@@ -466,7 +466,7 @@ fn book_grid(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         .iter()
         .enumerate()
         .map(|(index, book)| {
-            let selected = app.selected == Some(book.id);
+            let selected = app.is_marked(book.id);
             let authors = if book.authors.is_empty() {
                 "Unknown author".to_string()
             } else {
@@ -560,7 +560,9 @@ fn book_interactions(
         .cursor_pointer()
         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
             window.focus(&this.list_focus, cx);
-            this.select_index(index, window, cx);
+            let modifiers = event.modifiers();
+            let toggle = modifiers.control || modifiers.platform;
+            this.click_index(index, toggle, modifiers.shift, window, cx);
             if event.click_count() == 2 {
                 this.start_reading(window, cx);
             }
@@ -569,7 +571,10 @@ fn book_interactions(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                 window.focus(&this.list_focus, cx);
-                this.select_index(index, window, cx);
+                let inside = this.books.get(index).is_some_and(|b| this.is_marked(b.id));
+                if !inside {
+                    this.click_index(index, false, false, window, cx);
+                }
                 book_context_menu(this).show(event.position, window, cx);
             }),
         )

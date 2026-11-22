@@ -42,9 +42,20 @@ benchmark is on the roadmap.
 
 - Create and open **calibre-compatible** libraries (`metadata.db`, schema
   version 28, the same triggers and application id).
-- Add books, remove books (optionally deleting files), list, search, and show
-  library statistics.
-- Export books with a path template.
+- Add books, list, search, and show library statistics.
+- Import folders recursively, read metadata from file names with a pattern,
+  create empty records, and choose what happens to duplicates: add, skip, or
+  merge the file into the existing book as another format.
+- Add, replace and remove individual formats of a book.
+- Removed books and formats go to calibre's `.caltrash` folder and can be
+  restored (with the same id) or deleted for good.
+- Bulk metadata edits: add/remove/clear tags, set authors, publisher, series
+  and rating, number a series, search and replace (plain or regex), copy one
+  field into another, with a dry-run preview.
+- Copy or move books between libraries with their formats, cover, metadata
+  and extra `data/` files.
+- Export books with a path template, selected formats, optional cover and
+  OPF, and a rename/overwrite/skip rule for existing files.
 - Book directories use calibre's layout: `First Author/Title (id)/`.
 - Each book gets `metadata.opf` and, when available, `cover.jpg`.
 - Format files use calibre's `Title - Author.ext` naming.
@@ -134,7 +145,11 @@ beginning of the "Edit book" workflow; calibre's full editor UI is not there yet
   languages, publication date and multi-line comments) with validation;
 - cover replacement and interactive cover cropping: drag the crop box and
   corner handles, or use the 2:3, 1:1 and 3:4 presets;
-- export the selected book, or the current filtered library, to a folder
+- multi-selection (Ctrl/Cmd-click, Shift-click, select all) with batch
+  remove, export and send;
+- adding a file whose title and authors match an existing book attaches it
+  to that book as another format;
+- export the selected books, or the current filtered library, to a folder
   picker using the same path template as `cr export`;
 - a basic EPUB source editor: unpack, edit XHTML/CSS/OPF files, save changes
   and repack into the library, with a save/discard prompt when closing;
@@ -204,6 +219,10 @@ cr init ~/Calibre\ Library
 
 # Import books
 cr add ~/Downloads/*.epub
+cr add -r ~/Books --duplicates merge     # EPUB + AZW3 of one book -> one record
+cr add ~/scans --filename-pattern '(?P<author>.+) - (?P<title>.+)'
+cr add-format 12 book.azw3
+cr remove-format 12 azw3
 
 # Browse and search
 cr list
@@ -214,6 +233,17 @@ cr list --sort series --limit 20
 cr show 12
 cr set 12 --author "Ursula K. Le Guin" --tag "Fantasy,Classic" \
           --series "Earthsea" --series-index 2 --stars 5
+
+# Change many books at once
+cr bulk 3 4 5 --series "Dune" --series-start 1 --add-tag sf
+cr bulk --query "tag:scifi" --remove-tag scifi --add-tag sf --dry-run
+cr bulk 7 8 --field title --search '^The ' --replace '' --regex
+
+# Remove, restore, and move between libraries
+cr rm 12                 # to the trash; --permanent deletes
+cr trash
+cr trash restore 12
+cr copy 3 4 --to ~/Other\ Library --move
 
 # Read
 cr read 12 --list
@@ -230,7 +260,7 @@ cr edit 12 --extract ./book-12
 cr edit 12 --pack ./book-12 --output ./book-12.epub
 
 # Export and send
-cr export 12 --to ~/exports
+cr export 12 --to ~/exports --format epub --cover --opf --collision skip
 cr devices
 cr send 12 --device /media/$USER/Kindle
 # With one connected device, the mount path or MTP identifier is optional.
@@ -317,7 +347,8 @@ The engine covers the core; the surrounding calibre product is much larger.
 Currently missing:
 
 - **GUI polish** — the GPUI front end has a basic text-based EPUB editor, but
-  no visual editor, bulk metadata actions or cover-generation tools yet.
+  no visual editor, bulk metadata dialog, trash browser or cover-generation
+  tools yet (bulk edits, trash and library transfers are CLI-only).
 - Format conversion outside the EPUB and Kindle paths above.
 - PDF metadata and text extraction.
 - calibre's plugin system, content server/OPDS, annotations, full-text search,
