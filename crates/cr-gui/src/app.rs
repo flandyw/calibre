@@ -191,6 +191,8 @@ pub struct RunningJob {
 pub struct CalibreApp {
     pub settings: Settings,
     pub job: Option<RunningJob>,
+    /// Close or quit requested while a job was running; done once it stops.
+    close_after_job: Option<AfterResolve>,
     pub library: Option<Library>,
     pub devices: Vec<Device>,
     pub scanning_devices: bool,
@@ -330,6 +332,7 @@ impl CalibreApp {
         let mut app = Self {
             settings,
             job: None,
+            close_after_job: None,
             library: None,
             devices: Vec::new(),
             scanning_devices: false,
@@ -459,7 +462,14 @@ impl CalibreApp {
             return;
         }
         let label = label.into();
-        let mut handle = jobs::spawn(label.clone(), body);
+        let mut handle = match jobs::spawn(label.clone(), body) {
+            Ok(handle) => handle,
+            Err(err) => {
+                finish(self, Err(err), window, cx);
+                cx.notify();
+                return;
+            }
+        };
         self.job = Some(RunningJob {
             label,
             progress: Progress::default(),
@@ -491,6 +501,15 @@ impl CalibreApp {
                 this.job = None;
                 finish(this, result, window, cx);
                 cx.notify();
+                match this.close_after_job.take() {
+                    Some(AfterResolve::CloseWindow) => {
+                        if this.window_should_close(window, cx) {
+                            window.remove_window();
+                        }
+                    }
+                    Some(AfterResolve::Quit) => this.request_quit(window, cx),
+                    None => {}
+                }
             })
             .ok();
         })
@@ -2480,7 +2499,21 @@ impl CalibreApp {
     // Closing and quitting
     // ---------------------------------------------------------------------
 
+    /// Lets a running job stop at a safe point before the app exits, so no
+    /// half-added book is left on disk.
+    fn defer_until_job_stops(&mut self, then: AfterResolve, cx: &mut Context<Self>) -> bool {
+        if self.job.is_none() {
+            return false;
+        }
+        self.close_after_job = Some(then);
+        self.cancel_job(cx);
+        true
+    }
+
     fn window_should_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.defer_until_job_stops(AfterResolve::CloseWindow, cx) {
+            return false;
+        }
         if self.has_unsaved_changes() {
             self.resolve_unsaved(AfterResolve::CloseWindow, window, cx);
             return false;
@@ -2491,6 +2524,9 @@ impl CalibreApp {
     }
 
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.defer_until_job_stops(AfterResolve::Quit, cx) {
+            return;
+        }
         if self.has_unsaved_changes() {
             self.resolve_unsaved(AfterResolve::Quit, window, cx);
             return;

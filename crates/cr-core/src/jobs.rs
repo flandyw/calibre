@@ -85,7 +85,7 @@ pub struct JobHandle<T> {
     cancel: Arc<AtomicBool>,
     progress: Receiver<Progress>,
     latest: Progress,
-    thread: Option<JoinHandle<Result<T>>>,
+    thread: JoinHandle<Result<T>>,
 }
 
 impl<T> JobHandle<T> {
@@ -107,22 +107,19 @@ impl<T> JobHandle<T> {
     }
 
     pub fn is_finished(&self) -> bool {
-        self.thread.as_ref().is_none_or(JoinHandle::is_finished)
+        self.thread.is_finished()
     }
 
     /// Block until the job ends and return its result.
-    pub fn join(mut self) -> Result<T> {
-        match self.thread.take() {
-            Some(thread) => thread
-                .join()
-                .unwrap_or_else(|_| Err(Error::Other(format!("job `{}` panicked", self.name)))),
-            None => Err(Error::Other(format!("job `{}` already joined", self.name))),
-        }
+    pub fn join(self) -> Result<T> {
+        self.thread
+            .join()
+            .unwrap_or_else(|_| Err(Error::Other(format!("job `{}` panicked", self.name))))
     }
 }
 
-/// Run `body` on a background thread.
-pub fn spawn<T, F>(name: impl Into<String>, body: F) -> JobHandle<T>
+/// Run `body` on a background thread. Fails when the thread cannot start.
+pub fn spawn<T, F>(name: impl Into<String>, body: F) -> Result<JobHandle<T>>
 where
     T: Send + 'static,
     F: FnOnce(&JobContext) -> Result<T> + Send + 'static,
@@ -136,18 +133,14 @@ where
     };
     let thread = std::thread::Builder::new()
         .name(name.clone())
-        .spawn(move || body(&context));
-    let thread = match thread {
-        Ok(thread) => Some(thread),
-        Err(_) => None,
-    };
-    JobHandle {
+        .spawn(move || body(&context))?;
+    Ok(JobHandle {
         name,
         cancel,
         progress: receiver,
         latest: Progress::default(),
         thread,
-    }
+    })
 }
 
 /// The outcome of one item in a batch: the batch keeps going past failures.
@@ -192,7 +185,8 @@ mod tests {
                 .into_iter()
                 .filter_map(|r| r.result.ok())
                 .sum::<i32>())
-        });
+        })
+        .unwrap();
         while !job.is_finished() {
             std::thread::yield_now();
         }
@@ -220,7 +214,8 @@ mod tests {
                 },
             )
             .len())
-        });
+        })
+        .unwrap();
         wait.recv().unwrap();
         job.cancel();
         resume.send(()).unwrap();
