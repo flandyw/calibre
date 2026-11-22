@@ -895,7 +895,7 @@ pub struct TrashEntry {
 }
 
 /// Format files directly inside a directory, as `(FORMAT, path)`.
-fn format_files(directory: &Path) -> Vec<(String, PathBuf)> {
+pub(super) fn format_files(directory: &Path) -> Vec<(String, PathBuf)> {
     let Ok(children) = fs::read_dir(directory) else {
         return Vec::new();
     };

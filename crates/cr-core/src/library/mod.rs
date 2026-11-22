@@ -25,12 +25,14 @@ use crate::text;
 
 mod edit;
 mod fts;
+mod maintain;
 mod manage;
 mod organize;
 mod reading;
 mod search;
 pub use edit::*;
 pub use fts::*;
+pub use maintain::*;
 pub use manage::*;
 pub use organize::*;
 pub use reading::*;

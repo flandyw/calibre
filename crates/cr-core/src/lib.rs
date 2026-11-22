@@ -22,6 +22,7 @@ pub mod jobs;
 pub mod library;
 pub mod metadata;
 pub mod opf;
+pub mod server;
 pub mod text;
 pub mod xml;
 

@@ -17,6 +17,7 @@ use cr_core::library::{
     TextField,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
+use cr_core::server::{Server, ServerOptions};
 use cr_core::text::{self, split_authors};
 use cr_core::Chapter;
 use serde_json::{json, Value};
@@ -163,7 +164,7 @@ enum Command {
     },
     /// Write a catalog of the library (or of a search) as CSV or JSON
     Catalog {
-        /// Output file ending in .csv or .json (`-` prints CSV)
+        /// Output file ending in .csv, .json, .xml, .bib or .epub (`-` prints CSV)
         output: PathBuf,
         /// Only include books matching this search
         query: Vec<String>,
@@ -380,6 +381,23 @@ enum Command {
         #[arg(long)]
         device: Option<PathBuf>,
     },
+    /// Serve the library to browsers and OPDS reading apps (read-only)
+    Serve {
+        /// Address and port to listen on
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: String,
+        /// Require this user name; the password is read from CR_SERVER_PASSWORD
+        #[arg(long)]
+        user: Option<String>,
+    },
+    /// Check the library's files against its database
+    Check {
+        /// Fix what can be fixed without deleting any book file
+        #[arg(long)]
+        repair: bool,
+    },
+    /// Rebuild a lost or damaged metadata.db from the metadata.opf files
+    RestoreDb,
     /// Show library statistics
     Info,
 }
@@ -897,8 +915,23 @@ fn run(cli: Cli) -> Result<()> {
         Command::Catalog { output, query } => {
             let library = Library::open(&library_path)?;
             let extension = output.extension().and_then(|e| e.to_str()).unwrap_or("csv");
+            if extension.eq_ignore_ascii_case("epub") {
+                // Written beside the target and renamed, so a failure leaves nothing.
+                let parent = output
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let mut file = tempfile::NamedTempFile::new_in(parent)?;
+                library.catalog_epub(&query.join(" "), file.as_file_mut())?;
+                file.persist(&output)
+                    .with_context(|| format!("cannot write {}", output.display()))?;
+                println!("Wrote {}", output.display());
+                return Ok(());
+            }
             let format = CatalogFormat::parse(extension).ok_or_else(|| {
-                anyhow!("unknown catalog type `.{extension}` (use .csv or .json)")
+                anyhow!(
+                    "unknown catalog type `.{extension}` (use .csv, .json, .xml, .bib or .epub)"
+                )
             })?;
             let catalog = library.catalog(&query.join(" "), format)?;
             if output.as_os_str() == "-" {
@@ -1459,6 +1492,70 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 other => bail!("unknown action {other}; use books, rm or status"),
+            }
+        }
+        Command::Serve { bind, user } => {
+            let credentials = match user {
+                Some(user) => {
+                    let password = std::env::var("CR_SERVER_PASSWORD")
+                        .ok()
+                        .filter(|password| !password.is_empty())
+                        .ok_or_else(|| anyhow!("--user needs a password in CR_SERVER_PASSWORD"))?;
+                    Some((user, password))
+                }
+                None => None,
+            };
+            let open = credentials.is_none();
+            let server = Server::bind(&library_path, &ServerOptions { bind, credentials })?;
+            let address = server.local_addr()?;
+            println!("Serving {} at http://{address}/", library_path.display());
+            println!("OPDS catalog: http://{address}/opds");
+            if open && !address.ip().is_loopback() {
+                eprintln!(
+                    "warning: anyone who can reach {address} can read and download this library. Use --user."
+                );
+            }
+            server.run()?;
+        }
+        Command::Check { repair } => {
+            let mut library = Library::open(&library_path)?;
+            let problems = library.check()?;
+            if cli.json {
+                print_json(&json!(problems
+                    .iter()
+                    .map(|problem| json!({
+                        "problem": problem.describe(),
+                        "repairable": problem.repairable(),
+                    }))
+                    .collect::<Vec<_>>()))?;
+            } else if problems.is_empty() {
+                println!("No problems found.");
+            } else {
+                for problem in &problems {
+                    println!("{}", problem.describe());
+                }
+            }
+            if repair {
+                let fixed = library.repair(&problems)?;
+                let left = library.check()?.len();
+                eprintln!("Repaired {fixed}; {left} problem(s) need attention by hand.");
+            } else if !problems.is_empty() {
+                let repairable = problems.iter().filter(|p| p.repairable()).count();
+                eprintln!(
+                    "{} problem(s), {repairable} repairable with --repair.",
+                    problems.len()
+                );
+                std::process::exit(1);
+            }
+        }
+        Command::RestoreDb => {
+            let (_, report) = Library::rebuild(&library_path)?;
+            println!("Restored {} book(s).", report.restored);
+            if let Some(backup) = &report.backup {
+                println!("Previous database kept at {}", backup.display());
+            }
+            for (folder, reason) in &report.failed {
+                eprintln!("not restored: {folder}: {reason}");
             }
         }
         Command::Info => {
