@@ -1,6 +1,7 @@
 //! Ebook format detection, metadata import and text extraction.
 
 mod conversion;
+mod documents;
 pub mod epub;
 pub mod fb2;
 pub mod html;
@@ -101,16 +102,30 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
         return Err(Error::Other(format!("not a file: {}", path.display())));
     }
     let format = detect_format(path);
-    let (mut metadata, cover) = match format.as_str() {
-        "EPUB" => epub::metadata(path)?,
-        "FB2" => fb2::read(path)?,
-        "TXT" => (txt::metadata(path), None),
-        "HTML" => (html_metadata(path)?, None),
-        "AZW3" | "AZW" | "MOBI" | "PRC" => {
-            mobi::metadata(path).unwrap_or_else(|_| (txt::filename_metadata(path), None))
-        }
-        _ => (txt::filename_metadata(path), None),
-    };
+    let (mut metadata, cover) =
+        match format.as_str() {
+            "EPUB" => epub::metadata(path)?,
+            "FB2" => fb2::read(path)?,
+            "TXT" => (txt::metadata(path), None),
+            "HTML" => (html_metadata(path)?, None),
+            "AZW3" | "AZW" | "MOBI" | "PRC" => {
+                mobi::metadata(path).unwrap_or_else(|_| (txt::filename_metadata(path), None))
+            }
+            // A file that cannot be parsed is still worth storing.
+            "DOCX" => documents::docx_metadata(path)
+                .unwrap_or_else(|_| (txt::filename_metadata(path), None)),
+            "CBZ" => documents::cbz_metadata(path)
+                .unwrap_or_else(|_| (txt::filename_metadata(path), None)),
+            "RTF" => (
+                documents::rtf_metadata(path).unwrap_or_else(|_| txt::filename_metadata(path)),
+                None,
+            ),
+            "PDF" => (
+                documents::pdf_metadata(path).unwrap_or_else(|_| txt::filename_metadata(path)),
+                None,
+            ),
+            _ => (txt::filename_metadata(path), None),
+        };
     metadata.format = Some(format.clone());
     if metadata.uuid.is_none() {
         metadata.uuid = Some(uuid::Uuid::new_v4().to_string());
@@ -137,6 +152,8 @@ pub fn extract_text(path: &Path, format: Option<&str>) -> Result<BookText> {
         "TXT" => txt::text(path),
         "HTML" => txt::html_text(path),
         "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC" => mobi::text(path),
+        "DOCX" => documents::docx_text(path),
+        "RTF" => documents::rtf_text(path),
         other => Err(Error::UnsupportedFormat(format!(
             "{other} text extraction is not implemented yet"
         ))),

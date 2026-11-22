@@ -49,8 +49,8 @@ const REQUIRED_TABLES: [&str; 8] = [
     "library_id",
 ];
 /// Formats `read_book` can turn into text, best first.
-pub const READABLE_FORMATS: [&str; 9] = [
-    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "TXT",
+pub const READABLE_FORMATS: [&str; 11] = [
+    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "DOCX", "RTF", "TXT",
 ];
 
 /// Test hook: where an injected failure interrupts a mutation.
