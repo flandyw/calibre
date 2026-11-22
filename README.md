@@ -229,6 +229,36 @@ beginning of the "Edit book" workflow; calibre's full editor UI is not there yet
   tags, rating, identifiers, dates, format and size.
 - `--dry-run` previews without writing.
 
+### Content server
+
+- `cr serve` serves the library read-only over HTTP (default
+  `127.0.0.1:8080`, change with `--bind`): browse, search with the same
+  search syntax, sort, book details, covers and downloads.
+- `/opds` is an OPDS catalog (navigation, paged acquisition feeds and
+  OpenSearch) for reading apps such as KOReader.
+- **Read** opens EPUB, Kindle, FB2, DOCX, HTML, RTF and TXT books in the
+  browser as one page; the browser remembers the position per book. Scripts
+  in a book are blocked by the page's content security policy.
+- `--user NAME` with the password in `CR_SERVER_PASSWORD` requires HTTP Basic
+  authentication. The server speaks plain HTTP: to reach it from another
+  machine, put it behind a reverse proxy that adds TLS.
+- It uses only the standard library's sockets, one thread per connection, up
+  to 32 at a time.
+
+### Catalogs and maintenance
+
+- `cr catalog books.csv|.json|.xml|.bib|.epub [SEARCH]` writes a book list as
+  CSV, JSON, XML, BibTeX or an EPUB grouped by author.
+- `cr check` compares every book's record with its folder: missing folders,
+  format files and covers, wrong sizes, book files and covers the database
+  does not list, missing `metadata.opf`, and folders that belong to no book.
+  `--repair` fixes all but missing and unknown folders; it never deletes a
+  book file.
+- `cr restore-db` rebuilds a lost or damaged `metadata.db` from the
+  `metadata.opf` in each book folder, keeping ids and uuids. The old database
+  is kept as `metadata_pre_restore.db`. Custom columns, saved searches and
+  virtual libraries are not in those files and are not restored.
+
 ### Desktop UI
 
 `crates/cr-gui` is an early GPUI front end built with
@@ -370,6 +400,10 @@ cr edit 12 --pack ./book-12 --output ./book-12.epub
 
 # Export and send
 cr export 12 --to ~/exports --format epub --cover --opf --collision skip
+cr serve --bind 127.0.0.1:8080
+CR_SERVER_PASSWORD=secret cr serve --bind 0.0.0.0:8080 --user ann
+cr catalog books.bib
+cr check --repair
 cr devices
 cr send 12 --device /media/$USER/Kindle
 cr device books

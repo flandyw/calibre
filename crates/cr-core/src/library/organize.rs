@@ -704,6 +704,10 @@ fn custom_column_ddl(id: i64, datatype: &str, normalized: bool) -> String {
 pub enum CatalogFormat {
     Csv,
     Json,
+    Xml,
+    Bibtex,
+    /// An XHTML book list; `catalog_epub` wraps it into an EPUB.
+    Html,
 }
 
 impl CatalogFormat {
@@ -711,6 +715,9 @@ impl CatalogFormat {
         match value.to_ascii_lowercase().as_str() {
             "csv" => Some(Self::Csv),
             "json" => Some(Self::Json),
+            "xml" => Some(Self::Xml),
+            "bib" | "bibtex" => Some(Self::Bibtex),
+            "html" | "xhtml" => Some(Self::Html),
             _ => None,
         }
     }
@@ -784,6 +791,12 @@ impl Library {
         }
         let mut header: Vec<String> = CATALOG_FIELDS.iter().map(|f| f.to_string()).collect();
         header.extend(columns.iter().map(|column| format!("#{}", column.label)));
+        match format {
+            CatalogFormat::Xml => return Ok(catalog_xml(&rows, &header)),
+            CatalogFormat::Bibtex => return Ok(catalog_bibtex(&rows)),
+            CatalogFormat::Html => return Ok(catalog_html(&rows)),
+            CatalogFormat::Csv | CatalogFormat::Json => {}
+        }
         let mut out = header.join(",");
         out.push_str("\r\n");
         for row in &rows {
@@ -807,6 +820,189 @@ impl Library {
         }
         Ok(out)
     }
+}
+
+impl Library {
+    /// Write the catalog as an EPUB: the matching books grouped by author.
+    pub fn catalog_epub(&self, query: &str, output: &mut std::fs::File) -> Result<()> {
+        let document = crate::formats::document::Document {
+            metadata: crate::metadata::Metadata {
+                title: "Library catalog".to_string(),
+                authors: vec!["calibre-rust".to_string()],
+                ..Default::default()
+            },
+            sections: vec![crate::formats::document::Section {
+                title: "Library catalog".to_string(),
+                html: self.catalog(query, CatalogFormat::Html)?,
+            }],
+            ..Default::default()
+        };
+        crate::formats::document::write_epub(&document, output)
+    }
+}
+
+fn items(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Array(items) => items.iter().flat_map(self::items).collect(),
+        other => vec![other.to_string()],
+    }
+}
+
+fn xml_text(text: &str) -> String {
+    // Characters XML 1.0 cannot carry are dropped.
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect();
+    html_escape::encode_double_quoted_attribute(&clean).to_string()
+}
+
+/// One `<record>` per book; a custom column `#label` is `<custom label="...">`.
+fn catalog_xml(rows: &[serde_json::Value], header: &[String]) -> String {
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<calibredb>\n");
+    for row in rows {
+        out.push_str("  <record>\n");
+        for field in header {
+            let values = items(&row[field.as_str()]);
+            if values.is_empty() {
+                continue;
+            }
+            let (open, close) = match field.strip_prefix('#') {
+                Some(label) => (format!("custom label=\"{}\"", xml_text(label)), "custom"),
+                None => (field.clone(), field.as_str()),
+            };
+            if matches!(row[field.as_str()], serde_json::Value::Array(_)) {
+                out.push_str(&format!("    <{open}>"));
+                for value in values {
+                    out.push_str(&format!("<item>{}</item>", xml_text(&value)));
+                }
+                out.push_str(&format!("</{close}>\n"));
+            } else {
+                out.push_str(&format!("    <{open}>{}</{close}>\n", xml_text(&values[0])));
+            }
+        }
+        out.push_str("  </record>\n");
+    }
+    out.push_str("</calibredb>\n");
+    out
+}
+
+fn bibtex_text(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        match c {
+            '{' | '}' | '&' | '%' | '$' | '#' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\\' => out.push_str("\\textbackslash{}"),
+            '~' => out.push_str("\\textasciitilde{}"),
+            '^' => out.push_str("\\textasciicircum{}"),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn catalog_bibtex(rows: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let text = |field: &str| items(&row[field]);
+        let year = text("pubdate")
+            .first()
+            .and_then(|date| date.get(..4).map(str::to_string));
+        // The key must be unique and plain: first author's last word, year, id.
+        let author_key: String = text("authors")
+            .first()
+            .and_then(|author| author.split_whitespace().last().map(str::to_string))
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        out.push_str(&format!(
+            "@book{{{}{}_{},\n",
+            if author_key.is_empty() {
+                "book"
+            } else {
+                &author_key
+            },
+            year.as_deref().unwrap_or(""),
+            row["id"]
+        ));
+        let mut field = |name: &str, value: String| {
+            if !value.is_empty() {
+                out.push_str(&format!("  {name} = {{{}}},\n", bibtex_text(&value)));
+            }
+        };
+        field("title", text("title").join(""));
+        field("author", text("authors").join(" and "));
+        field("publisher", text("publisher").join(""));
+        field("year", year.unwrap_or_default());
+        field("series", text("series").join(""));
+        field("volume", text("series_index").join(""));
+        field("language", text("languages").join(", "));
+        field("keywords", text("tags").join(", "));
+        let isbn = text("identifiers")
+            .iter()
+            .find_map(|identifier| identifier.strip_prefix("isbn:").map(str::to_string));
+        field("isbn", isbn.unwrap_or_default());
+        out.push_str("}\n\n");
+    }
+    out
+}
+
+/// Books grouped by first author, as XHTML body content.
+fn catalog_html(rows: &[serde_json::Value]) -> String {
+    let mut entries: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            let author = items(&row["authors"])
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Unknown".to_string());
+            let mut line = format!("<i>{}</i>", xml_text(&items(&row["title"]).join("")));
+            if let Some(series) = items(&row["series"]).first() {
+                line.push_str(&format!(
+                    " ({} #{})",
+                    xml_text(series),
+                    xml_text(&items(&row["series_index"]).join(""))
+                ));
+            }
+            if let Some(date) = items(&row["pubdate"]).first() {
+                line.push_str(&format!(", {}", xml_text(date.get(..4).unwrap_or(date))));
+            }
+            let formats = items(&row["formats"]);
+            if !formats.is_empty() {
+                line.push_str(&format!(" [{}]", xml_text(&formats.join(", "))));
+            }
+            (author, line)
+        })
+        .collect();
+    entries.sort_by_key(|(author, line)| {
+        (
+            crate::text::author_sort(author).to_lowercase(),
+            line.clone(),
+        )
+    });
+    let mut out = format!("<h1>Library catalog</h1><p>{} book(s)</p>", entries.len());
+    let mut current: Option<&str> = None;
+    for (author, line) in &entries {
+        if current != Some(author.as_str()) {
+            if current.is_some() {
+                out.push_str("</ul>");
+            }
+            out.push_str(&format!("<h2>{}</h2><ul>", xml_text(author)));
+            current = Some(author.as_str());
+        }
+        out.push_str(&format!("<li>{line}</li>"));
+    }
+    if current.is_some() {
+        out.push_str("</ul>");
+    }
+    out
 }
 
 fn csv_cell(value: &str) -> String {
