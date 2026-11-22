@@ -18,7 +18,9 @@ const BOOK_EXTENSIONS: [&str; 15] = [
 ];
 
 pub(super) fn is_book_file(name: &str) -> bool {
+    // The Kindle's highlight archive is a text file, not a book.
     !name.starts_with('.')
+        && !name.to_ascii_lowercase().starts_with("my clippings")
         && name.rsplit_once('.').is_some_and(|(_, extension)| {
             BOOK_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
         })
