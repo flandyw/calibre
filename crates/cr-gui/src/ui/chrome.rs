@@ -715,6 +715,7 @@ pub fn shortcuts_overlay(window: &mut Window, cx: &mut Context<CalibreApp>) -> A
             row("Export", &ExportSelected, app_ctx, window),
             row("Send to e-reader", &SendToFirstDevice, app_ctx, window),
             row("Remove", &RemoveBook, app_ctx, window),
+            row("Select all", &SelectAll, list_ctx, window),
         ],
         cx,
     );

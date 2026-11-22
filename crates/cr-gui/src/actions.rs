@@ -59,6 +59,7 @@ actions!(
         RevealInFileManager,
         CopyBookInfo,
         RemoveBook,
+        SelectAll,
         SendToFirstDevice,
         RescanDevices,
         // List navigation
@@ -152,6 +153,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("down"), SelectLast, list),
         KeyBinding::new("enter", ReadBook, list),
         KeyBinding::new("delete", RemoveBook, list),
+        KeyBinding::new(primary!("a"), SelectAll, list),
         // Reader
         KeyBinding::new("left", PreviousChapter, reader),
         KeyBinding::new("right", NextChapter, reader),
