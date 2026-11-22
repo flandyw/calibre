@@ -1058,9 +1058,13 @@ fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                "search" => show(&library.search_annotations(
-                    target.as_deref().context("give the text to search for")?,
-                )?),
+                "search" => {
+                    let mut found = library.search_annotations(
+                        target.as_deref().context("give the text to search for")?,
+                    )?;
+                    found.retain(|annotation| book.is_none_or(|id| annotation.book == id));
+                    show(&found);
+                }
                 "add" => {
                     let id = need_book()?;
                     let content = library.open_book(id, None)?;
