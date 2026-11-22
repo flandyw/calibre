@@ -153,41 +153,42 @@ impl Library {
             return Ok(Vec::new());
         }
         let conn = self.fts_connection()?;
-        let run = |expression: &str| -> rusqlite::Result<Vec<(i64, i64, String, String)>> {
+        let run = |expression: &str| -> rusqlite::Result<Vec<FtsHit>> {
             let mut stmt = conn.prepare(
                 "SELECT book, chapter, title, snippet(chapters, 1, '[', ']', '…', 24)
-                 FROM chapters WHERE chapters MATCH ?1 ORDER BY rank LIMIT ?2",
+                 FROM chapters WHERE chapters MATCH ?1 ORDER BY rank",
             )?;
-            let rows = stmt.query_map(params![expression, limit as i64], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-            })?;
-            rows.collect()
-        };
-        let rows = match run(query) {
-            Ok(rows) => rows,
-            // Not valid FTS5 syntax: search for the words themselves.
-            Err(_) => run(&quote_words(query))?,
-        };
-        let mut hits = Vec::with_capacity(rows.len());
-        for (book, chapter, chapter_title, snippet) in rows {
-            // Books removed since the last indexing run are skipped.
-            let title: Option<String> = rusqlite::OptionalExtension::optional(
-                self.conn
-                    .query_row("SELECT title FROM books WHERE id=?1", [book], |row| {
-                        row.get(0)
-                    }),
-            )?;
-            if let Some(title) = title {
-                hits.push(FtsHit {
-                    book,
-                    title,
-                    chapter: chapter as usize,
-                    chapter_title,
-                    snippet: snippet.split_whitespace().collect::<Vec<_>>().join(" "),
-                });
+            let mut title = self.conn.prepare("SELECT title FROM books WHERE id=?1")?;
+            let mut rows = stmt.query([expression])?;
+            let mut hits = Vec::new();
+            while hits.len() < limit {
+                let Some(row) = rows.next()? else {
+                    break;
+                };
+                let book: i64 = row.get(0)?;
+                // Books removed since the last indexing run are skipped, and
+                // do not count towards the limit.
+                let title: Option<String> = rusqlite::OptionalExtension::optional(
+                    title.query_row([book], |row| row.get(0)),
+                )?;
+                if let Some(title) = title {
+                    let snippet: String = row.get(3)?;
+                    hits.push(FtsHit {
+                        book,
+                        title,
+                        chapter: row.get::<_, i64>(1)? as usize,
+                        chapter_title: row.get(2)?,
+                        snippet: snippet.split_whitespace().collect::<Vec<_>>().join(" "),
+                    });
+                }
             }
+            Ok(hits)
+        };
+        match run(query) {
+            Ok(hits) => Ok(hits),
+            // Not valid FTS5 syntax: search for the words themselves.
+            Err(_) => Ok(run(&quote_words(query))?),
         }
-        Ok(hits)
     }
 }
 
