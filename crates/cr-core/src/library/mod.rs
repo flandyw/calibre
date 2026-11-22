@@ -179,7 +179,8 @@ impl Library {
         )?;
         conn.execute(
             "INSERT OR REPLACE INTO preferences (key, val) VALUES ('calibre_rust_version', ?1)",
-            [env!("CARGO_PKG_VERSION")],
+            // calibre expects every preference to be JSON.
+            [concat!("\"", env!("CARGO_PKG_VERSION"), "\"")],
         )?;
         Ok(Self {
             root: root.to_path_buf(),
