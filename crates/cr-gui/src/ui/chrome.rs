@@ -362,11 +362,19 @@ fn epub_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(SaveChanges), cx)),
         )
         .child(
+            Button::new("epub-check")
+                .small()
+                .outline()
+                .label("Check Book")
+                .tooltip("Look for broken links, missing files and bad markup")
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(CheckEpub), cx)),
+        )
+        .child(
             Button::new("epub-repack")
                 .small()
                 .primary()
-                .label("Repack & Replace")
-                .tooltip("Write all edits into the library's EPUB")
+                .label("Check & Save to Library")
+                .tooltip("Check the book, then replace the library's EPUB; the original is kept")
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(RepackEpub), cx)),
         )
         .into_any_element()

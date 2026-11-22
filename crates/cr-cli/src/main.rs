@@ -7,12 +7,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cr_core::device::{self, Device, SendOptions};
+use cr_core::formats::editing::{self, Change, ChangeKind, EpubDir, SearchOptions, Severity};
 use cr_core::formats::{ConvertOptions, Profile, INPUT_FORMATS, OUTPUT_FORMATS};
 use cr_core::jobs::JobContext;
 use cr_core::library::{
     filename_pattern, scan_sources, AddOutcome, Annotation, AnnotationFormat, BookSort, BookUpdate,
     BulkEdit, CatalogFormat, Category, Collision, ConvertOutcome, DuplicatePolicy, ExportOptions,
-    ImportOptions, Library, LibraryConvertOptions, ListOptions, SearchReplace, TextField,
+    ImportOptions, Library, LibraryConvertOptions, ListOptions, SaveOutcome, SearchReplace,
+    TextField,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
 use cr_core::text::{self, split_authors};
@@ -292,6 +294,39 @@ enum Command {
         /// Do not replace the library copy after repacking
         #[arg(long)]
         no_replace: bool,
+    },
+    /// Work on an EPUB's contents: check, fix, search, replace, toc, files, add, rm, mv, spine, compress, diff or restore
+    Epub {
+        action: String,
+        /// A library book ID, an EPUB file, or an unpacked EPUB directory
+        target: PathBuf,
+        /// search: PATTERN; replace: PATTERN REPLACEMENT; add: SOURCE PATH; rm: PATH;
+        /// mv: FROM TO; spine: PATH POSITION; diff: OTHER.epub
+        args: Vec<String>,
+        /// search/replace: the pattern is a regular expression
+        #[arg(long)]
+        regex: bool,
+        /// search/replace: match case
+        #[arg(long)]
+        case: bool,
+        /// search/replace: only files whose path contains this
+        #[arg(long)]
+        file: Option<String>,
+        /// toc: rebuild the table of contents from headings
+        #[arg(long)]
+        generate: bool,
+        /// toc --generate: deepest heading level to include
+        #[arg(long, default_value_t = 2)]
+        depth: u8,
+        /// compress: JPEG quality
+        #[arg(long, default_value_t = 80)]
+        quality: u8,
+        /// compress: scale images down to at most this many pixels a side
+        #[arg(long, default_value_t = 2000)]
+        max_side: u32,
+        /// Save to a library book even when the check finds errors
+        #[arg(long)]
+        force: bool,
     },
     /// Copy books out of the library
     Export {
@@ -1010,6 +1045,35 @@ fn run(cli: Cli) -> Result<()> {
                 read_book(&library_path, id, format, chapter, list, all, width)?
             }
         }
+        Command::Epub {
+            action,
+            target,
+            args,
+            regex,
+            case,
+            file,
+            generate,
+            depth,
+            quality,
+            max_side,
+            force,
+        } => {
+            let search = SearchOptions {
+                regex,
+                case_sensitive: case,
+                file,
+            };
+            epub_command(
+                &library_path,
+                &action,
+                &target,
+                &args,
+                &search,
+                generate.then_some(depth),
+                (quality, max_side),
+                force,
+            )?
+        }
         Command::Annotations {
             action,
             target,
@@ -1695,6 +1759,221 @@ fn read_book(
         );
     }
     print_chapter(&book.chapters[index - 1], width);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn epub_command(
+    library_path: &PathBuf,
+    action: &str,
+    target: &Path,
+    args: &[String],
+    search: &SearchOptions,
+    generate: Option<u8>,
+    (quality, max_side): (u8, u32),
+    force: bool,
+) -> Result<()> {
+    let argument = |index: usize, what: &str| {
+        args.get(index)
+            .map(String::as_str)
+            .ok_or_else(|| anyhow!("{action} needs {what}"))
+    };
+    let book_id = (!target.exists())
+        .then(|| target.to_str().and_then(|id| id.parse::<i64>().ok()))
+        .flatten();
+    let show = |changes: &[Change]| {
+        for change in changes {
+            match (change.kind, change.lines) {
+                (ChangeKind::Added, _) => println!("added     {}", change.file),
+                (ChangeKind::Removed, _) => println!("removed   {}", change.file),
+                (ChangeKind::Modified, Some((removed, added))) => {
+                    println!("modified  {} (-{removed} +{added} lines)", change.file)
+                }
+                (ChangeKind::Modified, None) => println!("modified  {}", change.file),
+            }
+        }
+        if changes.is_empty() {
+            println!("No differences.");
+        }
+    };
+
+    // Actions on whole files rather than an unpacked book.
+    match action {
+        "diff" => {
+            let changes = match book_id {
+                Some(id) => Library::open(library_path)?.compare_with_original(id, "EPUB")?,
+                None => editing::compare(target, Path::new(argument(0, "a second EPUB")?))?,
+            };
+            show(&changes);
+            return Ok(());
+        }
+        "restore" => {
+            let id = book_id.context("restore needs a library book ID")?;
+            Library::open(library_path)?.restore_original(id, "EPUB")?;
+            println!("Restored the original EPUB of book {id}.");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let scratch = tempfile::tempdir()?;
+    let directory = if target.is_dir() {
+        target.to_path_buf()
+    } else if let Some(id) = book_id {
+        Library::open(library_path)?.unpack_book(id, "EPUB", scratch.path())?;
+        scratch.path().to_path_buf()
+    } else if target.is_file() {
+        cr_core::formats::epub::unpack(target, scratch.path())?;
+        scratch.path().to_path_buf()
+    } else {
+        bail!(
+            "{} is not a book ID, an EPUB file or a directory",
+            target.display()
+        );
+    };
+    let mut book = EpubDir::open(&directory)?;
+    let mut modified = false;
+    let mut failed = false;
+    match action {
+        "check" | "fix" => {
+            if action == "fix" {
+                let done = book.fix()?;
+                for line in &done {
+                    println!("fixed: {line}");
+                }
+                modified = !done.is_empty();
+            }
+            let issues = book.check();
+            for issue in &issues {
+                println!(
+                    "{}: {}{}: {}{}",
+                    match issue.severity {
+                        Severity::Error => "error",
+                        Severity::Warning => "warning",
+                    },
+                    issue.file,
+                    issue.line.map(|line| format!(":{line}")).unwrap_or_default(),
+                    issue.message,
+                    if issue.fixable { " (fixable)" } else { "" }
+                );
+            }
+            let errors = issues
+                .iter()
+                .filter(|issue| issue.severity == Severity::Error)
+                .count();
+            println!("{errors} error(s), {} warning(s).", issues.len() - errors);
+            failed = errors > 0;
+        }
+        "search" => {
+            let matches = book.search(argument(0, "a pattern")?, search)?;
+            for found in &matches {
+                println!("{}:{}: {}", found.file, found.line, found.text);
+            }
+            println!("{} match(es).", matches.len());
+        }
+        "replace" => {
+            let changed = book.replace(
+                argument(0, "a pattern")?,
+                argument(1, "a replacement")?,
+                search,
+            )?;
+            for (file, count) in &changed {
+                println!("{file}: {count} replacement(s)");
+            }
+            modified = !changed.is_empty();
+            if !modified {
+                println!("Nothing to replace.");
+            }
+        }
+        "toc" => {
+            if let Some(depth) = generate {
+                let entries = book.generate_toc(depth)?;
+                println!("Wrote {entries} entries.");
+                modified = true;
+            }
+            for entry in book.toc()? {
+                println!(
+                    "{}{}  ->  {}",
+                    "  ".repeat(entry.level.saturating_sub(1) as usize),
+                    entry.title,
+                    entry.target
+                );
+            }
+        }
+        "files" => {
+            for item in book.items() {
+                println!(
+                    "{}\t{}\t{}",
+                    item.spine
+                        .map(|position| (position + 1).to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    item.media_type,
+                    item.path
+                );
+            }
+        }
+        "add" => {
+            book.add_file(
+                Path::new(argument(0, "a file to add")?),
+                argument(1, "its path in the book")?,
+            )?;
+            modified = true;
+        }
+        "rm" => {
+            book.remove_file(argument(0, "a path in the book")?)?;
+            modified = true;
+        }
+        "mv" => {
+            let updated = book.rename_file(
+                argument(0, "the current path")?,
+                argument(1, "the new path")?,
+            )?;
+            println!("Updated references in {updated} file(s).");
+            modified = true;
+        }
+        "spine" => {
+            let position: usize = argument(1, "a position, starting at 1")?
+                .parse()
+                .context("the position must be a number")?;
+            book.move_in_spine(argument(0, "a path in the book")?, position.saturating_sub(1))?;
+            modified = true;
+        }
+        "compress" => {
+            let saved = book.compress_images(quality, max_side)?;
+            let total: u64 = saved.iter().map(|(_, bytes)| bytes).sum();
+            println!("{} image(s) smaller, {total} bytes saved.", saved.len());
+            modified = !saved.is_empty();
+        }
+        other => bail!(
+            "unknown action {other}; use check, fix, search, replace, toc, files, add, rm, mv, spine, compress, diff or restore"
+        ),
+    }
+
+    if modified && !target.is_dir() {
+        if let Some(id) = book_id {
+            match Library::open(library_path)?.save_edited_book(id, &directory, force)? {
+                SaveOutcome::Saved { changes } => {
+                    show(&changes);
+                    println!(
+                        "Saved book {id}; the first edit keeps the old file as ORIGINAL_EPUB."
+                    );
+                }
+                SaveOutcome::Unchanged => println!("Book {id} is unchanged."),
+                SaveOutcome::Invalid { errors } => {
+                    for issue in &errors {
+                        eprintln!("error: {}: {}", issue.file, issue.message);
+                    }
+                    bail!("not saved: the book has errors (use --force to save anyway)");
+                }
+            }
+        } else {
+            editing::save(&directory, target)?;
+            println!("Saved {}.", target.display());
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

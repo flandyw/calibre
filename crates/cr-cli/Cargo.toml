@@ -11,6 +11,7 @@ name = "cr"
 path = "src/main.rs"
 
 [dependencies]
+tempfile.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -18,4 +19,3 @@ cr-core = { path = "../cr-core" }
 serde_json.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
