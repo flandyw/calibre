@@ -89,6 +89,13 @@ fn search_language_matches_the_golden_fixture() {
         ("#genre:false", &["The Cyberiad", "Emma"]),
         ("#read:true", &["Solaris"]),
         ("#missing:x", &[]),
+        ("not #pages:>400", &["The Cyberiad", "Emma", "Solaris"]),
+        ("-#read:true", &["The Cyberiad", "Dune", "Emma"]),
+        ("#read:empty", &["The Cyberiad", "Emma"]),
+        ("date:true", &["The Cyberiad", "Dune", "Emma", "Solaris"]),
+        ("date:false", &[]),
+        ("true", &[]),
+        ("false or emma", &["Emma"]),
     ];
     library
         .set_saved_search("Favourites", Some("rating:>=4"))
@@ -274,6 +281,14 @@ fn full_text_index_finds_passages_and_tracks_changes() {
     assert_eq!((updated.indexed, updated.removed), (1, 1));
     assert!(library.fts_search("spice", 10).unwrap().is_empty());
     assert_eq!(library.fts_search("sandworms", 10).unwrap()[0].book, dune);
+
+    // A removed book that is still indexed does not use up the limit.
+    let gone = add(&mut library, "Gone.txt", "sandworms sandworms sandworms");
+    library.fts_index(&context).unwrap();
+    library.remove_book(gone, true).unwrap();
+    let hits = library.fts_search("sandworms", 1).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].book, dune);
     assert!(library.fts_search("handsome", 10).unwrap().is_empty());
 }
 
