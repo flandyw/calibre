@@ -405,6 +405,72 @@ pub(crate) enum Mark {
     Found,
 }
 
+/// The part of a block's text in `part`, styled, with its links clickable.
+fn rich_text(
+    id: (usize, usize),
+    text: &str,
+    part: Range<usize>,
+    runs: &[(Range<usize>, Vec<Mark>)],
+    cx: &mut Context<CalibreApp>,
+) -> InteractiveText {
+    let theme = cx.theme().clone();
+    let mut links: Vec<(Range<usize>, String)> = Vec::new();
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for (range, marks) in runs {
+        let (from, to) = (range.start.max(part.start), range.end.min(part.end));
+        if from >= to {
+            continue;
+        }
+        let range = from - part.start..to - part.start;
+        let mut style = HighlightStyle::default();
+        for mark in marks {
+            match mark {
+                Mark::Style(Style::Bold) => style.font_weight = Some(FontWeight::BOLD),
+                Mark::Style(Style::Italic) => style.font_style = Some(FontStyle::Italic),
+                Mark::Style(Style::Underline) => {
+                    style.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    })
+                }
+                Mark::Style(Style::Strike) => {
+                    style.strikethrough = Some(StrikethroughStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    })
+                }
+                Mark::Style(Style::Code) => style.background_color = Some(theme.muted),
+                Mark::Style(Style::Superscript | Style::Subscript) => style.fade_out = Some(0.25),
+                Mark::Style(Style::Link(href)) => {
+                    style.color = Some(theme.link);
+                    style.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        ..Default::default()
+                    });
+                    links.push((range.clone(), href.clone()));
+                }
+                Mark::Highlight => style.background_color = Some(theme.warning.opacity(0.35)),
+                Mark::Found => style.background_color = Some(theme.primary.opacity(0.35)),
+            }
+        }
+        highlights.push((range, style));
+    }
+    let app = cx.entity().downgrade();
+    InteractiveText::new(
+        ElementId::NamedInteger("text".into(), (id.0 * 64 + id.1) as u64),
+        StyledText::new(text[part].to_string()).with_highlights(highlights),
+    )
+    .on_click(
+        links.iter().map(|(range, _)| range.clone()).collect(),
+        move |link, _, cx| {
+            if let Some((_, href)) = links.get(link) {
+                let href = href.clone();
+                let _ = app.update(cx, |this, cx| this.follow_link(&href, cx));
+            }
+        },
+    )
+}
+
 fn block_element(
     app: &CalibreApp,
     block: &Block,
@@ -452,62 +518,26 @@ fn block_element(
     }
 
     let runs = text_runs(block, marked, found);
-    let mut links: Vec<(Range<usize>, String)> = Vec::new();
-    let highlights: Vec<(Range<usize>, HighlightStyle)> = runs
-        .into_iter()
-        .map(|(range, marks)| {
-            let mut style = HighlightStyle::default();
-            for mark in marks {
-                match mark {
-                    Mark::Style(Style::Bold) => style.font_weight = Some(FontWeight::BOLD),
-                    Mark::Style(Style::Italic) => style.font_style = Some(FontStyle::Italic),
-                    Mark::Style(Style::Underline) => {
-                        style.underline = Some(UnderlineStyle {
-                            thickness: px(1.),
-                            ..Default::default()
-                        })
-                    }
-                    Mark::Style(Style::Strike) => {
-                        style.strikethrough = Some(StrikethroughStyle {
-                            thickness: px(1.),
-                            ..Default::default()
-                        })
-                    }
-                    Mark::Style(Style::Code) => {
-                        style.background_color = Some(theme.muted);
-                    }
-                    Mark::Style(Style::Superscript | Style::Subscript) => {
-                        style.fade_out = Some(0.25)
-                    }
-                    Mark::Style(Style::Link(href)) => {
-                        style.color = Some(theme.link);
-                        style.underline = Some(UnderlineStyle {
-                            thickness: px(1.),
-                            ..Default::default()
-                        });
-                        links.push((range.clone(), href));
-                    }
-                    Mark::Highlight => style.background_color = Some(theme.warning.opacity(0.35)),
-                    Mark::Found => style.background_color = Some(theme.primary.opacity(0.35)),
-                }
-            }
-            (range, style)
-        })
-        .collect();
-
-    let text = InteractiveText::new(
-        ("text", index),
-        StyledText::new(block.text.clone()).with_highlights(highlights),
-    )
-    .on_click(links.iter().map(|(range, _)| range.clone()).collect(), {
-        let app = cx.entity().downgrade();
-        move |link, _, cx| {
-            if let Some((_, href)) = links.get(link) {
-                let href = href.clone();
-                let _ = app.update(cx, |this, cx| this.follow_link(&href, cx));
-            }
-        }
-    });
+    if block.kind == BlockKind::TableRow {
+        let mut start = 0;
+        let cells = block.text.split('\t').enumerate().map(|(cell, text)| {
+            let range = start..start + text.len();
+            start = range.end + 1;
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(rich_text((index, cell), &block.text, range, &runs, cx))
+        });
+        return h_flex()
+            .w_full()
+            .gap_3()
+            .py_1()
+            .border_b_1()
+            .border_color(theme.border)
+            .children(cells.collect::<Vec<_>>())
+            .into_any_element();
+    }
+    let text = rich_text((index, 0), &block.text, 0..block.text.len(), &runs, cx);
 
     match &block.kind {
         BlockKind::Heading(level) => {
@@ -546,19 +576,6 @@ fn block_element(
             .font_family(theme.mono_font_family.clone())
             .text_size(px(font_size * 0.9))
             .child(text)
-            .into_any_element(),
-        BlockKind::TableRow => h_flex()
-            .w_full()
-            .gap_3()
-            .py_1()
-            .border_b_1()
-            .border_color(theme.border)
-            .children(
-                block
-                    .text
-                    .split('\t')
-                    .map(|cell| div().flex_1().min_w_0().child(cell.to_string())),
-            )
             .into_any_element(),
         _ => div()
             .w_full()
