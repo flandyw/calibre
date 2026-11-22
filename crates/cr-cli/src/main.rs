@@ -7,11 +7,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cr_core::device::{self, Device, SendOptions};
+use cr_core::formats::{ConvertOptions, Profile, INPUT_FORMATS, OUTPUT_FORMATS};
 use cr_core::jobs::JobContext;
 use cr_core::library::{
     filename_pattern, scan_sources, AddOutcome, BookSort, BookUpdate, BulkEdit, CatalogFormat,
-    Category, Collision, DuplicatePolicy, ExportOptions, ImportOptions, Library, ListOptions,
-    SearchReplace, TextField,
+    Category, Collision, ConvertOutcome, DuplicatePolicy, ExportOptions, ImportOptions, Library,
+    LibraryConvertOptions, ListOptions, SearchReplace, TextField,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, Metadata};
 use cr_core::text::{self, split_authors};
@@ -213,18 +214,31 @@ enum Command {
         #[arg(long, default_value_t = 80)]
         width: usize,
     },
-    /// Convert EPUB to AZW3/MOBI or Kindle files to EPUB/TXT
+    /// Convert a book file, or library books, to EPUB, AZW3, MOBI, HTMLZ or TXT
     Convert {
-        /// Input file or library book ID
-        input: PathBuf,
-        /// New output file (.azw3, .mobi, .epub or .txt)
-        output: PathBuf,
+        /// Input file followed by the new output file, or library book IDs with --to
+        args: Vec<PathBuf>,
+        /// Convert the library books given as IDs to this format and store it on them
+        #[arg(long)]
+        to: Option<String>,
+        /// With --to: also convert the books matching this search
+        #[arg(long)]
+        search: Option<String>,
+        /// With --to: replace an existing file of that format (kept as ORIGINAL_<FORMAT>)
+        #[arg(long)]
+        overwrite: bool,
         /// Source format to use for a library book
         #[arg(long)]
         from: Option<String>,
         /// Store the converted file on the same library book, replacing that format if present
         #[arg(long)]
         add: bool,
+        /// Scale images to a screen: generic (no scaling), kindle, kobo or tablet
+        #[arg(long, default_value = "generic")]
+        profile: String,
+        /// Keep the source as one section instead of splitting at chapter headings
+        #[arg(long)]
+        no_split: bool,
     },
     /// Save a book's cover image
     Cover {
@@ -935,12 +949,40 @@ fn run(cli: Cli) -> Result<()> {
             width,
         } => read_book(&library_path, id, format, chapter, list, all, width)?,
         Command::Convert {
-            input,
-            output,
+            args,
+            to,
+            search,
+            overwrite,
             from,
             add,
+            profile,
+            no_split,
         } => {
-            convert_book(&library_path, input, output, from, add, cli.json)?;
+            let profile = Profile::parse(&profile).ok_or_else(|| {
+                anyhow!("unknown profile {profile}; use generic, kindle, kobo or tablet")
+            })?;
+            if let Some(to) = to {
+                let options = LibraryConvertOptions {
+                    from,
+                    overwrite,
+                    no_split,
+                    profile,
+                };
+                convert_library_books(&library_path, &args, search, &to, &options, cli.json)?;
+            } else {
+                let [input, output] = args.as_slice() else {
+                    bail!("give an input and an output file, or book IDs with --to FORMAT");
+                };
+                if overwrite || search.is_some() {
+                    bail!("--overwrite and --search need --to FORMAT");
+                }
+                let options = ConvertOptions {
+                    split_chapters: !no_split,
+                    profile,
+                    ..ConvertOptions::default()
+                };
+                convert_book(&library_path, input, output, from, add, &options, cli.json)?;
+            }
         }
         Command::Cover { id, output } => {
             let library = Library::open(&library_path)?;
@@ -1350,51 +1392,107 @@ fn edit_metadata(library: &mut Library, args: SetArgs, json: bool) -> Result<()>
     Ok(())
 }
 
+fn convert_library_books(
+    library_path: &Path,
+    args: &[PathBuf],
+    search: Option<String>,
+    target: &str,
+    options: &LibraryConvertOptions,
+    json: bool,
+) -> Result<()> {
+    let mut library = Library::open(library_path)?;
+    let mut ids = Vec::new();
+    for arg in args {
+        let id = arg
+            .to_str()
+            .and_then(|arg| arg.parse::<i64>().ok())
+            .ok_or_else(|| anyhow!("{} is not a book ID", arg.display()))?;
+        ids.push(id);
+    }
+    if let Some(query) = search {
+        let found = library.list_books(&ListOptions {
+            query: Some(query),
+            ..ListOptions::default()
+        })?;
+        ids.extend(found.iter().map(|book| book.id));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut report = Vec::new();
+    let mut failures = 0usize;
+    for item in library.convert_books(&ids, target, options, &JobContext::detached()) {
+        let (status, detail) = match item.result {
+            Ok(ConvertOutcome::Converted { from }) => ("converted", format!("from {from}")),
+            Ok(ConvertOutcome::Skipped) => (
+                "skipped",
+                "already has that format; use --overwrite".to_string(),
+            ),
+            Err(error) => {
+                failures += 1;
+                ("failed", error.to_string())
+            }
+        };
+        if !json {
+            println!("#{}\t{status}\t{detail}", item.item);
+        }
+        report.push(json!({"book_id": item.item, "status": status, "detail": detail}));
+    }
+    if json {
+        print_json(&Value::Array(report))?;
+    }
+    if failures > 0 {
+        bail!("{failures} book(s) could not be converted");
+    }
+    Ok(())
+}
+
 fn convert_book(
     library_path: &Path,
-    input: PathBuf,
-    output: PathBuf,
+    input: &Path,
+    output: &Path,
     from: Option<String>,
     add: bool,
+    options: &ConvertOptions,
     json: bool,
 ) -> Result<()> {
     let id = input
         .to_str()
         .filter(|_| !input.exists())
         .and_then(|input| input.parse::<i64>().ok());
-    let target = text::format_from_path(&output)
-        .ok_or_else(|| anyhow!("give the output a .azw3, .mobi, .epub or .txt extension"))?;
+    let target = text::format_from_path(output).ok_or_else(|| {
+        anyhow!(
+            "give the output an extension: {}",
+            OUTPUT_FORMATS.join(", ")
+        )
+    })?;
     if let Some(id) = id {
         let mut library = Library::open(library_path)?;
-        let kindle_formats = ["AZW3", "AZW", "MOBI", "PRC"];
-        let from = from.as_deref();
-        let candidates = if from.is_some() {
-            from.as_slice()
-        } else {
-            match target.as_str() {
-                "AZW3" | "MOBI" => &["EPUB"][..],
-                "EPUB" | "TXT" => &kindle_formats[..],
-                _ => bail!("unsupported conversion target {target}"),
-            }
+        let kindle = |format: &str| matches!(format, "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC");
+        let have = library.formats(id)?;
+        let source = match &from {
+            Some(from) => from.to_ascii_uppercase(),
+            None => INPUT_FORMATS
+                .iter()
+                .find(|format| {
+                    **format != target
+                        && !(kindle(format) && kindle(&target))
+                        && have.iter().any(|have| have == *format)
+                })
+                .map(|format| format.to_string())
+                .ok_or_else(|| anyhow!("book {id} has no format to convert to {target}"))?,
         };
-        let mut source = None;
-        for format in candidates {
-            if let Some(path) = library.format_path(id, format)? {
-                source = Some(path);
-                break;
-            }
-        }
-        let source = source
-            .ok_or_else(|| anyhow!("book {id} has no input file in {}", candidates.join(", ")))?;
-        cr_core::formats::convert(&source, &output)?;
+        let source = library
+            .format_path(id, &source)?
+            .ok_or_else(|| anyhow!("book {id} has no {source} file"))?;
+        cr_core::formats::convert_with(&source, output, options)?;
         if add {
-            library.replace_format(id, &target, &output)?;
+            library.replace_format(id, &target, output)?;
         }
     } else {
         if add || from.is_some() {
             bail!("--add and --from require a library book ID");
         }
-        cr_core::formats::convert(&input, &output)?;
+        cr_core::formats::convert_with(input, output, options)?;
     }
     if json {
         print_json(&json!({"path": output, "format": target, "book_id": id, "added": add}))?;

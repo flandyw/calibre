@@ -1121,3 +1121,114 @@ impl Default for ExportOptions {
 pub fn filename_pattern(pattern: &str) -> Result<Regex> {
     Regex::new(pattern).map_err(|error| Error::InvalidMetadata(format!("bad pattern: {error}")))
 }
+
+/// Settings for converting books that are in the library.
+#[derive(Debug, Clone, Default)]
+pub struct LibraryConvertOptions {
+    /// Source format; the best available one when `None`.
+    pub from: Option<String>,
+    /// Replace an existing file of the target format. The replaced file is
+    /// kept as `ORIGINAL_<FORMAT>` unless the book already has one.
+    pub overwrite: bool,
+    /// Keep the source as one section instead of splitting at chapters.
+    pub no_split: bool,
+    pub profile: formats::Profile,
+}
+
+/// What converting one library book did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConvertOutcome {
+    Converted {
+        from: String,
+    },
+    /// The book already has the target format.
+    Skipped,
+}
+
+impl Library {
+    /// Convert a book to another format and store the result on the book.
+    /// The output carries the library's metadata and cover, except between
+    /// EPUB and Kindle formats with the generic profile, where the book's
+    /// own files are kept as they are.
+    pub fn convert_book(
+        &mut self,
+        id: i64,
+        target: &str,
+        options: &LibraryConvertOptions,
+    ) -> Result<ConvertOutcome> {
+        self.writable()?;
+        let target = target.to_ascii_uppercase();
+        if !formats::OUTPUT_FORMATS.contains(&target.as_str()) {
+            return Err(Error::UnsupportedFormat(format!(
+                "cannot convert to {target}; outputs are {}",
+                formats::OUTPUT_FORMATS.join(", ")
+            )));
+        }
+        let have = self.formats(id)?;
+        let existing = have.iter().any(|format| *format == target);
+        if existing && !options.overwrite {
+            return Ok(ConvertOutcome::Skipped);
+        }
+        let kindle = |format: &str| matches!(format, "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC");
+        let usable = |format: &str| format != target && !(kindle(format) && kindle(&target));
+        let from = match &options.from {
+            Some(from) => from.to_ascii_uppercase(),
+            None => formats::INPUT_FORMATS
+                .iter()
+                .find(|format| usable(format) && have.iter().any(|have| have == *format))
+                .map(|format| format.to_string())
+                .ok_or_else(|| {
+                    Error::Other(format!("book {id} has no format to convert to {target}"))
+                })?,
+        };
+        let source = self
+            .format_path(id, &from)?
+            .ok_or_else(|| Error::Other(format!("book {id} has no {from} file")))?;
+
+        let direct = options.profile == formats::Profile::Generic
+            && ((from == "EPUB" && kindle(&target)) || (kindle(&from) && target == "EPUB"));
+        let convert = formats::ConvertOptions {
+            metadata: if direct {
+                None
+            } else {
+                Some(self.get_metadata(id)?)
+            },
+            cover: if direct { None } else { self.cover(id)? },
+            split_chapters: !options.no_split,
+            profile: options.profile,
+        };
+        let scratch = tempfile::tempdir()?;
+        let output = scratch
+            .path()
+            .join(format!("book.{}", target.to_ascii_lowercase()));
+        formats::convert_with(&source, &output, &convert)?;
+
+        if existing {
+            let backup = format!("ORIGINAL_{target}");
+            if !have.iter().any(|format| *format == backup) {
+                if let Some(old) = self.format_path(id, &target)? {
+                    self.replace_format(id, &backup, &old)?;
+                }
+            }
+        }
+        self.replace_format(id, &target, &output)?;
+        Ok(ConvertOutcome::Converted { from })
+    }
+
+    /// Convert several books, reporting progress; a failure affects only
+    /// its own book.
+    pub fn convert_books(
+        &mut self,
+        ids: &[i64],
+        target: &str,
+        options: &LibraryConvertOptions,
+        context: &JobContext,
+    ) -> Vec<ItemResult<i64, ConvertOutcome>> {
+        jobs::for_each(
+            context,
+            ids.iter().copied(),
+            |id| format!("Converting book {id} to {}", target.to_ascii_uppercase()),
+            |id| self.convert_book(*id, target, options),
+        )
+    }
+}

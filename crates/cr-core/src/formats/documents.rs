@@ -15,14 +15,14 @@ use crate::xml::{self, Node};
 /// The largest archive member read into memory.
 const MAX_ENTRY: u64 = 256 * 1024 * 1024;
 
-fn zip_entry(archive: &mut zip::ZipArchive<File>, name: &str) -> Option<Vec<u8>> {
+pub(super) fn zip_entry(archive: &mut zip::ZipArchive<File>, name: &str) -> Option<Vec<u8>> {
     let entry = archive.by_name(name).ok()?;
     let mut data = Vec::new();
     entry.take(MAX_ENTRY).read_to_end(&mut data).ok()?;
     Some(data)
 }
 
-fn open_zip(path: &Path) -> Result<zip::ZipArchive<File>> {
+pub(super) fn open_zip(path: &Path) -> Result<zip::ZipArchive<File>> {
     zip::ZipArchive::new(File::open(path)?)
         .map_err(|error| Error::InvalidMetadata(format!("{}: {error}", path.display())))
 }

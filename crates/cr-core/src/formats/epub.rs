@@ -16,18 +16,20 @@ use crate::opf;
 use crate::xml;
 
 #[derive(Debug, Clone)]
-struct ManifestItem {
-    href: String,
-    media_type: String,
+pub(super) struct ManifestItem {
+    pub(super) href: String,
+    pub(super) media_type: String,
     properties: String,
 }
 
 #[derive(Debug)]
-struct Package {
-    metadata: Metadata,
-    cover: Option<Vec<u8>>,
-    manifest: HashMap<String, ManifestItem>,
-    spine: Vec<String>,
+pub(super) struct Package {
+    pub(super) metadata: Metadata,
+    pub(super) cover: Option<Vec<u8>>,
+    pub(super) manifest: HashMap<String, ManifestItem>,
+    pub(super) spine: Vec<String>,
+    /// Spine items marked `linear="no"`.
+    pub(super) nonlinear: Vec<String>,
 }
 
 /// Read metadata and the cover image from an EPUB.
@@ -146,7 +148,7 @@ pub fn repack(directory: &Path, output: &Path) -> Result<usize> {
     Ok(count)
 }
 
-fn read_package(path: &Path) -> Result<Package> {
+pub(super) fn read_package(path: &Path) -> Result<Package> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
 
@@ -181,15 +183,18 @@ fn read_package(path: &Path) -> Result<Package> {
     }
 
     let mut spine = Vec::new();
+    let mut nonlinear = Vec::new();
     if let Some(spine_node) = opf_xml.child("spine") {
         for itemref in spine_node.children.iter().filter(|c| c.name == "itemref") {
+            let Some(idref) = itemref.attr("idref") else {
+                continue;
+            };
             if itemref
                 .attr("linear")
                 .is_some_and(|v| v.eq_ignore_ascii_case("no"))
             {
-                continue;
-            }
-            if let Some(idref) = itemref.attr("idref") {
+                nonlinear.push(idref.to_string());
+            } else {
                 spine.push(idref.to_string());
             }
         }
@@ -239,6 +244,7 @@ fn read_package(path: &Path) -> Result<Package> {
         cover,
         manifest,
         spine,
+        nonlinear,
     })
 }
 
@@ -253,7 +259,7 @@ pub(super) fn package_path(container: &[u8]) -> Result<String> {
         .ok_or_else(|| Error::InvalidEpub("rootfile has no full-path".into()))
 }
 
-fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
+pub(super) fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     let mut entry = archive
         .by_name(name)
         .map_err(|_| Error::InvalidEpub(format!("missing entry: {name}")))?;
@@ -262,7 +268,7 @@ fn read_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn is_html_media_type(media_type: &str) -> bool {
+pub(super) fn is_html_media_type(media_type: &str) -> bool {
     matches!(
         media_type,
         "application/xhtml+xml" | "text/html" | "application/xml" | "text/xml" | ""

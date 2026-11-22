@@ -1,6 +1,7 @@
 //! Ebook format detection, metadata import and text extraction.
 
 mod conversion;
+pub mod document;
 mod documents;
 pub mod epub;
 pub mod fb2;
@@ -8,7 +9,9 @@ pub mod html;
 mod mobi;
 pub mod txt;
 
-pub use conversion::convert;
+pub use conversion::{
+    convert, convert_with, ConvertOptions, Profile, INPUT_FORMATS, OUTPUT_FORMATS,
+};
 
 use std::fs::File;
 use std::io::Read;

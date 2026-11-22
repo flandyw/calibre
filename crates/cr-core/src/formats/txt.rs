@@ -73,7 +73,7 @@ pub fn title_from_path(path: &Path) -> String {
     }
 }
 
-fn split_chapters(content: &str, fallback_title: &str) -> BookText {
+pub(super) fn split_chapters(content: &str, fallback_title: &str) -> BookText {
     let mut chapters = Vec::new();
     let mut current_title = fallback_title.to_string();
     let mut buffer = String::new();

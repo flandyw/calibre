@@ -109,16 +109,40 @@ everything, and `--width` controls wrapping.
 
 ### Conversion
 
-`cr convert INPUT OUTPUT` selects the target by the output extension. It uses
-[Kindling](https://github.com/ciscoriordan/kindling) to convert EPUB to AZW3 or
-dual-format MOBI, and bundled [libmobi](https://github.com/bfabiszewski/libmobi)
-to convert AZW3, AZW, MOBI or PRC to EPUB or plain text. Kindle reading and
-conversion require DRM-free files.
+`cr convert INPUT OUTPUT` selects the target by the output extension.
+
+| From | To |
+|---|---|
+| EPUB, AZW3, AZW, MOBI, PRC, FB2, DOCX, HTML, RTF, TXT | EPUB, AZW3, MOBI, HTMLZ, TXT |
+
+EPUB to AZW3/MOBI uses [Kindling](https://github.com/ciscoriordan/kindling) and
+Kindle to EPUB uses bundled [libmobi](https://github.com/bfabiszewski/libmobi);
+both keep the book's own files, including styles and fonts. Every other pair
+goes through one document model (sections of XHTML, images, a stylesheet and
+metadata): the source is read into it and the target is written from it. That
+path keeps headings, paragraphs, inline formatting, lists, tables, images,
+links, footnote anchors and the source's CSS; it drops scripts, forms, embedded
+fonts and media. The EPUB it writes has a generated table of contents and a
+cover page. Kindle reading and conversion require DRM-free files.
+
+- `--no-split` keeps the source as one section. By default a new section
+  starts at `h1`/`h2` headings (HTML), `Heading 1` (DOCX), `<section>` (FB2)
+  and "Chapter ..." lines (TXT).
+- `--profile kindle|kobo|tablet` scales images down to that screen.
 
 `INPUT` can be a filename or a library book ID. With a book ID, use
 `--from FORMAT` to choose the source format and `--add` to store the result on
 the same book. The output path must be new. `--add` replaces the stored copy of
 the target format if the book already has one.
+
+`cr convert --to FORMAT ID... [--search QUERY]` converts library books in one
+run and stores the result on each book, with the library's metadata and cover.
+A book that already has the format is skipped; `--overwrite` replaces it and
+keeps the old file as `ORIGINAL_<FORMAT>`, as calibre does. One book failing
+does not stop the others.
+
+Not converted yet: PDF, comics (CBZ/CBR), ODT, LIT and other legacy formats;
+Kindle to Kindle directly (go through EPUB).
 
 ### Editing
 
@@ -261,6 +285,8 @@ cr read 12 --chapter 3 --width 88
 cr convert book.epub book.azw3
 cr convert book.azw3 book.txt
 cr convert 12 book-for-kindle.azw3 --add
+cr convert notes.docx notes.epub --profile kindle
+cr convert --to azw3 --search "tag:sf format:epub"
 
 # Edit an EPUB
 cr edit 12 --extract ./book-12
