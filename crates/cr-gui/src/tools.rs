@@ -1651,8 +1651,19 @@ impl CalibreApp {
             Ok(()) => {
                 self.epub_pending = true;
                 self.reload_editor_files(window, cx);
-                self.tools.editor_toc = entries;
+                // As the book now has them, which is what the next change
+                // is compared with: writing tidies titles.
+                self.tools.editor_toc = book.toc().unwrap_or(entries);
+                let selected = selected.filter(|index| *index < self.tools.editor_toc.len());
                 self.tools.editor_toc_selected = selected;
+                if let Some(entry) = selected.and_then(|index| self.tools.editor_toc.get(index)) {
+                    set_input(
+                        &self.tools.editor_toc_title,
+                        entry.title.clone(),
+                        window,
+                        cx,
+                    );
+                }
                 if selected.is_none() {
                     set_input(&self.tools.editor_toc_title, String::new(), window, cx);
                 }
