@@ -1600,6 +1600,34 @@ impl CalibreApp {
         let Some(mut book) = self.editor_book(window, cx) else {
             return;
         };
+        // The contents may have been edited in the source since they were
+        // listed; writing the list back would undo that.
+        match book.toc() {
+            Ok(current) if current == self.tools.editor_toc => {}
+            Ok(current) => {
+                self.tools.editor_toc = current;
+                self.tools.editor_toc_selected = None;
+                set_input(&self.tools.editor_toc_title, String::new(), window, cx);
+                self.announce(
+                    "The contents changed in the book's files and were read again. Select the entry and repeat the change.",
+                    Tone::Info,
+                    window,
+                    cx,
+                );
+                window.set_window_edited(self.has_unsaved_changes());
+                cx.notify();
+                return;
+            }
+            Err(err) => {
+                self.announce(
+                    format!("Could not read the contents: {err}"),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
+                return;
+            }
+        }
         match book.set_toc(&entries) {
             Ok(()) => {
                 self.epub_pending = true;
