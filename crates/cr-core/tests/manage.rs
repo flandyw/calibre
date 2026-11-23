@@ -143,6 +143,21 @@ fn trash_restores_a_book_with_its_id_formats_and_extra_files() {
     assert_eq!(library.extra_files(id).unwrap(), ["notes.md"]);
     assert!(library.list_trash().unwrap().is_empty());
 
+    // A removed format and the removed book are separate trash entries.
+    library.remove_format(id, "HTML").unwrap();
+    library.trash_book(id).unwrap();
+    let kinds = |library: &Library| -> Vec<bool> {
+        let trash = library.list_trash().unwrap();
+        trash.iter().map(|entry| entry.is_book).collect()
+    };
+    assert_eq!(kinds(&library).len(), 2);
+    library.purge_trash_entry(id, false).unwrap();
+    assert_eq!(kinds(&library), [true]);
+    assert!(library.purge_trash_entry(id, false).is_err());
+    library.purge_trash_entry(id, true).unwrap();
+    assert!(library.list_trash().unwrap().is_empty());
+
+    let id = library.add_book(&txt).unwrap().id;
     library.trash_book(id).unwrap();
     assert_eq!(library.purge_trash(None).unwrap(), 1);
     assert!(library.restore_book(id).is_err());

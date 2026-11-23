@@ -704,10 +704,18 @@ impl CalibreApp {
         cx: &mut Context<Self>,
     ) {
         let entry = index.and_then(|index| self.tools.trash.get(index).cloned());
-        let (question, id) = match (&entry, index) {
-            (Some(entry), _) => (
+        let (question, only) = match (&entry, index) {
+            (Some(entry), _) if entry.is_book => (
                 format!("Delete “{}” permanently?", entry.title),
-                Some(entry.id),
+                Some((entry.id, true)),
+            ),
+            (Some(entry), _) => (
+                format!(
+                    "Delete the removed {} of “{}” permanently?",
+                    entry.formats.join(", "),
+                    entry.title
+                ),
+                Some((entry.id, false)),
             ),
             (None, Some(_)) => return,
             (None, None) if self.tools.trash.is_empty() => return,
@@ -729,7 +737,10 @@ impl CalibreApp {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(0) = receiver.await {
                 this.update_in(cx, |this, window, cx| {
-                    let purged = this.library.as_mut().map(|library| library.purge_trash(id));
+                    let purged = this.library.as_mut().map(|library| match only {
+                        Some((id, is_book)) => library.purge_trash_entry(id, is_book).map(|()| 1),
+                        None => library.purge_trash(None),
+                    });
                     match purged {
                         Some(Ok(count)) => this.announce(
                             format!("Deleted {count} item(s) from the trash."),
