@@ -7,6 +7,7 @@ use gpui_kit::*;
 
 use std::ops::Range;
 
+use cr_core::formats::css::Align;
 use cr_core::formats::reading::{Block, BlockKind, Book, Style};
 use cr_core::library::AnnotationKind;
 use gpui_kit::component::input::Input;
@@ -471,7 +472,48 @@ fn rich_text(
     )
 }
 
+/// A block laid out as the book's stylesheet asks.
 fn block_element(
+    app: &CalibreApp,
+    block: &Block,
+    index: usize,
+    marked: &[Range<usize>],
+    found: &[Range<usize>],
+    font_size: f32,
+    cx: &mut Context<CalibreApp>,
+) -> AnyElement {
+    let style = &block.style;
+    let scale = style
+        .size
+        .map_or(1., |size| f32::from(size.clamp(50, 300)) / 100.);
+    let size = font_size * scale;
+    let content = plain_block(app, block, index, marked, found, size, cx);
+    if *style == Default::default() {
+        return content;
+    }
+    let em = |hundredths: u16| px(size * f32::from(hundredths.min(600)) / 100.);
+    let family = style
+        .family
+        .as_ref()
+        .and_then(|family| app.reader_fonts.get(family))
+        .cloned();
+    div()
+        .w_full()
+        .pt(em(style.space_before))
+        .pb(em(style.space_after))
+        .pl(em(style.margin_left))
+        .when(style.size.is_some(), |this| this.text_size(px(size)))
+        .when_some(family, |this, family| this.font_family(family))
+        .map(|this| match style.align {
+            Align::Center => this.text_center(),
+            Align::End => this.text_right(),
+            Align::Start | Align::Justify => this,
+        })
+        .child(content)
+        .into_any_element()
+}
+
+fn plain_block(
     app: &CalibreApp,
     block: &Block,
     index: usize,
@@ -623,6 +665,7 @@ mod tests {
             ],
             indent: 0,
             quoted: false,
+            style: Default::default(),
         };
         let runs = text_runs(&block, &[0..8], &[100..200]);
         let ranges: Vec<Range<usize>> = runs.iter().map(|(range, _)| range.clone()).collect();

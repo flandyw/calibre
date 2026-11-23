@@ -2,7 +2,8 @@
 //! Rendering lives in [`crate::ui`].
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -222,6 +223,10 @@ pub struct CalibreApp {
     pub section_index: usize,
     /// Decoded once per book; `None` for images that cannot be shown.
     pub reader_images: Vec<Option<std::sync::Arc<Image>>>,
+    /// The loaded name of each font family the open book embeds.
+    pub reader_fonts: HashMap<String, SharedString>,
+    /// Font files already handed to the text system, which keeps them.
+    loaded_fonts: HashSet<(usize, u64)>,
     pub reader_search: Entity<InputState>,
     pub reader_hits: Vec<Hit>,
     pub reader_hit: usize,
@@ -389,6 +394,8 @@ impl CalibreApp {
             reader_book_id: 0,
             section_index: 0,
             reader_images: Vec::new(),
+            reader_fonts: HashMap::new(),
+            loaded_fonts: HashSet::new(),
             reader_search,
             reader_hits: Vec::new(),
             reader_hit: 0,
@@ -2087,6 +2094,31 @@ impl CalibreApp {
                 )))
             })
             .collect();
+        self.reader_fonts.clear();
+        let mut plain: HashSet<&str> = HashSet::new();
+        for font in &book.fonts {
+            let Some(name) = cr_core::formats::css::font_family_name(&font.data) else {
+                continue;
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            font.data.hash(&mut hasher);
+            if self.loaded_fonts.insert((font.data.len(), hasher.finish()))
+                && cx
+                    .text_system()
+                    .add_fonts(vec![font.data.clone().into()])
+                    .is_err()
+            {
+                continue;
+            }
+            // The upright face names the family when faces disagree.
+            let upright = !font.bold && !font.italic;
+            if upright || !plain.contains(font.family.as_str()) {
+                self.reader_fonts.insert(font.family.clone(), name.into());
+            }
+            if upright {
+                plain.insert(&font.family);
+            }
+        }
         self.reader_title = book.title.clone();
         let sections = book.sections.len();
         self.book = Some(Rc::new(book));
@@ -2151,6 +2183,7 @@ impl CalibreApp {
         self.save_reading_position();
         self.book = None;
         self.reader_images.clear();
+        self.reader_fonts.clear();
         self.reader_annotations.clear();
         self.reader_hits.clear();
         self.reader_block = None;
