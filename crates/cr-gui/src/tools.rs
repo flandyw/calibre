@@ -147,6 +147,12 @@ pub fn search_term(field: &str, kind: TermMatch, value: &str) -> Result<String, 
     if value.is_empty() {
         return Err("Type a value for the term.".to_string());
     }
+    // A bare `true` or `false` asks whether the field is set; as text to
+    // look for, it has to be a pattern.
+    let prefix = match kind {
+        TermMatch::Contains if ["true", "false"].contains(&value.to_lowercase().as_str()) => "~",
+        _ => prefix,
+    };
     // `identifier:isbn:=123`: the comparison belongs to the value, after
     // the identifier's type.
     if matches!(field, "identifier" | "identifiers") {
@@ -1758,6 +1764,11 @@ mod tests {
             search_term("size", TermMatch::Less, "1M").unwrap(),
             "size:<1M"
         );
+        // Text to look for is never read as "is set" / "is empty".
+        assert_eq!(term(TermMatch::Contains, "true").unwrap(), "title:~true");
+        assert_eq!(term(TermMatch::Contains, "False").unwrap(), "title:~False");
+        assert_eq!(term(TermMatch::Equals, "true").unwrap(), "title:=true");
+        assert_eq!(term(TermMatch::Present, "").unwrap(), "title:true");
         // The comparison goes after an identifier's type.
         let identifier = |kind, value| search_term("identifier", kind, value).unwrap();
         assert_eq!(
