@@ -251,7 +251,9 @@ pub fn bulk_edit(form: &BulkForm) -> Result<BulkEdit, String> {
         ),
         None => None,
     };
-    let replace = match (text(&form.find), form.field) {
+    // As typed: spaces at either end of what to find are part of it.
+    let find = Some(form.find.clone()).filter(|find| !find.is_empty());
+    let replace = match (find, form.field) {
         (Some(pattern), Some(field)) => {
             if form.regex {
                 regex::Regex::new(&pattern).map_err(|err| format!("Bad pattern: {err}"))?;
@@ -1793,7 +1795,7 @@ mod tests {
             add_tags: "sf, space".into(),
             remove_tags: "todo".into(),
             clear_publisher: true,
-            find: "Vol.".into(),
+            find: "Vol. ".into(),
             replace: "Volume".into(),
             field: Some(TextField::Title),
             ignore_case: true,
@@ -1812,7 +1814,7 @@ mod tests {
         let replace = edit.replace.unwrap();
         assert_eq!(
             (replace.pattern.as_str(), replace.replacement.as_str()),
-            ("Vol.", "Volume")
+            ("Vol. ", "Volume")
         );
         assert!(replace.ignore_case && !replace.regex);
 
