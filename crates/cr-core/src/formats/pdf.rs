@@ -621,10 +621,11 @@ fn unpredict(data: Vec<u8>, parameters: &Dict) -> Vec<u8> {
     if number("Predictor", 1) < 10 {
         return data;
     }
-    let bits = number("Colors", 1) * number("BitsPerComponent", 8);
+    let bits = number("Colors", 1).saturating_mul(number("BitsPerComponent", 8));
     let pixel = (bits / 8).max(1);
-    let row = (number("Columns", 1) * bits).div_ceil(8);
-    if row == 0 {
+    let row = number("Columns", 1).saturating_mul(bits).div_ceil(8);
+    // A row the data cannot hold is a lie about the image, not a filter.
+    if row == 0 || row >= data.len() {
         return data;
     }
     let mut output: Vec<u8> = Vec::with_capacity(data.len());
