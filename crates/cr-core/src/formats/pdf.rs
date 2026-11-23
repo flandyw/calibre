@@ -1621,8 +1621,14 @@ pub(super) fn read_book(data: &[u8]) -> Result<PdfBook> {
                 Item::Line(line) => line,
             };
             let text = line.text.trim();
-            // Page numbers: a bare number at the top or bottom of the page.
-            if at_edge(line.y) && text.len() <= 4 && text.chars().all(|c| c.is_ascii_digit()) {
+            // Page numbers: a bare number at the top or bottom of the page,
+            // in text size; one set as a heading is a chapter's number or
+            // title.
+            if at_edge(line.y)
+                && line.size < body * 1.2
+                && text.len() <= 4
+                && text.chars().all(|c| c.is_ascii_digit())
+            {
                 continue;
             }
             if line.size >= body * 1.2 && text.chars().count() < 150 {

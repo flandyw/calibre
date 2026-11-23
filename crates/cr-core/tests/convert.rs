@@ -591,6 +591,44 @@ BT /F1 11 Tf 72 640 Td (1984) Tj ET\nBT /F1 11 Tf 72 590 Td (After the year.) Tj
 }
 
 #[test]
+fn a_pdf_heading_that_is_a_number_is_not_a_page_number() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("year.pdf");
+    // A running header, a year as the chapter title well above its text,
+    // and a page number at the foot.
+    let content = b"BT /F1 8 Tf 72 760 Td (A Running Header) Tj ET\n\
+BT /F1 20 Tf 72 720 Td (1984) Tj ET\n\
+BT /F1 11 Tf 72 660 Td 14 TL (It was a bright cold day in April,) Tj T* (and the clocks were striking.) Tj T* (He slipped quickly through) Tj T* (the glass doors, though not) Tj T* (quickly enough to keep out) Tj T* (a swirl of gritty dust.) Tj T* (Thirteen of them.) Tj ET\n\
+BT /F1 9 Tf 300 40 Td (7) Tj ET\n";
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    for (number, object) in [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            String::from_utf8_lossy(content)
+        ),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        pdf.extend(format!("{} 0 obj\n{object}\nendobj\n", number + 1).bytes());
+    }
+    pdf.extend(b"trailer\n<< /Size 6 /Root 1 0 R >>\n%%EOF\n");
+    fs::write(&source, pdf).unwrap();
+
+    let text = cr_core::formats::extract_text(&source, None)
+        .unwrap()
+        .full_text();
+    assert!(text.lines().any(|line| line.trim() == "1984"), "{text}");
+    assert!(text.contains("Thirteen of them."), "{text}");
+    assert!(!text.lines().any(|line| line.trim() == "7"), "{text}");
+}
+
+#[test]
 fn pdf_text_images_and_outline_become_a_book() {
     let temp = tempdir().unwrap();
     let source = temp.path().join("book.pdf");
