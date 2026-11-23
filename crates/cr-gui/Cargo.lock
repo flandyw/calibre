@@ -1212,6 +1212,7 @@ dependencies = [
  "cc",
  "chrono",
  "encoding_rs",
+ "flate2",
  "futures",
  "html-escape",
  "image",

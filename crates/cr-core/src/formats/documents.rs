@@ -169,19 +169,61 @@ pub fn cbz_metadata(path: &Path) -> Result<(Metadata, Option<Vec<u8>>)> {
     }
 
     // The first page, in reading order, is the cover.
-    let mut pages: Vec<&String> = names
+    let cover = comic_pages(&names)
+        .first()
+        .and_then(|name| zip_entry(&mut archive, name));
+    Ok((meta, cover))
+}
+
+/// Opens a comic archive. A CBR file is a RAR archive, which is not
+/// read here; many are ZIP archives with the wrong extension and do open.
+pub(super) fn open_comic(path: &Path) -> Result<zip::ZipArchive<File>> {
+    let mut magic = [0u8; 4];
+    let read = File::open(path)?.read(&mut magic)?;
+    if magic[..read].starts_with(b"Rar!") {
+        return Err(Error::UnsupportedFormat(format!(
+            "{} is a RAR archive, which is not supported; repack it as CBZ (a ZIP archive)",
+            path.display()
+        )));
+    }
+    open_zip(path)
+}
+
+/// The page images of a comic archive in reading order: by name, with
+/// numbers compared as numbers so that `page10` follows `page9`.
+pub(super) fn comic_pages(names: &[String]) -> Vec<String> {
+    fn key(name: &str) -> Vec<(String, u64)> {
+        let mut parts = Vec::new();
+        let mut rest = name;
+        while !rest.is_empty() {
+            let text = rest.len() - rest.trim_start_matches(|c: char| !c.is_ascii_digit()).len();
+            let digits = rest[text..].len()
+                - rest[text..]
+                    .trim_start_matches(|c: char| c.is_ascii_digit())
+                    .len();
+            let number = rest[text..text + digits].parse().unwrap_or(u64::MAX);
+            parts.push((rest[..text].to_lowercase(), number));
+            rest = &rest[text + digits..];
+        }
+        parts
+    }
+    let mut pages: Vec<String> = names
         .iter()
         .filter(|name| {
             let lower = name.to_ascii_lowercase();
             !lower.starts_with("__macosx")
-                && [".jpg", ".jpeg", ".png"]
+                && !lower
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|file| file.starts_with('.'))
+                && [".jpg", ".jpeg", ".png", ".gif", ".webp"]
                     .iter()
                     .any(|extension| lower.ends_with(extension))
         })
+        .cloned()
         .collect();
-    pages.sort_by_key(|name| name.to_ascii_lowercase());
-    let cover = pages.first().and_then(|name| zip_entry(&mut archive, name));
-    Ok((meta, cover))
+    pages.sort_by_cached_key(|name| key(name));
+    pages
 }
 
 // ---------------------------------------------------------------------------

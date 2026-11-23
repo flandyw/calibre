@@ -1,6 +1,7 @@
 //! Ebook format detection, metadata import and text extraction.
 
 mod conversion;
+pub mod css;
 pub mod document;
 mod documents;
 pub mod editing;
@@ -8,6 +9,7 @@ pub mod epub;
 pub mod fb2;
 pub mod html;
 mod mobi;
+pub mod pdf;
 pub mod reading;
 pub mod txt;
 
@@ -61,6 +63,11 @@ impl BookText {
 
 /// The canonical format name for a path, e.g. `EPUB`, `AZW3`, `HTML`.
 pub fn detect_format(path: &Path) -> String {
+    // Kobo's EPUB variant carries a double extension.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if name.to_ascii_lowercase().ends_with(".kepub.epub") {
+        return "KEPUB".to_string();
+    }
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let upper = ext.trim().to_ascii_uppercase();
         return match upper.as_str() {
@@ -109,7 +116,7 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
     let format = detect_format(path);
     let (mut metadata, cover) =
         match format.as_str() {
-            "EPUB" => epub::metadata(path)?,
+            "EPUB" | "KEPUB" => epub::metadata(path)?,
             "FB2" => fb2::read(path)?,
             "TXT" => (txt::metadata(path), None),
             "HTML" => (html_metadata(path)?, None),
@@ -119,7 +126,7 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
             // A file that cannot be parsed is still worth storing.
             "DOCX" => documents::docx_metadata(path)
                 .unwrap_or_else(|_| (txt::filename_metadata(path), None)),
-            "CBZ" => documents::cbz_metadata(path)
+            "CBZ" | "CBR" => documents::cbz_metadata(path)
                 .unwrap_or_else(|_| (txt::filename_metadata(path), None)),
             "RTF" => (
                 documents::rtf_metadata(path).unwrap_or_else(|_| txt::filename_metadata(path)),
@@ -127,7 +134,7 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
             ),
             "PDF" => (
                 documents::pdf_metadata(path).unwrap_or_else(|_| txt::filename_metadata(path)),
-                None,
+                pdf::cover(path),
             ),
             _ => (txt::filename_metadata(path), None),
         };
@@ -152,13 +159,14 @@ pub fn extract_text(path: &Path, format: Option<&str>) -> Result<BookText> {
         .map(str::to_ascii_uppercase)
         .unwrap_or_else(|| detect_format(path));
     match format.as_str() {
-        "EPUB" => epub::text(path),
+        "EPUB" | "KEPUB" => epub::text(path),
         "FB2" => fb2::text(path),
         "TXT" => txt::text(path),
         "HTML" => txt::html_text(path),
         "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC" => mobi::text(path),
         "DOCX" => documents::docx_text(path),
         "RTF" => documents::rtf_text(path),
+        "PDF" => pdf::text(path),
         other => Err(Error::UnsupportedFormat(format!(
             "{other} text extraction is not implemented yet"
         ))),
@@ -226,6 +234,8 @@ mod tests {
     #[test]
     fn detects_formats() {
         assert_eq!(detect_format(Path::new("book.epub")), "EPUB");
+        assert_eq!(detect_format(Path::new("book.kepub.epub")), "KEPUB");
+        assert_eq!(detect_format(Path::new("book.kepub")), "KEPUB");
         assert_eq!(detect_format(Path::new("book.xhtml")), "HTML");
         assert_eq!(detect_format(Path::new("book.azw3")), "AZW3");
         assert_eq!(detect_format(Path::new("book.azw")), "AZW");

@@ -595,10 +595,7 @@ fn book_interactions(
 
 /// The right-click menu for the selected book, drawn by the OS.
 pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
-    let has_epub = app
-        .selected_formats
-        .iter()
-        .any(|format| format.eq_ignore_ascii_case("EPUB"));
+    let has_epub = crate::app::editable_format(&app.selected_formats).is_some();
     let has_files = !app.selected_formats.is_empty();
     let mut menu = NativeMenu::new()
         .menu_with_disabled("Read", !has_files, Box::new(ReadBook))
@@ -612,7 +609,7 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .menu("Edit Metadata…", Box::new(EditMetadata))
         .menu("Change Cover…", Box::new(ChangeCover))
         .menu_with_disabled("Crop Cover…", app.cover_path.is_none(), Box::new(CropCover))
-        .menu_with_disabled("Edit EPUB…", !has_epub, Box::new(EditEpub))
+        .menu_with_disabled("Edit Book…", !has_epub, Box::new(EditEpub))
         .separator()
         .menu("Copy Title and Author", Box::new(CopyBookInfo))
         .menu("Export…", Box::new(ExportSelected));

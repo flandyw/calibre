@@ -37,6 +37,8 @@ pub(super) struct Package {
     pub(super) spine: Vec<String>,
     /// Spine items marked `linear="no"`.
     pub(super) nonlinear: Vec<String>,
+    /// The text of the identifier the package names as unique.
+    pub(super) unique_id: String,
 }
 
 /// Read metadata and the cover image from an EPUB.
@@ -246,12 +248,24 @@ pub(super) fn read_package(path: &Path) -> Result<Package> {
     if metadata.format.is_none() {
         metadata.format = Some("EPUB".to_string());
     }
+    let unique_id = opf_xml
+        .attr("unique-identifier")
+        .and_then(|id| {
+            opf_xml
+                .child("metadata")?
+                .children
+                .iter()
+                .find(|child| child.name == "identifier" && child.attr("id") == Some(id))
+        })
+        .map(|identifier| identifier.deep_text().trim().to_string())
+        .unwrap_or_default();
     Ok(Package {
         metadata,
         cover,
         manifest,
         spine,
         nonlinear,
+        unique_id,
     })
 }
 

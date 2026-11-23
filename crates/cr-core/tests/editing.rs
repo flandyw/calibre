@@ -458,3 +458,103 @@ fn prefixed_packages_and_other_encodings_stay_valid() {
     assert!(written.contains("Erste"));
     assert!(written.contains("encoding=\"utf-8\""));
 }
+
+#[test]
+fn a_packed_output_replaces_only_a_format_it_is_written_as() {
+    use cr_core::formats::editing::output_matches;
+    let matches = |format, name: &str| output_matches(format, Path::new(name));
+    assert!(matches("AZW3", "book.azw3") && matches("AZW3", "book.kf8"));
+    assert!(!matches("AZW3", "book.epub") && !matches("AZW3", "book.pdf"));
+    assert!(matches("EPUB", "book.epub") && matches("KEPUB", "book.epub"));
+    assert!(matches("KEPUB", "book.kepub.epub"));
+    assert!(!matches("EPUB", "book.azw3") && !matches("KEPUB", "book.kf8"));
+    // An EPUB archive under another format's name would not open as it.
+    assert!(!matches("EPUB", "book.pdf") && !matches("KEPUB", "book.txt"));
+    assert!(!matches("EPUB", "book"));
+}
+
+#[test]
+fn kepub_and_azw3_books_are_edited_in_their_own_format() {
+    let temp = tempdir().unwrap();
+    let epub = make_epub(temp.path());
+    let kepub = temp.path().join("kobo.kepub.epub");
+    fs::copy(&epub, &kepub).unwrap();
+    let azw3 = temp.path().join("kindle.azw3");
+    convert(&epub, &azw3).unwrap();
+
+    let mut library = Library::create(&temp.path().join("library")).unwrap();
+    for (file, format) in [(&kepub, "KEPUB"), (&azw3, "AZW3")] {
+        let id = library.add_book(file).unwrap().id;
+        assert_eq!(library.editable_format(id).unwrap(), format);
+        let backup = format!("ORIGINAL_{format}");
+
+        // An untouched copy is recognised as unchanged.
+        let root = temp.path().join(format!("edit-{format}"));
+        library.unpack_book(id, format, &root).unwrap();
+        assert_eq!(
+            library
+                .save_edited_format(id, format, &root, false)
+                .unwrap(),
+            SaveOutcome::Unchanged
+        );
+        assert!(!library.formats(id).unwrap().contains(&backup));
+
+        let mut book = EpubDir::open(&root).unwrap();
+        let options = SearchOptions::default();
+        assert!(!book
+            .replace("Second", "Edited", &options)
+            .unwrap()
+            .is_empty());
+        let saved = library
+            .save_edited_format(id, format, &root, false)
+            .unwrap();
+        assert!(matches!(saved, SaveOutcome::Saved { ref changes } if !changes.is_empty()));
+        let formats = library.formats(id).unwrap();
+        assert!(formats.contains(&backup) && formats.contains(&format.to_string()));
+        assert!(!formats.contains(&"EPUB".to_string()));
+
+        // The saved file is still of its format and carries the edit.
+        let stored = library.format_path(id, format).unwrap().unwrap();
+        assert_eq!(cr_core::formats::detect_format(&stored), format);
+        let text = cr_core::formats::extract_text(&stored, None)
+            .unwrap()
+            .full_text();
+        assert!(
+            text.contains("Edited") && !text.contains("Second"),
+            "{text}"
+        );
+        assert!(!library
+            .compare_with_original(id, format)
+            .unwrap()
+            .is_empty());
+
+        library.restore_original(id, format).unwrap();
+        let stored = library.format_path(id, format).unwrap().unwrap();
+        let text = cr_core::formats::extract_text(&stored, None)
+            .unwrap()
+            .full_text();
+        assert!(text.contains("Second"), "{text}");
+    }
+
+    // A file outside a library is saved back in its own format.
+    let root = temp.path().join("loose");
+    editing::unpack(&azw3, &root).unwrap();
+    let mut book = EpubDir::open(&root).unwrap();
+    book.replace("Second", "Changed", &SearchOptions::default())
+        .unwrap();
+    editing::save(&root, &azw3).unwrap();
+    assert_eq!(cr_core::formats::detect_format(&azw3), "AZW3");
+    assert!(cr_core::formats::extract_text(&azw3, None)
+        .unwrap()
+        .full_text()
+        .contains("Changed"));
+
+    // Other formats are refused.
+    let text = temp.path().join("plain.txt");
+    fs::write(&text, "Plain words.").unwrap();
+    let id = library.add_book(&text).unwrap().id;
+    assert!(library.editable_format(id).is_err());
+    assert!(library
+        .unpack_book(id, "TXT", &temp.path().join("no"))
+        .is_err());
+}

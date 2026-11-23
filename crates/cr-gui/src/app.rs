@@ -2,13 +2,14 @@
 //! Rendering lives in [`crate::ui`].
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cr_core::device::{self, Device, SendOptions};
-use cr_core::formats::editing::{EpubDir, Severity};
+use cr_core::formats::editing::{EpubDir, Severity, EDITABLE_FORMATS};
 use cr_core::formats::reading::{Book, Hit, Locator};
 use cr_core::jobs::{self, Canceller, JobContext, Progress};
 use cr_core::library::{
@@ -181,6 +182,14 @@ pub enum Tone {
 const EXPORT_TEMPLATE: &str = "{author_sort}/{title} ({id})/{title} - {author}";
 const RECENTLY_ADDED_LIMIT: usize = 50;
 /// Formats tried first when opening or dragging a book out of the app.
+/// The format of a book the editor opens, if it has one.
+pub fn editable_format(formats: &[String]) -> Option<&'static str> {
+    EDITABLE_FORMATS
+        .iter()
+        .find(|format| formats.iter().any(|own| own.eq_ignore_ascii_case(format)))
+        .copied()
+}
+
 const PREFERRED_FORMATS: &[&str] = &["EPUB", "PDF", "AZW3", "MOBI", "FB2", "TXT"];
 
 /// A long operation running off the UI thread, shown in the status bar.
@@ -222,6 +231,10 @@ pub struct CalibreApp {
     pub section_index: usize,
     /// Decoded once per book; `None` for images that cannot be shown.
     pub reader_images: Vec<Option<std::sync::Arc<Image>>>,
+    /// The loaded name of each font family the open book embeds.
+    pub reader_fonts: HashMap<String, SharedString>,
+    /// Font files already handed to the text system, which keeps them.
+    loaded_fonts: HashSet<(usize, u64)>,
     pub reader_search: Entity<InputState>,
     pub reader_hits: Vec<Hit>,
     pub reader_hit: usize,
@@ -235,6 +248,8 @@ pub struct CalibreApp {
     pub chapter_list_visible: bool,
     pub screen: Screen,
     pub editing: bool,
+    /// The format of the book open in the editor.
+    pub epub_format: String,
     pub status: String,
     pub status_tone: Tone,
     pub query: String,
@@ -253,6 +268,8 @@ pub struct CalibreApp {
     pub epub_files: Vec<EpubFile>,
     pub epub_selected: Option<usize>,
     pub epub_dirty: bool,
+    /// Edits written to the unpacked files but not yet saved to the library.
+    pub epub_pending: bool,
 
     pub focus_handle: FocusHandle,
     pub list_focus: FocusHandle,
@@ -389,6 +406,8 @@ impl CalibreApp {
             reader_book_id: 0,
             section_index: 0,
             reader_images: Vec::new(),
+            reader_fonts: HashMap::new(),
+            loaded_fonts: HashSet::new(),
             reader_search,
             reader_hits: Vec::new(),
             reader_hit: 0,
@@ -400,6 +419,7 @@ impl CalibreApp {
             chapter_list_visible: true,
             screen: Screen::Library,
             editing: false,
+            epub_format: "EPUB".to_string(),
             status: String::new(),
             status_tone: Tone::Info,
             query: String::new(),
@@ -414,6 +434,7 @@ impl CalibreApp {
             epub_files: Vec::new(),
             epub_selected: None,
             epub_dirty: false,
+            epub_pending: false,
             focus_handle,
             list_focus,
             reader_focus,
@@ -660,7 +681,7 @@ impl CalibreApp {
     }
 
     pub fn has_unsaved_changes(&self) -> bool {
-        self.editing || self.epub_dirty
+        self.editing || self.epub_dirty || self.epub_pending
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -2087,6 +2108,31 @@ impl CalibreApp {
                 )))
             })
             .collect();
+        self.reader_fonts.clear();
+        let mut plain: HashSet<&str> = HashSet::new();
+        for font in &book.fonts {
+            let Some(name) = cr_core::formats::css::font_family_name(&font.data) else {
+                continue;
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            font.data.hash(&mut hasher);
+            if self.loaded_fonts.insert((font.data.len(), hasher.finish()))
+                && cx
+                    .text_system()
+                    .add_fonts(vec![font.data.clone().into()])
+                    .is_err()
+            {
+                continue;
+            }
+            // The upright face names the family when faces disagree.
+            let upright = !font.bold && !font.italic;
+            if upright || !plain.contains(font.family.as_str()) {
+                self.reader_fonts.insert(font.family.clone(), name.into());
+            }
+            if upright {
+                plain.insert(&font.family);
+            }
+        }
         self.reader_title = book.title.clone();
         let sections = book.sections.len();
         self.book = Some(Rc::new(book));
@@ -2151,6 +2197,7 @@ impl CalibreApp {
         self.save_reading_position();
         self.book = None;
         self.reader_images.clear();
+        self.reader_fonts.clear();
         self.reader_annotations.clear();
         self.reader_hits.clear();
         self.reader_block = None;
@@ -2674,20 +2721,16 @@ impl CalibreApp {
         if self.editing || self.screen != Screen::Library {
             return;
         }
-        if !self
-            .selected_formats
-            .iter()
-            .any(|format| format.eq_ignore_ascii_case("EPUB"))
-        {
+        let Some(format) = editable_format(&self.selected_formats) else {
             self.announce(
-                "This book has no EPUB file to edit.",
+                "This book has no EPUB, KEPUB or AZW3 file to edit.",
                 Tone::Info,
                 window,
                 cx,
             );
             cx.notify();
             return;
-        }
+        };
         let dir = std::env::temp_dir().join(format!("calibre-rust-edit-{id}-{}", temp_stamp()));
         if let Err(err) = std::fs::create_dir_all(&dir) {
             self.announce(
@@ -2702,11 +2745,11 @@ impl CalibreApp {
         let unpacked = self
             .library
             .as_ref()
-            .map(|library| library.unpack_book(id, "EPUB", &dir));
+            .map(|library| library.unpack_book(id, format, &dir));
         if let Some(Err(err)) = unpacked {
             let _ = std::fs::remove_dir_all(&dir);
             self.announce(
-                format!("Could not unpack EPUB: {err}"),
+                format!("Could not unpack the {format} file: {err}"),
                 Tone::Error,
                 window,
                 cx,
@@ -2718,7 +2761,7 @@ impl CalibreApp {
         if files.is_empty() {
             let _ = std::fs::remove_dir_all(&dir);
             self.announce(
-                "This EPUB has no editable text files.",
+                "This book has no editable text files.",
                 Tone::Info,
                 window,
                 cx,
@@ -2727,10 +2770,12 @@ impl CalibreApp {
             return;
         }
         self.epub_book_id = Some(id);
+        self.epub_format = format.to_string();
         self.epub_dir = Some(dir);
         self.epub_files = files;
         self.epub_selected = None;
         self.epub_dirty = false;
+        self.epub_pending = false;
         self.screen = Screen::Epub;
         window.focus(&self.focus_handle, cx);
         // Start on the first content document rather than META-INF.
@@ -2788,6 +2833,7 @@ impl CalibreApp {
             entry.size = text.len() as u64;
         }
         self.epub_dirty = false;
+        self.epub_pending = true;
         Ok(())
     }
 
@@ -2819,11 +2865,12 @@ impl CalibreApp {
             return false;
         }
         // Checked first, written atomically, and the first save keeps the
-        // old file as ORIGINAL_EPUB.
+        // old file as ORIGINAL_<FORMAT>.
+        let format = self.epub_format.clone();
         let outcome = match self.library.as_mut() {
             Some(library) => library
-                .save_edited_book(id, &dir, false)
-                .map_err(|err| format!("Could not save the EPUB: {err}")),
+                .save_edited_format(id, &format, &dir, false)
+                .map_err(|err| format!("Could not save the {format} file: {err}")),
             None => Err("Open a library first.".to_string()),
         };
         let ok = match outcome {
@@ -2847,10 +2894,10 @@ impl CalibreApp {
                 window.focus(&self.list_focus, cx);
                 let message = match saved {
                     SaveOutcome::Saved { changes } => format!(
-                        "Saved {} changed file(s); the original is kept as ORIGINAL_EPUB.",
+                        "Saved {} changed file(s); the original is kept as ORIGINAL_{format}.",
                         changes.len()
                     ),
-                    _ => "Nothing changed; the library EPUB was left as it is.".to_string(),
+                    _ => "Nothing changed; the library copy was left as it is.".to_string(),
                 };
                 self.announce(message, Tone::Success, window, cx);
                 true
@@ -2913,17 +2960,17 @@ impl CalibreApp {
     }
 
     pub fn close_epub_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.epub_dirty {
+        if !self.epub_dirty && !self.epub_pending {
             self.discard_epub_editor();
-            self.set_status("Closed the EPUB editor.", Tone::Info);
+            self.set_status("Closed the book editor.", Tone::Info);
             window.focus(&self.list_focus, cx);
             cx.notify();
             return;
         }
         let receiver = window.prompt(
             PromptLevel::Warning,
-            "Save changes to the EPUB before closing?",
-            Some("Your edits are only written to the library when the EPUB is repacked."),
+            "Save changes to the book before closing?",
+            Some("Your edits are only written to the library when the book is saved."),
             &["Repack & Close", "Discard Changes", "Cancel"],
             cx,
         );
@@ -2937,7 +2984,7 @@ impl CalibreApp {
                     this.discard_epub_editor();
                     window.set_window_edited(this.has_unsaved_changes());
                     window.focus(&this.list_focus, cx);
-                    this.set_status("Discarded EPUB edits.", Tone::Info);
+                    this.set_status("Discarded the edits.", Tone::Info);
                     cx.notify();
                 }
                 _ => {}
@@ -2955,6 +3002,7 @@ impl CalibreApp {
         self.epub_files.clear();
         self.epub_selected = None;
         self.epub_dirty = false;
+        self.epub_pending = false;
         if self.screen == Screen::Epub {
             self.screen = Screen::Library;
         }

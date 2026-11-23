@@ -15,7 +15,7 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
 
 use super::html::{attr_value, find_tag_end, first_heading, html_to_text, tag_name};
-use super::{decode_markup, documents, epub, txt, BookText};
+use super::{css, decode_markup, documents, epub, pdf, txt, BookText};
 use crate::error::{Error, Result};
 use crate::metadata::Metadata;
 use crate::xml::{self, Node};
@@ -45,6 +45,8 @@ pub struct Document {
     pub images: Vec<Image>,
     /// Stylesheet carried over from the source.
     pub css: String,
+    /// Font files the stylesheet names, stored under `fonts/` in the output.
+    pub fonts: Vec<Image>,
     /// The source's own table of contents, when it has one.
     pub toc: Vec<TocItem>,
 }
@@ -447,8 +449,16 @@ impl Xhtml<'_> {
         if let Some(id) = id {
             attributes.push_str(&format!(" id=\"{}\"", escape_attribute(&id)));
         }
-        for keep in ["class", "lang", "dir", "title", "colspan", "rowspan"] {
+        for keep in [
+            "class", "lang", "dir", "title", "colspan", "rowspan", "style",
+        ] {
             if let Some(value) = attr_value(tag, keep) {
+                // A style may not load anything.
+                let lower = value.to_ascii_lowercase();
+                let loads = ["url", "\\", "@", "expression"];
+                if keep == "style" && loads.iter().any(|bad| lower.contains(bad)) {
+                    continue;
+                }
                 attributes.push_str(&format!(" {keep}=\"{}\"", escape_attribute(&value)));
             }
         }
@@ -554,7 +564,7 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
         Split::None
     };
     match format {
-        "EPUB" => read_epub(path, &mut document)?,
+        "EPUB" | "KEPUB" => read_epub(path, &mut document)?,
         "HTML" => read_html(path, headings, &mut document)?,
         "FB2" => read_fb2(path, options.split_chapters, &mut document)?,
         "DOCX" => read_docx(path, options.split_chapters, &mut document)?,
@@ -573,6 +583,8 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
             from_text(text, &mut document);
         }
         "RTF" => from_text(documents::rtf_text(path)?, &mut document),
+        "PDF" => read_pdf(path, options.split_chapters, &mut document)?,
+        "CBZ" | "CBR" => read_comic(path, &mut document)?,
         other => {
             return Err(Error::UnsupportedFormat(format!(
                 "{other} cannot be converted"
@@ -632,6 +644,82 @@ fn from_text(text: BookText, document: &mut Document) {
     }
 }
 
+fn read_pdf(path: &Path, split: bool, document: &mut Document) -> Result<()> {
+    let book = pdf::read_book(&std::fs::read(path)?)?;
+    let mut images = Images::default();
+    let mut whole = Section::default();
+    for (title, parts) in book.chapters {
+        let mut section = Section {
+            title: title.trim().to_string(),
+            html: String::new(),
+        };
+        // A chapter that does not open with its own heading gets its
+        // bookmark as one.
+        let headed = matches!(parts.first(), Some(pdf::Part::Heading(..)));
+        if !section.title.is_empty() && !headed {
+            section
+                .html
+                .push_str(&format!("<h2>{}</h2>\n", escape(&section.title)));
+        }
+        for part in parts {
+            match part {
+                pdf::Part::Heading(level, text) => {
+                    section
+                        .html
+                        .push_str(&format!("<h{level}>{}</h{level}>\n", escape(&text)));
+                }
+                pdf::Part::Paragraph(text) => {
+                    section
+                        .html
+                        .push_str(&format!("<p>{}</p>\n", escape(&text)));
+                }
+                pdf::Part::Image(data) => {
+                    let source = format!("pdf{}", images.list.len());
+                    if let Some(src) = images.src(&source, || Some(data)) {
+                        section
+                            .html
+                            .push_str(&format!("<p><img src=\"{src}\" alt=\"\"/></p>\n"));
+                    }
+                }
+            }
+        }
+        if split {
+            document.sections.push(section);
+        } else {
+            whole.html.push_str(&section.html);
+        }
+    }
+    if !split && !whole.html.is_empty() {
+        document.sections.push(whole);
+    }
+    document.images = images.list;
+    if document.sections.is_empty() {
+        return Err(Error::Other(format!(
+            "{} has no text or images that can be read; it may be a scan",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_comic(path: &Path, document: &mut Document) -> Result<()> {
+    let mut archive = documents::open_comic(path)?;
+    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let mut images = Images::default();
+    for name in documents::comic_pages(&names) {
+        let Some(src) = images.src(&name, || documents::zip_entry(&mut archive, &name)) else {
+            continue;
+        };
+        let title = format!("Page {}", document.sections.len() + 1);
+        document.sections.push(Section {
+            html: format!("<div class=\"comic-page\"><img src=\"{src}\" alt=\"{title}\"/></div>\n"),
+            title,
+        });
+    }
+    document.images = images.list;
+    Ok(())
+}
+
 fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
     let markup = decode_markup(&std::fs::read(path)?);
     let directory = path
@@ -667,7 +755,8 @@ fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
         &external_link,
     );
     document.sections = sections;
-    document.css = css;
+    // A page's own stylesheet cannot bring files along.
+    document.css = css::rewrite_urls(&css, &mut |_| None);
     document.images = images.list;
     Ok(())
 }
@@ -703,6 +792,126 @@ fn read_fb2(path: &Path, split: bool, document: &mut Document) -> Result<()> {
     document.sections = sections;
     document.images = images.list;
     Ok(())
+}
+
+const FONT_TYPES: [(&str, &str); 4] = [
+    ("ttf", "font/ttf"),
+    ("otf", "font/otf"),
+    ("woff", "font/woff"),
+    ("woff2", "font/woff2"),
+];
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut state: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut message = data.to_vec();
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
+    for block in message.chunks_exact(64) {
+        let mut words = [0u32; 80];
+        for (index, word) in block.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes(word.try_into().expect("four bytes"));
+        }
+        for index in 16..80 {
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = state;
+        for (index, word) in words.iter().enumerate() {
+            let (mixed, constant) = match index {
+                0..20 => ((b & c) | (!b & d), 0x5A827999),
+                20..40 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..60 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6u32),
+            };
+            let next = a
+                .rotate_left(5)
+                .wrapping_add(mixed)
+                .wrapping_add(e)
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            (e, d, c, b, a) = (d, c, b.rotate_left(30), a, next);
+        }
+        for (total, add) in state.iter_mut().zip([a, b, c, d, e]) {
+            *total = total.wrapping_add(add);
+        }
+    }
+    let mut digest = [0u8; 20];
+    for (bytes, word) in digest.chunks_exact_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+    digest
+}
+
+/// The fonts an EPUB stores scrambled, by path; `true` for Adobe's method
+/// and `false` for the EPUB standard's.
+fn obfuscated_fonts(archive: &mut ZipArchive<File>) -> HashMap<String, bool> {
+    fn collect(node: &Node, found: &mut HashMap<String, bool>) {
+        if node.name.ends_with("EncryptedData") {
+            let mut algorithm = "";
+            let mut path = None;
+            let mut pending = vec![node];
+            while let Some(inner) = pending.pop() {
+                if inner.name.ends_with("EncryptionMethod") {
+                    algorithm = inner.attr("Algorithm").unwrap_or_default();
+                } else if inner.name.ends_with("CipherReference") {
+                    path = inner.attr("URI");
+                }
+                pending.extend(&inner.children);
+            }
+            let adobe = match algorithm {
+                "http://www.idpf.org/2008/embedding" => Some(false),
+                "http://ns.adobe.com/pdf/enc#RC" => Some(true),
+                _ => None,
+            };
+            if let (Some(path), Some(adobe)) = (path, adobe) {
+                let path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+                found.insert(path.into_owned(), adobe);
+            }
+            return;
+        }
+        for child in &node.children {
+            collect(child, found);
+        }
+    }
+    let mut found = HashMap::new();
+    if let Ok(data) = epub::read_entry(archive, "META-INF/encryption.xml") {
+        if let Ok(root) = xml::parse(&data) {
+            collect(&root, &mut found);
+        }
+    }
+    found
+}
+
+/// Undo the scrambling of the start of an embedded font. The key comes
+/// from the book's identifier, so this is not copy protection.
+fn reveal_font(data: &mut [u8], unique_id: &str, adobe: bool) {
+    let key: Vec<u8> = if adobe {
+        let hex: Vec<u8> = unique_id
+            .trim_start_matches("urn:uuid:")
+            .bytes()
+            .filter(u8::is_ascii_hexdigit)
+            .collect();
+        hex.chunks_exact(2)
+            .filter_map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+            .collect()
+    } else {
+        let id: Vec<u8> = unique_id
+            .bytes()
+            .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            .collect();
+        sha1(&id).to_vec()
+    };
+    if key.len() < 16 {
+        return;
+    }
+    let scrambled = if adobe { 1024 } else { 1040 };
+    for (index, byte) in data.iter_mut().take(scrambled).enumerate() {
+        *byte ^= key[index % key.len()];
+    }
 }
 
 fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
@@ -762,11 +971,38 @@ fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
         .map(|item| item.href.as_str())
         .collect();
     stylesheets.sort_unstable();
+    let obfuscated = obfuscated_fonts(&mut archive);
+    let mut font_sources: HashMap<String, Option<String>> = HashMap::new();
     for href in stylesheets {
-        if let Ok(css) = epub::read_entry(&mut archive, href) {
-            document.css.push_str(&decode_markup(&css));
-            document.css.push('\n');
-        }
+        let Ok(sheet) = epub::read_entry(&mut archive, href) else {
+            continue;
+        };
+        let directory = href.rsplit_once('/').map_or("", |(directory, _)| directory);
+        let sheet = css::rewrite_urls(&decode_markup(&sheet), &mut |target| {
+            let path = epub::resolve_href(directory, target.split(['#', '?']).next()?);
+            if let Some(known) = font_sources.get(&path) {
+                return known.clone();
+            }
+            let extension = path.rsplit_once('.')?.1.to_ascii_lowercase();
+            let source = FONT_TYPES
+                .iter()
+                .any(|(known, _)| *known == extension)
+                .then(|| epub::read_entry(&mut archive, &path).ok())
+                .flatten()
+                .map(|mut data| {
+                    if let Some(adobe) = obfuscated.get(&path) {
+                        reveal_font(&mut data, &package.unique_id, *adobe);
+                    }
+                    let name = format!("font{}.{extension}", document.fonts.len() + 1);
+                    let source = format!("fonts/{name}");
+                    document.fonts.push(Image { name, data });
+                    source
+                });
+            font_sources.insert(path, source.clone());
+            source
+        });
+        document.css.push_str(&sheet);
+        document.css.push('\n');
     }
     let mut images = Images::default();
     let mut ids = HashSet::new();
@@ -1399,6 +1635,17 @@ fn package_opf(document: &Document, cover: Option<&str>) -> String {
             escape_attribute(&image.name)
         ));
     }
+    for (index, font) in document.fonts.iter().enumerate() {
+        let media_type = FONT_TYPES
+            .iter()
+            .find(|(extension, _)| font.name.ends_with(extension))
+            .map_or("application/octet-stream", |kind| kind.1);
+        opf.push_str(&format!(
+            "<item id=\"font{}\" href=\"fonts/{}\" media-type=\"{media_type}\"/>\n",
+            index + 1,
+            escape_attribute(&font.name)
+        ));
+    }
     opf.push_str("</manifest>\n<spine toc=\"ncx\">\n");
     if cover.is_some() {
         opf.push_str("<itemref idref=\"titlepage\"/>\n");
@@ -1474,6 +1721,10 @@ pub fn write_epub(document: &Document, output: &mut File) -> Result<()> {
         )?;
         zip.write_all(&image.data)?;
     }
+    for font in &document.fonts {
+        zip.start_file(format!("OEBPS/fonts/{}", font.name), deflated())?;
+        zip.write_all(&font.data)?;
+    }
 
     let mut nav = String::from("<nav epub:type=\"toc\" id=\"toc\">\n<h1>Contents</h1>\n<ol>\n");
     let mut ncx = format!(
@@ -1540,6 +1791,10 @@ pub fn write_htmlz(document: &Document, output: &mut File) -> Result<()> {
             SimpleFileOptions::default(),
         )?;
         zip.write_all(&image.data)?;
+    }
+    for font in &document.fonts {
+        zip.start_file(format!("fonts/{}", font.name), deflated())?;
+        zip.write_all(&font.data)?;
     }
     zip.finish()?;
     Ok(())

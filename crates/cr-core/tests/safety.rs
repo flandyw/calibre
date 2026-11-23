@@ -189,13 +189,13 @@ fn batch_add_reports_each_failure_and_continues() {
 fn reading_prefers_a_supported_format() {
     let temp = tempdir().unwrap();
     let mut library = Library::create(&temp.path().join("library")).unwrap();
-    let pdf = temp.path().join("Paper - Author.pdf");
-    fs::write(&pdf, b"%PDF-1.4 not really").unwrap();
-    let id = library.add_book(&pdf).unwrap().id;
+    let scan = temp.path().join("Paper - Author.djvu");
+    fs::write(&scan, b"AT&TFORM not really").unwrap();
+    let id = library.add_book(&scan).unwrap().id;
 
     let error = library.read_book(id, None).err().unwrap();
     assert!(matches!(error, Error::UnsupportedFormat(_)));
-    assert!(error.to_string().contains("only has PDF"), "{error}");
+    assert!(error.to_string().contains("only has DJVU"), "{error}");
 
     // LIT sorts before TXT alphabetically; an unreadable-first choice would fail.
     let lit = temp.path().join("paper.lit");

@@ -10,6 +10,7 @@ description = "Core engine for calibre-rust: calibre-compatible library, metadat
 base64.workspace = true
 chrono.workspace = true
 encoding_rs.workspace = true
+flate2 = "1"
 html-escape.workspace = true
 image.workspace = true
 kindling = { package = "kindling-mobi", version = "=0.46.2" }

@@ -331,7 +331,7 @@ fn epub_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             div()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
-                .child("Edit EPUB"),
+                .child("Edit Book"),
         )
         .child(
             div()

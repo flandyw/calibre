@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 use regex::{Regex, RegexBuilder};
 
 use super::epub::{self, resolve_href};
+use super::{conversion, detect_format, mobi};
 use crate::error::{Error, Result};
 
 static ATTRIBUTE: LazyLock<Regex> =
@@ -1523,8 +1524,53 @@ fn malformed(text: &str) -> Option<(usize, String)> {
     }
 }
 
-/// Pack an edited book into an EPUB without ever leaving a partial file:
-/// it is written beside `output` and moved into place.
+/// Formats the editor can open and save, in order of preference. KEPUB is
+/// an EPUB with Kobo's markers; AZW3 is edited through its EPUB form and
+/// rebuilt on save.
+pub const EDITABLE_FORMATS: [&str; 3] = ["EPUB", "KEPUB", "AZW3"];
+
+fn is_azw3(path: &Path) -> bool {
+    // A kept original has the format's name after `ORIGINAL_`.
+    let format = detect_format(path);
+    matches!(
+        format.strip_prefix("ORIGINAL_").unwrap_or(&format),
+        "AZW3" | "KF8"
+    )
+}
+
+/// The EPUB form of an AZW3 file.
+fn azw3_as_epub(path: &Path) -> Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let mut epub = tempfile::Builder::new().suffix(".epub").tempfile()?;
+    mobi::write_epub(path, epub.as_file_mut())?;
+    epub.as_file_mut().flush()?;
+    Ok(epub)
+}
+
+/// Whether [`save`] to `output` writes a file that can stand as `format`.
+/// Its name decides between a Kindle file and an EPUB archive, and a KEPUB
+/// is an EPUB archive; a name of any other format is never a match.
+pub fn output_matches(format: &str, output: &Path) -> bool {
+    let named = detect_format(output);
+    match format {
+        "AZW3" => matches!(named.as_str(), "AZW3" | "KF8"),
+        "EPUB" | "KEPUB" => matches!(named.as_str(), "EPUB" | "KEPUB"),
+        _ => false,
+    }
+}
+
+/// Unpack a book of one of the [`EDITABLE_FORMATS`] for editing.
+pub fn unpack(path: &Path, destination: &Path) -> Result<usize> {
+    if is_azw3(path) {
+        epub::unpack(azw3_as_epub(path)?.path(), destination)
+    } else {
+        epub::unpack(path, destination)
+    }
+}
+
+/// Pack an edited book without ever leaving a partial file: it is written
+/// beside `output` and moved into place. The extension of `output` selects
+/// EPUB (also for KEPUB) or AZW3.
 pub fn save(directory: &Path, output: &Path) -> Result<usize> {
     let parent = output
         .parent()
@@ -1534,7 +1580,14 @@ pub fn save(directory: &Path, output: &Path) -> Result<usize> {
         .prefix(".cr-save-")
         .suffix(".epub")
         .tempfile_in(parent)?;
-    let count = epub::repack(directory, scratch.path())?;
+    let count = if is_azw3(output) {
+        let packed = tempfile::Builder::new().suffix(".epub").tempfile()?;
+        let count = epub::repack(directory, packed.path())?;
+        conversion::write_kindle(packed.path(), scratch.path(), true)?;
+        count
+    } else {
+        epub::repack(directory, scratch.path())?
+    };
     scratch
         .persist(output)
         .map_err(|err| Error::Other(format!("cannot write {}: {}", output.display(), err.error)))?;
@@ -1543,6 +1596,8 @@ pub fn save(directory: &Path, output: &Path) -> Result<usize> {
 
 fn archive_files(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
     use std::io::Read;
+    let converted = is_azw3(path).then(|| azw3_as_epub(path)).transpose()?;
+    let path = converted.as_ref().map_or(path, |epub| epub.path());
     let mut archive = zip::ZipArchive::new(fs::File::open(path)?)?;
     let mut files = HashMap::new();
     for index in 0..archive.len() {
@@ -1557,8 +1612,8 @@ fn archive_files(path: &Path) -> Result<HashMap<String, Vec<u8>>> {
     Ok(files)
 }
 
-/// What differs between two EPUB files, by content rather than by bytes of
-/// the archive.
+/// What differs between two book files of the [`EDITABLE_FORMATS`], by
+/// content rather than by bytes of the archive.
 pub fn compare(old: &Path, new: &Path) -> Result<Vec<Change>> {
     let before = archive_files(old)?;
     let after = archive_files(new)?;

@@ -1,11 +1,12 @@
 //! A book laid out for reading: sections of blocks with styled text,
 //! images, links and a table of contents, built from a [`Document`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use regex::RegexBuilder;
 
+use super::css::{Align, Computed, Element, Stylesheet, Vertical};
 use super::document::{Document, Image};
 use super::html::{attr_value, find_tag_end, tag_name};
 use crate::error::Result;
@@ -49,6 +50,21 @@ pub enum BlockKind {
     Rule,
 }
 
+/// What the book's stylesheet says about a block. Lengths are in
+/// hundredths of an em.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockStyle {
+    pub align: Align,
+    /// Text size in percent of the reader's; `None` keeps the reader's.
+    pub size: Option<u16>,
+    pub first_indent: i16,
+    pub space_before: u16,
+    pub space_after: u16,
+    pub margin_left: u16,
+    /// The family of a font the book embeds, as [`BookFont::family`].
+    pub family: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub kind: BlockKind,
@@ -57,6 +73,17 @@ pub struct Block {
     /// Nesting inside lists and quotations.
     pub indent: u8,
     pub quoted: bool,
+    pub style: BlockStyle,
+}
+
+/// A font file the book brings along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookFont {
+    /// The name the stylesheet uses, in lower case.
+    pub family: String,
+    pub bold: bool,
+    pub italic: bool,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -97,6 +124,7 @@ pub struct Book {
     pub sections: Vec<ReadingSection>,
     pub toc: Vec<TocEntry>,
     pub images: Vec<Image>,
+    pub fonts: Vec<BookFont>,
     anchors: HashMap<String, Locator>,
     /// Text length before each section, and the total as the last item.
     lengths: Vec<usize>,
@@ -135,8 +163,19 @@ const BLOCK_TAGS: [&str; 15] = [
     "img",
 ];
 
+/// The elements around every section, which stylesheets address.
+const ROOTS: [&str; 2] = ["html", "body"];
+
 struct Layout<'a> {
     images: &'a HashMap<&'a str, usize>,
+    sheet: &'a Stylesheet,
+    /// Families of the fonts the book embeds.
+    families: &'a HashSet<String>,
+    /// Open elements and the style of each.
+    elements: Vec<Element>,
+    styles: Vec<Computed>,
+    /// The depth of the open element that is not displayed.
+    hidden: Option<usize>,
     blocks: Vec<Block>,
     anchors: Vec<(String, usize)>,
     text: String,
@@ -201,7 +240,9 @@ impl Layout<'_> {
         for anchor in self.pending_anchors.drain(..) {
             self.anchors.push((anchor, self.blocks.len()));
         }
+        let style = self.block_style();
         self.blocks.push(Block {
+            style,
             kind,
             text,
             spans,
@@ -210,7 +251,127 @@ impl Layout<'_> {
         });
     }
 
+    /// The style of the block element that holds the current text.
+    fn block_style(&self) -> BlockStyle {
+        let holder = self.elements.iter().rposition(|element| {
+            BLOCK_TAGS.contains(&element.tag.as_str())
+                || matches!(element.tag.as_bytes(), [b'h', b'1'..=b'6'])
+        });
+        let Some(computed) = holder.map(|holder| &self.styles[holder]) else {
+            return BlockStyle::default();
+        };
+        let hundredths = |em: f32| (em * 100.).round().clamp(0., 2000.) as u16;
+        // The page's own margins belong to the reader.
+        let margin: f32 = self.styles[ROOTS.len().min(self.styles.len())..]
+            .iter()
+            .map(|style| style.margin_left.max(0.))
+            .sum();
+        BlockStyle {
+            align: computed.align.unwrap_or_default(),
+            size: computed.size.map(|size| (size * 100.).round() as u16),
+            first_indent: (computed.indent.unwrap_or(0.) * 100.).round() as i16,
+            space_before: hundredths(computed.margin_top),
+            space_after: hundredths(computed.margin_bottom),
+            margin_left: hundredths(margin),
+            family: computed
+                .family
+                .clone()
+                .filter(|family| self.families.contains(family)),
+        }
+    }
+
+    /// Note an element as open and start the text styles its CSS asks for.
+    fn enter(&mut self, name: &str, tag: &str, opens: bool) -> bool {
+        let element = Element {
+            tag: name.to_string(),
+            id: attr_value(tag, "id").unwrap_or_default(),
+            classes: attr_value(tag, "class")
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        };
+        let root = Computed::default();
+        let parent = self.styles.last().unwrap_or(&root);
+        let inline = attr_value(tag, "style");
+        let computed = self
+            .sheet
+            .compute(parent, &self.elements, &element, inline.as_deref());
+        let (was_bold, was_italic) = (parent.bold == Some(true), parent.italic == Some(true));
+        let shown = self.hidden.is_none() && !computed.hidden;
+        if opens {
+            if computed.hidden && self.hidden.is_none() {
+                self.hidden = Some(self.elements.len());
+            }
+            if shown {
+                self.open_tag(name, tag);
+                let key = format!("\0{}", self.elements.len());
+                let mut start =
+                    |style: Style| self.open.push((key.clone(), style, self.text.len()));
+                if computed.bold == Some(true) && !was_bold {
+                    start(Style::Bold);
+                }
+                if computed.italic == Some(true) && !was_italic {
+                    start(Style::Italic);
+                }
+                if computed.underline {
+                    start(Style::Underline);
+                }
+                if computed.strike {
+                    start(Style::Strike);
+                }
+                match computed.vertical {
+                    Some(Vertical::Super) => start(Style::Superscript),
+                    Some(Vertical::Sub) => start(Style::Subscript),
+                    None => {}
+                }
+            }
+            self.elements.push(element);
+            self.styles.push(computed);
+        } else if shown {
+            // An element without content: its block takes its own style.
+            self.elements.push(element);
+            self.styles.push(computed);
+            self.open_tag(name, tag);
+            self.close_tag(name);
+            self.elements.pop();
+            self.styles.pop();
+        }
+        shown
+    }
+
+    fn leave(&mut self, name: &str) {
+        let depth = self.elements.iter().rposition(|open| open.tag == name);
+        let Some(depth) = depth.filter(|depth| *depth >= ROOTS.len()) else {
+            return;
+        };
+        if self.hidden.is_none() {
+            self.close_tag(name);
+        }
+        for inner in (depth..self.elements.len()).rev() {
+            let key = format!("\0{inner}");
+            while let Some(index) = self.open.iter().rposition(|(open, _, _)| *open == key) {
+                let (_, style, start) = self.open.remove(index);
+                if start < self.text.len() {
+                    self.spans.push(Span {
+                        start,
+                        end: self.text.len(),
+                        style,
+                    });
+                }
+            }
+        }
+        self.elements.truncate(depth);
+        self.styles.truncate(depth);
+        if self.hidden.is_some_and(|hidden| hidden >= depth) {
+            self.hidden = None;
+        }
+    }
+
     fn push_text(&mut self, text: &str) {
+        if self.hidden.is_some() {
+            return;
+        }
         if self.pre {
             self.text.push_str(text);
             return;
@@ -376,12 +537,9 @@ impl Layout<'_> {
             at += end + 1;
             let name = tag_name(tag);
             if tag.starts_with('/') {
-                self.close_tag(&name);
+                self.leave(&name);
             } else {
-                self.open_tag(&name, tag);
-                if tag.ends_with('/') {
-                    self.close_tag(&name);
-                }
+                self.enter(&name, tag, !tag.ends_with('/'));
             }
         }
         self.flush(None);
@@ -405,9 +563,43 @@ impl Book {
             title: document.metadata.title.clone(),
             ..Book::default()
         };
+        let sheet = Stylesheet::parse(&document.css);
+        for face in &sheet.faces {
+            let file = document
+                .fonts
+                .iter()
+                .find(|font| face.source.strip_prefix("fonts/") == Some(font.name.as_str()));
+            if let Some(file) = file {
+                book.fonts.push(BookFont {
+                    family: face.family.clone(),
+                    bold: face.bold,
+                    italic: face.italic,
+                    data: file.data.clone(),
+                });
+            }
+        }
+        let families: HashSet<String> = book.fonts.iter().map(|font| font.family.clone()).collect();
+        let mut roots: Vec<Element> = Vec::new();
+        let mut root_styles: Vec<Computed> = Vec::new();
+        for tag in ROOTS {
+            let element = Element {
+                tag: tag.to_string(),
+                ..Element::default()
+            };
+            let parent = root_styles.last().cloned().unwrap_or_default();
+            let mut computed = sheet.compute(&parent, &roots, &element, None);
+            computed.hidden = false;
+            roots.push(element);
+            root_styles.push(computed);
+        }
         for (number, section) in document.sections.iter().enumerate() {
             let mut layout = Layout {
                 images: &images,
+                sheet: &sheet,
+                families: &families,
+                elements: roots.clone(),
+                styles: root_styles.clone(),
+                hidden: None,
                 blocks: Vec::new(),
                 anchors: Vec::new(),
                 text: String::new(),

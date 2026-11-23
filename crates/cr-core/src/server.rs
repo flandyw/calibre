@@ -28,7 +28,7 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_HEAD_BYTES: u64 = 16 * 1024;
 /// The whole request head must arrive within this time.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(15);
-const SECURITY: &str = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const SECURITY: &str = "default-src 'none'; img-src 'self' data:; font-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -295,6 +295,20 @@ impl State {
                     None => Response::text(404, "No such image"),
                 }
             }
+            ["read", book, "fonts", name] => {
+                let document = self.open(&library, id(book)?)?;
+                let kind = match name.rsplit_once('.').map(|(_, extension)| extension) {
+                    Some("otf") => "font/otf",
+                    Some("woff") => "font/woff",
+                    Some("woff2") => "font/woff2",
+                    _ => "font/ttf",
+                };
+                match document.fonts.iter().find(|font| font.name == *name) {
+                    Some(font) => Response::new(200, kind, font.data.clone())
+                        .header("Cache-Control", "private, max-age=3600"),
+                    None => Response::text(404, "No such font"),
+                }
+            }
             ["opds"] => opds_root(&library)?,
             ["opds", "books"] => opds_books(&library, &query)?,
             ["opds", "search.xml"] => Response::new(
@@ -315,7 +329,7 @@ impl State {
     }
 
     fn open(&self, library: &Library, id: i64) -> Result<Arc<Document>> {
-        let format = library.preferred_readable_format(id)?;
+        let format = library.preferred_viewing_format(id)?;
         let file = library
             .format_path(id, &format)?
             .ok_or(Error::BookNotFound(id))?;
@@ -348,8 +362,11 @@ impl State {
         };
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let mut body = format!(
-            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>body{{max-width:42em;margin:0 auto;padding:1em;font:1.1em/1.6 Georgia,serif;color:#222;background:#fbfaf7}}img{{max-width:100%;height:auto}}nav{{font:0.85em sans-serif;margin-bottom:2em}}section{{margin-bottom:3em}}@media(prefers-color-scheme:dark){{body{{color:#ddd;background:#181818}}a{{color:#8ab4f8}}}}</style></head><body><nav><a href=\"/book/{id}\">&larr; {}</a></nav>",
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{}</title><style>{}</style><style>html,body{{max-width:42em;margin:0 auto;padding:1em;font-size:1.1em;line-height:1.6;color:#222;background:#fbfaf7}}html{{padding:0;font-size:100%;font-family:Georgia,serif}}img{{max-width:100%;height:auto}}nav{{font:0.85em sans-serif;margin-bottom:2em}}section{{margin-bottom:3em}}@media(prefers-color-scheme:dark){{body{{color:#ddd;background:#181818}}section *{{color:inherit!important;background:transparent!important}}a,section a{{color:#8ab4f8!important}}}}</style></head><body><nav><a href=\"/book/{id}\">&larr; {}</a></nav>",
             escape(&summary.title),
+            // The book's own styles come first, so the page's win a tie,
+            // and cannot close the element that holds them.
+            document.css.replace("</", "<\\/"),
             escape(&summary.title)
         );
         for section in &document.sections {
@@ -648,7 +665,7 @@ fn details(library: &Library, id: i64) -> Result<Response> {
         ));
     }
     body.push_str("<p>");
-    if library.preferred_readable_format(id).is_ok() {
+    if library.preferred_viewing_format(id).is_ok() {
         body.push_str(&format!("<a href=\"/read/{id}/\">Read</a> &middot; "));
     }
     let downloads: Vec<String> = formats
