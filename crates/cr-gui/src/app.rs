@@ -37,6 +37,7 @@ pub enum Screen {
     Reader,
     Epub,
     Crop,
+    Tools,
 }
 
 /// A sidebar entry that narrows the book list.
@@ -264,12 +265,15 @@ pub struct CalibreApp {
 
     // EPUB editor state.
     pub epub_book_id: Option<i64>,
-    epub_dir: Option<PathBuf>,
+    pub(crate) epub_dir: Option<PathBuf>,
     pub epub_files: Vec<EpubFile>,
     pub epub_selected: Option<usize>,
     pub epub_dirty: bool,
     /// Edits written to the unpacked files but not yet saved to the library.
     pub epub_pending: bool,
+
+    /// The tools screen and the editor's search and contents panels.
+    pub tools: crate::tools::Tools,
 
     pub focus_handle: FocusHandle,
     pub list_focus: FocusHandle,
@@ -382,7 +386,9 @@ impl CalibreApp {
         let list_focus = cx.focus_handle();
         let reader_focus = cx.focus_handle();
 
+        let tools = crate::tools::Tools::new(window, cx);
         let mut app = Self {
+            tools,
             settings,
             job: None,
             close_after_job: None,
@@ -495,7 +501,7 @@ impl CalibreApp {
     }
 
     /// Shows a message in the status bar and as a toast.
-    fn announce(
+    pub(crate) fn announce(
         &mut self,
         message: impl Into<String>,
         tone: Tone,
@@ -515,7 +521,7 @@ impl CalibreApp {
     /// Runs `body` on a background thread, showing its progress in the status
     /// bar, then hands the result to `finish` on the UI thread. One job runs
     /// at a time.
-    fn run_job<T: Send + 'static>(
+    pub(crate) fn run_job<T: Send + 'static>(
         &mut self,
         label: impl Into<String>,
         window: &mut Window,
@@ -593,7 +599,7 @@ impl CalibreApp {
     }
 
     /// The open library's folder, or a status message when it cannot be changed.
-    fn writable_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<PathBuf> {
+    pub(crate) fn writable_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<PathBuf> {
         let Some(library) = &self.library else {
             self.set_status("Open a library first.", Tone::Info);
             cx.notify();
@@ -615,7 +621,7 @@ impl CalibreApp {
             let target = match self.screen {
                 Screen::Reader => self.reader_focus.clone(),
                 Screen::Library => self.list_focus.clone(),
-                Screen::Epub | Screen::Crop => self.focus_handle.clone(),
+                Screen::Epub | Screen::Crop | Screen::Tools => self.focus_handle.clone(),
             };
             window.focus(&target, cx);
         }
@@ -724,7 +730,7 @@ impl CalibreApp {
     // ---------------------------------------------------------------------
 
     /// Re-reads every book (for the sidebar) and the visible list.
-    fn refresh_all(&mut self) {
+    pub(crate) fn refresh_all(&mut self) {
         let result = self
             .library
             .as_ref()
@@ -1077,6 +1083,10 @@ impl CalibreApp {
     ) {
         self.discard_epub_editor();
         self.clear_crop();
+        // The server and the tools' lists belong to the previous library.
+        self.stop_server();
+        self.tools.problems = None;
+        self.tools.trash.clear();
         self.library = Some(library);
         self.screen = Screen::Library;
         self.shelf = Shelf::All;
@@ -2816,7 +2826,7 @@ impl CalibreApp {
         cx.notify();
     }
 
-    fn save_current_epub_file(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
+    pub(crate) fn save_current_epub_file(&mut self, cx: &mut Context<Self>) -> Result<(), String> {
         if !self.epub_dirty {
             return Ok(());
         }
@@ -3003,6 +3013,7 @@ impl CalibreApp {
         self.epub_selected = None;
         self.epub_dirty = false;
         self.epub_pending = false;
+        self.reset_editor_tools();
         if self.screen == Screen::Epub {
             self.screen = Screen::Library;
         }
@@ -3378,6 +3389,7 @@ impl CalibreApp {
         match self.screen {
             Screen::Crop => self.cancel_crop(window, cx),
             Screen::Epub => self.close_epub_editor(window, cx),
+            Screen::Tools => self.close_tools(window, cx),
             Screen::Reader => self.close_reader(window, cx),
             Screen::Library if self.editing => self.cancel_edit(window, cx),
             Screen::Library if !self.query.is_empty() => {
@@ -3419,7 +3431,7 @@ impl CalibreApp {
 // Free helpers
 // -------------------------------------------------------------------------
 
-fn text_input(
+pub(crate) fn text_input(
     placeholder: &str,
     window: &mut Window,
     cx: &mut Context<CalibreApp>,
@@ -3444,7 +3456,7 @@ fn text_area(
     })
 }
 
-fn set_textarea(input: &Entity<TextareaState>, value: String, window: &mut Window, cx: &mut App) {
+pub(crate) fn set_textarea(input: &Entity<TextareaState>, value: String, window: &mut Window, cx: &mut App) {
     input.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 
@@ -3483,7 +3495,7 @@ pub fn fit_dims(width: f32, height: f32, max_width: f32, max_height: f32) -> (f3
     (width * scale, height * scale)
 }
 
-fn scan_epub_files(root: &Path) -> Vec<EpubFile> {
+pub(crate) fn scan_epub_files(root: &Path) -> Vec<EpubFile> {
     let mut files = Vec::new();
     collect_epub_files(root, root, &mut files);
     files.sort_by(|a, b| a.relative.cmp(&b.relative));
@@ -3532,7 +3544,7 @@ fn temp_stamp() -> u128 {
         .unwrap_or(0)
 }
 
-fn split_commas(input: &str) -> Vec<String> {
+pub(crate) fn split_commas(input: &str) -> Vec<String> {
     input
         .split(',')
         .map(|value| value.trim().to_string())
@@ -3569,7 +3581,7 @@ pub fn default_library_path() -> PathBuf {
         .join("Calibre Library")
 }
 
-fn capitalize(text: &str) -> String {
+pub(crate) fn capitalize(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),

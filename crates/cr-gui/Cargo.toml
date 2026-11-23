@@ -15,5 +15,6 @@ cr-core = { path = "../cr-core" }
 futures = "0.3"
 gpui-kit = "0.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
