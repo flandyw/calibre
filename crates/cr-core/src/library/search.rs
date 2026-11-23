@@ -88,6 +88,13 @@ enum Token {
     },
 }
 
+/// Whether a search has `or` between its terms, at any depth.
+pub fn has_alternatives(query: &str) -> bool {
+    tokenize(query).iter().any(
+        |token| matches!(token, Token::Word { text, bare: true } if text.eq_ignore_ascii_case("or")),
+    )
+}
+
 fn tokenize(query: &str) -> Vec<Token> {
     let mut out = Vec::new();
     let mut current = String::new();

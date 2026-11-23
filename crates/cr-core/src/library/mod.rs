@@ -37,6 +37,7 @@ pub use maintain::*;
 pub use manage::*;
 pub use organize::*;
 pub use reading::*;
+pub use search::has_alternatives;
 
 pub const DB_FILE: &str = "metadata.db";
 pub const METADATA_FILE: &str = "metadata.opf";

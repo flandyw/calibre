@@ -10,8 +10,8 @@ use cr_core::device::{self, Device, DeviceBook, DeviceReading};
 use cr_core::formats::editing::{EpubDir, Match, SearchOptions, TocEntry};
 use cr_core::formats::Profile;
 use cr_core::library::{
-    BulkEdit, ConvertOutcome, Library, LibraryConvertOptions, Problem, SearchReplace, TextField,
-    TrashEntry,
+    has_alternatives, BulkEdit, ConvertOutcome, Library, LibraryConvertOptions, Problem,
+    SearchReplace, TextField, TrashEntry,
 };
 use cr_core::server::{Server, ServerOptions, Stopper};
 use gpui_kit::component::input::InputState;
@@ -180,10 +180,7 @@ pub fn append_term(query: &str, term: &str, join: Join) -> String {
             _ => term.to_string(),
         };
     }
-    let alternatives = query
-        .split_whitespace()
-        .any(|word| word.eq_ignore_ascii_case("or"));
-    let grouped = if alternatives && join != Join::Or {
+    let grouped = if has_alternatives(query) && join != Join::Or {
         format!("({query})")
     } else {
         query.to_string()
@@ -1768,6 +1765,15 @@ mod tests {
         assert_eq!(append_term("a", "tag:sf", Join::And), "a tag:sf");
         assert_eq!(append_term("a", "tag:sf", Join::Or), "a or tag:sf");
         assert_eq!(append_term("a", "tag:sf", Join::Not), "a not tag:sf");
+        // `or` is an operator next to a bracket too, but not inside quotes.
+        assert_eq!(
+            append_term("tag:a or(tag:b)", "tag:sf", Join::And),
+            "(tag:a or(tag:b)) tag:sf"
+        );
+        assert_eq!(
+            append_term("title:\"this or that\"", "tag:sf", Join::And),
+            "title:\"this or that\" tag:sf"
+        );
         // Alternatives are grouped before they are narrowed.
         assert_eq!(
             append_term("a OR b", "tag:sf", Join::And),
