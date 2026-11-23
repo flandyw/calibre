@@ -77,9 +77,12 @@ Import from:
 - **HTML/XHTML** — `<title>`, author/language/keywords meta tags.
 - **DOCX** — document properties (title, author, keywords, description).
 - **RTF** — the `\info` group.
-- **PDF** — the document information dictionary.
-- **CBZ** — `ComicInfo.xml` (series, number, writer, publisher, genre); the
-  first page becomes the cover.
+- **PDF** — the document information dictionary; the first full-page image,
+  when there is one, becomes the cover.
+- **CBZ/CBR** — `ComicInfo.xml` (series, number, writer, publisher, genre);
+  the first page becomes the cover. A CBR must be a ZIP archive inside: RAR
+  archives are stored but not read.
+- **KEPUB** (`.kepub.epub`, `.kepub`) — as EPUB.
 - Other files can be stored and managed; metadata falls back to the filename.
 
 **Custom columns** of every calibre type except composite are read, written
@@ -110,10 +113,23 @@ everything, and `--width` controls wrapping.
 The GUI reader lays the book out from its own markup instead of extracted
 text: headings, bold/italic/underline/code, lists, quotations, tables,
 preformatted text, images and links (links inside the book jump, others open
-in the browser), for every format that converts (EPUB, Kindle, FB2, DOCX,
-HTML, RTF, TXT). The side panel shows the book's real table of contents
-(EPUB 3 navigation document or NCX, nested), search results, and bookmarks
-and highlights. Publisher CSS, embedded fonts and paged mode are not applied.
+in the browser), for every format that converts (EPUB, KEPUB, Kindle, FB2,
+DOCX, HTML, RTF, TXT, PDF, and comics as one page image per section). The side
+panel shows the book's real table of contents (EPUB 3 navigation document or
+NCX, nested), search results, and bookmarks and highlights.
+
+The book's stylesheet is followed for what a reflowing reader can honour:
+alignment, text size, bold/italic/underline/strike, super- and subscript,
+paragraph spacing, left margins, hidden elements (`display: none`) and
+embedded TrueType/OpenType fonts (including fonts obfuscated with the EPUB or
+Adobe method, which are keyed to the book's identifier and are not DRM).
+Selectors by element, class, ID and ancestry are understood; colours,
+floats, first-line indents and paged mode are not applied. `cr serve` gives
+the browser reader the same stylesheet and fonts.
+
+A PDF is read as reflowed text with its images and outline, not as fixed
+pages: columns, tables and scanned (image-only) pages do not come through
+well, and encrypted files are refused.
 
 - **Position**: the place is saved when you move or close the book and
   restored on reopening; a book last read in calibre's viewer resumes at
@@ -132,10 +148,12 @@ and highlights. Publisher CSS, embedded fonts and paged mode are not applied.
   `cr annotations import-calibre --book ID` copies its highlights in.
   Nothing is written back to calibre.
 
-### Editing EPUBs
+### Editing EPUB, KEPUB and AZW3 books
 
-`cr epub ACTION TARGET` works on a library book ID, an `.epub` file or an
-unpacked directory (`cr edit ID --extract DIR`):
+`cr epub ACTION TARGET` works on a library book ID, an `.epub`, `.kepub.epub`
+or `.azw3` file, or an unpacked directory (`cr edit ID --extract DIR`). A
+library book is edited in the first of EPUB, KEPUB and AZW3 it has. An AZW3
+book is opened through its EPUB form and rebuilt as AZW3 when saved:
 
 - `check` reports missing or unlisted files, bad media types, markup that is
   not well-formed (with the line), broken links, images and anchors, spine
@@ -153,10 +171,11 @@ unpacked directory (`cr edit ID --extract DIR`):
 
 Saving to a library book checks it first and refuses a book with errors
 (`--force` overrides), writes the file atomically, does nothing when the
-content is unchanged, and keeps the first replaced file as `ORIGINAL_EPUB`.
+content is unchanged, and keeps the first replaced file as
+`ORIGINAL_<FORMAT>` (`ORIGINAL_EPUB`, `ORIGINAL_KEPUB`, `ORIGINAL_AZW3`).
 The GUI editor's Check Book and Check & Save to Library buttons use the same
 checks and save path. Not included: live preview, spell check, HTML tidy,
-font subsetting, EPUBCheck, and editing AZW3 or KEPUB directly.
+font subsetting and EPUBCheck.
 
 ### Conversion
 
@@ -164,7 +183,7 @@ font subsetting, EPUBCheck, and editing AZW3 or KEPUB directly.
 
 | From | To |
 |---|---|
-| EPUB, AZW3, AZW, MOBI, PRC, FB2, DOCX, HTML, RTF, TXT | EPUB, AZW3, MOBI, HTMLZ, TXT |
+| EPUB, KEPUB, AZW3, AZW, MOBI, PRC, FB2, DOCX, HTML, RTF, TXT, PDF, CBZ, CBR | EPUB, AZW3, MOBI, HTMLZ, TXT |
 
 EPUB to AZW3/MOBI uses [Kindling](https://github.com/ciscoriordan/kindling) and
 Kindle to EPUB uses bundled [libmobi](https://github.com/bfabiszewski/libmobi);
@@ -172,8 +191,9 @@ both keep the book's own files, including styles and fonts. Every other pair
 goes through one document model (sections of XHTML, images, a stylesheet and
 metadata): the source is read into it and the target is written from it. That
 path keeps headings, paragraphs, inline formatting, lists, tables, images,
-links, footnote anchors and the source's CSS; it drops scripts, forms, embedded
-fonts and media. The EPUB it writes has a generated table of contents and a
+links, footnote anchors, the source's CSS and the fonts it embeds; it drops
+scripts, forms and media. A PDF is read as reflowed text (see Reading); a
+comic becomes one page image per section. The EPUB it writes has a generated table of contents and a
 cover page. Kindle reading and conversion require DRM-free files.
 
 - `--no-split` keeps the source as one section. By default a new section
@@ -192,15 +212,17 @@ A book that already has the format is skipped; `--overwrite` replaces it and
 keeps the old file as `ORIGINAL_<FORMAT>`, as calibre does. One book failing
 does not stop the others.
 
-Not converted yet: PDF, comics (CBZ/CBR), ODT, LIT and other legacy formats;
-Kindle to Kindle directly (go through EPUB).
+Not converted yet: RAR-compressed comics (repack as CBZ), ODT, LIT and other
+legacy formats; Kindle to Kindle directly (go through EPUB). There is no PDF,
+KEPUB or comic output.
 
 ### Editing
 
-`cr edit` unpacks an EPUB to a directory, lets you change its XHTML/resources,
-then repacks it with a spec-correct stored `mimetype` entry. Repacking replaces
-the library copy by default (`--no-replace` to keep it separate). This is the
-beginning of the "Edit book" workflow; calibre's full editor UI is not there yet.
+`cr edit` unpacks a book to a directory, lets you change its XHTML/resources,
+then repacks it with a spec-correct stored `mimetype` entry. `--format` picks
+EPUB (the default), KEPUB or AZW3. Repacking replaces the library copy by
+default (`--no-replace` to keep it separate). This is the beginning of the
+"Edit book" workflow; calibre's full editor UI is not there yet.
 
 ### Devices
 
@@ -526,13 +548,13 @@ Currently missing:
   saved searches or full-text results (its search box does accept the whole
   search language); these are CLI-only.
 - Format conversion outside the EPUB and Kindle paths above.
-- PDF text extraction, PDF metadata stored in compressed object streams or
-  XMP, and CBR/CB7 comic archives.
+- Page-faithful PDF viewing, PDF metadata stored in compressed object streams
+  or XMP, and RAR/7z comic archives (CBR/CB7).
 - Downloading metadata and covers from online sources.
 - Notes on authors/series/tags, composite (template) custom columns, and
   custom values in `metadata.opf` (calibre rewrites them there itself).
 - calibre's plugin system, content server/OPDS and annotations.
-- Full ebook editor (only EPUB unpack/repack today), cover cropping and
+- Live preview and spell check in the editor, cover cropping and
   thumbnail generation, DRM.
 - Opening libraries older than schema 28 without an upgrade step.
 
@@ -540,7 +562,7 @@ Currently missing:
 
 1. Polish the GPUI app: visual EPUB editing, bulk actions and a richer crop
    surface with drag handles.
-2. PDF/DOCX text extraction.
+2. Page-faithful PDF viewing.
 3. Calibre custom columns and saved searches.
 4. OPDS/content server and annotation sync.
 5. Benchmarks against calibre on a 10k-book library, with a compatibility test
