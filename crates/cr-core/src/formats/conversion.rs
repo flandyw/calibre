@@ -17,8 +17,9 @@ use crate::metadata::Metadata;
 use crate::text::format_from_path;
 
 /// Formats a conversion can start from, best source first.
-pub const INPUT_FORMATS: [&str; 11] = [
-    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "DOCX", "HTML", "RTF", "TXT",
+pub const INPUT_FORMATS: [&str; 14] = [
+    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "DOCX", "HTML", "RTF", "TXT", "PDF", "CBZ",
+    "CBR",
 ];
 /// Formats a conversion can produce.
 pub const OUTPUT_FORMATS: [&str; 5] = ["EPUB", "AZW3", "MOBI", "HTMLZ", "TXT"];

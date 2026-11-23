@@ -315,7 +315,7 @@ impl State {
     }
 
     fn open(&self, library: &Library, id: i64) -> Result<Arc<Document>> {
-        let format = library.preferred_readable_format(id)?;
+        let format = library.preferred_viewing_format(id)?;
         let file = library
             .format_path(id, &format)?
             .ok_or(Error::BookNotFound(id))?;
@@ -648,7 +648,7 @@ fn details(library: &Library, id: i64) -> Result<Response> {
         ));
     }
     body.push_str("<p>");
-    if library.preferred_readable_format(id).is_ok() {
+    if library.preferred_viewing_format(id).is_ok() {
         body.push_str(&format!("<a href=\"/read/{id}/\">Read</a> &middot; "));
     }
     let downloads: Vec<String> = formats

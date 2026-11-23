@@ -486,14 +486,7 @@ impl Library {
     pub fn open_book(&self, id: i64, format: Option<&str>) -> Result<Book> {
         let format = match format {
             Some(format) => format.to_ascii_uppercase(),
-            None => {
-                let have = self.formats(id)?;
-                crate::formats::INPUT_FORMATS
-                    .iter()
-                    .find(|format| have.iter().any(|have| have == *format))
-                    .map(|format| format.to_string())
-                    .ok_or_else(|| Error::Other(format!("book {id} has no readable format")))?
-            }
+            None => self.preferred_viewing_format(id)?,
         };
         let path = self
             .format_path(id, &format)?

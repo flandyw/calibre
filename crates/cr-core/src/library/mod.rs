@@ -55,9 +55,11 @@ const REQUIRED_TABLES: [&str; 8] = [
     "library_id",
 ];
 /// Formats `read_book` can turn into text, best first.
-pub const READABLE_FORMATS: [&str; 11] = [
-    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "DOCX", "RTF", "TXT",
+pub const READABLE_FORMATS: [&str; 12] = [
+    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "DOCX", "RTF", "TXT", "PDF",
 ];
+/// Formats that open in the reader but have no text: comics.
+pub const PICTURE_FORMATS: [&str; 2] = ["CBZ", "CBR"];
 
 /// Test hook: where an injected failure interrupts a mutation.
 #[doc(hidden)]
@@ -852,6 +854,23 @@ impl Library {
                     "book {id} only has {}; reading needs one of {}",
                     formats.join(", "),
                     READABLE_FORMATS.join(", ")
+                ))
+            })
+    }
+
+    /// The best format of a book that the reader can show, text first.
+    pub fn preferred_viewing_format(&self, id: i64) -> Result<String> {
+        let formats = self.formats(id)?;
+        READABLE_FORMATS
+            .iter()
+            .chain(&PICTURE_FORMATS)
+            .find(|wanted| formats.iter().any(|f| f.eq_ignore_ascii_case(wanted)))
+            .map(|f| f.to_string())
+            .ok_or_else(|| {
+                Error::UnsupportedFormat(format!(
+                    "book {id} has no format the reader can show; it needs one of {}, {}",
+                    READABLE_FORMATS.join(", "),
+                    PICTURE_FORMATS.join(", ")
                 ))
             })
     }

@@ -8,6 +8,7 @@ pub mod epub;
 pub mod fb2;
 pub mod html;
 mod mobi;
+pub mod pdf;
 pub mod reading;
 pub mod txt;
 
@@ -119,7 +120,7 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
             // A file that cannot be parsed is still worth storing.
             "DOCX" => documents::docx_metadata(path)
                 .unwrap_or_else(|_| (txt::filename_metadata(path), None)),
-            "CBZ" => documents::cbz_metadata(path)
+            "CBZ" | "CBR" => documents::cbz_metadata(path)
                 .unwrap_or_else(|_| (txt::filename_metadata(path), None)),
             "RTF" => (
                 documents::rtf_metadata(path).unwrap_or_else(|_| txt::filename_metadata(path)),
@@ -127,7 +128,7 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
             ),
             "PDF" => (
                 documents::pdf_metadata(path).unwrap_or_else(|_| txt::filename_metadata(path)),
-                None,
+                pdf::cover(path),
             ),
             _ => (txt::filename_metadata(path), None),
         };
@@ -159,6 +160,7 @@ pub fn extract_text(path: &Path, format: Option<&str>) -> Result<BookText> {
         "AZW3" | "KF8" | "AZW" | "MOBI" | "PRC" => mobi::text(path),
         "DOCX" => documents::docx_text(path),
         "RTF" => documents::rtf_text(path),
+        "PDF" => pdf::text(path),
         other => Err(Error::UnsupportedFormat(format!(
             "{other} text extraction is not implemented yet"
         ))),

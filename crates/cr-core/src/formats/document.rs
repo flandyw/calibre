@@ -15,7 +15,7 @@ use zip::write::{SimpleFileOptions, ZipWriter};
 use zip::{CompressionMethod, ZipArchive};
 
 use super::html::{attr_value, find_tag_end, first_heading, html_to_text, tag_name};
-use super::{decode_markup, documents, epub, txt, BookText};
+use super::{decode_markup, documents, epub, pdf, txt, BookText};
 use crate::error::{Error, Result};
 use crate::metadata::Metadata;
 use crate::xml::{self, Node};
@@ -573,6 +573,8 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
             from_text(text, &mut document);
         }
         "RTF" => from_text(documents::rtf_text(path)?, &mut document),
+        "PDF" => read_pdf(path, options.split_chapters, &mut document)?,
+        "CBZ" | "CBR" => read_comic(path, &mut document)?,
         other => {
             return Err(Error::UnsupportedFormat(format!(
                 "{other} cannot be converted"
@@ -630,6 +632,82 @@ fn from_text(text: BookText, document: &mut Document) {
             html,
         });
     }
+}
+
+fn read_pdf(path: &Path, split: bool, document: &mut Document) -> Result<()> {
+    let book = pdf::read_book(&std::fs::read(path)?)?;
+    let mut images = Images::default();
+    let mut whole = Section::default();
+    for (title, parts) in book.chapters {
+        let mut section = Section {
+            title: title.trim().to_string(),
+            html: String::new(),
+        };
+        // A chapter that does not open with its own heading gets its
+        // bookmark as one.
+        let headed = matches!(parts.first(), Some(pdf::Part::Heading(..)));
+        if !section.title.is_empty() && !headed {
+            section
+                .html
+                .push_str(&format!("<h2>{}</h2>\n", escape(&section.title)));
+        }
+        for part in parts {
+            match part {
+                pdf::Part::Heading(level, text) => {
+                    section
+                        .html
+                        .push_str(&format!("<h{level}>{}</h{level}>\n", escape(&text)));
+                }
+                pdf::Part::Paragraph(text) => {
+                    section
+                        .html
+                        .push_str(&format!("<p>{}</p>\n", escape(&text)));
+                }
+                pdf::Part::Image(data) => {
+                    let source = format!("pdf{}", images.list.len());
+                    if let Some(src) = images.src(&source, || Some(data)) {
+                        section
+                            .html
+                            .push_str(&format!("<p><img src=\"{src}\" alt=\"\"/></p>\n"));
+                    }
+                }
+            }
+        }
+        if split {
+            document.sections.push(section);
+        } else {
+            whole.html.push_str(&section.html);
+        }
+    }
+    if !split && !whole.html.is_empty() {
+        document.sections.push(whole);
+    }
+    document.images = images.list;
+    if document.sections.is_empty() {
+        return Err(Error::Other(format!(
+            "{} has no text or images that can be read; it may be a scan",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_comic(path: &Path, document: &mut Document) -> Result<()> {
+    let mut archive = documents::open_comic(path)?;
+    let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+    let mut images = Images::default();
+    for name in documents::comic_pages(&names) {
+        let Some(src) = images.src(&name, || documents::zip_entry(&mut archive, &name)) else {
+            continue;
+        };
+        let title = format!("Page {}", document.sections.len() + 1);
+        document.sections.push(Section {
+            html: format!("<div class=\"comic-page\"><img src=\"{src}\" alt=\"{title}\"/></div>\n"),
+            title,
+        });
+    }
+    document.images = images.list;
+    Ok(())
 }
 
 fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
