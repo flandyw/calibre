@@ -261,14 +261,17 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .into_any_element()
             })
             .collect();
-    if app.selected_formats.iter().any(|format| format == "EPUB") {
+    if let Some(source) = ["EPUB", "KEPUB"]
+        .into_iter()
+        .find(|source| app.selected_formats.iter().any(|format| format == source))
+    {
         formats.push(
             Button::new("convert-to-azw3")
                 .outline()
                 .small()
                 .label("Convert to AZW3")
                 .on_click(cx.listener(|this, _, window, cx| {
-                    this.save_conversion("EPUB", "azw3", window, cx)
+                    this.save_conversion(source, "azw3", window, cx)
                 }))
                 .into_any_element(),
         );
