@@ -17,6 +17,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{params, params_from_iter, Connection, OpenFlags, OptionalExtension};
 
 use crate::error::{Error, Result};
+use crate::formats::editing::EDITABLE_FORMATS;
 use crate::formats::{self, BookText};
 use crate::jobs::{self, ItemResult, JobContext};
 use crate::metadata::{format_datetime, now, parse_datetime, BookSummary, Metadata};
@@ -55,8 +56,9 @@ const REQUIRED_TABLES: [&str; 8] = [
     "library_id",
 ];
 /// Formats `read_book` can turn into text, best first.
-pub const READABLE_FORMATS: [&str; 12] = [
-    "EPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "DOCX", "RTF", "TXT", "PDF",
+pub const READABLE_FORMATS: [&str; 13] = [
+    "EPUB", "KEPUB", "AZW3", "KF8", "MOBI", "AZW", "PRC", "FB2", "HTML", "DOCX", "RTF", "TXT",
+    "PDF",
 ];
 /// Formats that open in the reader but have no text: comics.
 pub const PICTURE_FORMATS: [&str; 2] = ["CBZ", "CBR"];
@@ -884,15 +886,32 @@ impl Library {
     /// Extract an EPUB into a directory for editing.
     pub fn unpack_book(&self, id: i64, format: &str, destination: &Path) -> Result<usize> {
         let format = format.to_ascii_uppercase();
-        if format != "EPUB" {
+        if !EDITABLE_FORMATS.contains(&format.as_str()) {
             return Err(Error::UnsupportedFormat(format!(
-                "editing {format} files is not implemented; only EPUB"
+                "{format} files cannot be edited; only {}",
+                EDITABLE_FORMATS.join(", ")
             )));
         }
         let path = self
             .format_path(id, &format)?
             .ok_or_else(|| Error::Other(format!("book {id} has no {format} file")))?;
-        formats::epub::unpack(&path, destination)
+        formats::editing::unpack(&path, destination)
+    }
+
+    /// The format of a book the editor opens: the first of
+    /// [`EDITABLE_FORMATS`] it has.
+    pub fn editable_format(&self, id: i64) -> Result<String> {
+        let have = self.formats(id)?;
+        EDITABLE_FORMATS
+            .iter()
+            .find(|format| have.iter().any(|own| own == *format))
+            .map(|format| format.to_string())
+            .ok_or_else(|| {
+                Error::UnsupportedFormat(format!(
+                    "book {id} has no format that can be edited ({})",
+                    EDITABLE_FORMATS.join(", ")
+                ))
+            })
     }
 
     /// Replace (or add) a format file from an edited copy.

@@ -332,7 +332,7 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Change Cover…", ChangeCover),
         MenuItem::action("Crop Cover…", CropCover),
-        MenuItem::action("Edit EPUB…", EditEpub),
+        MenuItem::action("Edit Book…", EditEpub),
         MenuItem::separator(),
         MenuItem::action("Open in Default App", OpenInDefaultApp),
         MenuItem::action(reveal_label(), RevealInFileManager),

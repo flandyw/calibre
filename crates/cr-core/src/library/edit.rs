@@ -10,7 +10,7 @@ use crate::formats::editing::{self, Change, EpubDir, Issue, Severity};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveOutcome {
     /// The library copy was replaced; the first replacement of a book keeps
-    /// the old file as `ORIGINAL_EPUB`.
+    /// the old file as `ORIGINAL_<FORMAT>`.
     Saved { changes: Vec<Change> },
     /// The edited book has the same content as the library copy.
     Unchanged,
@@ -19,15 +19,35 @@ pub enum SaveOutcome {
 }
 
 impl Library {
-    /// Replace a book's EPUB with an edited, unpacked copy. The book is
-    /// checked first and refused if it has errors, unless `force` is set.
+    /// Replace a book's EPUB with an edited, unpacked copy. See
+    /// [`Library::save_edited_format`].
     pub fn save_edited_book(
         &mut self,
         id: i64,
         directory: &Path,
         force: bool,
     ) -> Result<SaveOutcome> {
+        self.save_edited_format(id, "EPUB", directory, force)
+    }
+
+    /// Replace one format of a book (EPUB, KEPUB or AZW3) with an edited,
+    /// unpacked copy. The book is checked first and refused if it has
+    /// errors, unless `force` is set.
+    pub fn save_edited_format(
+        &mut self,
+        id: i64,
+        format: &str,
+        directory: &Path,
+        force: bool,
+    ) -> Result<SaveOutcome> {
         self.writable()?;
+        let format = format.to_ascii_uppercase();
+        if !editing::EDITABLE_FORMATS.contains(&format.as_str()) {
+            return Err(Error::UnsupportedFormat(format!(
+                "{format} files cannot be edited; only {}",
+                editing::EDITABLE_FORMATS.join(", ")
+            )));
+        }
         let book = EpubDir::open(directory)?;
         if !force {
             let errors: Vec<Issue> = book
@@ -42,7 +62,7 @@ impl Library {
         let scratch = tempfile::tempdir()?;
         let packed = scratch.path().join("book.epub");
         editing::save(directory, &packed)?;
-        let current = self.format_path(id, "EPUB")?;
+        let current = self.format_path(id, &format)?;
         let changes = match &current {
             Some(current) => editing::compare(current, &packed)?,
             None => Vec::new(),
@@ -50,13 +70,20 @@ impl Library {
         if current.is_some() && changes.is_empty() {
             return Ok(SaveOutcome::Unchanged);
         }
+        let built = if format == "AZW3" {
+            let built = scratch.path().join("book.azw3");
+            editing::save(directory, &built)?;
+            built
+        } else {
+            packed
+        };
         if let Some(current) = &current {
-            let have = self.formats(id)?;
-            if !have.iter().any(|format| format == "ORIGINAL_EPUB") {
-                self.replace_format(id, "ORIGINAL_EPUB", current)?;
+            let backup = format!("ORIGINAL_{format}");
+            if !self.formats(id)?.contains(&backup) {
+                self.replace_format(id, &backup, current)?;
             }
         }
-        self.replace_format(id, "EPUB", &packed)?;
+        self.replace_format(id, &format, &built)?;
         Ok(SaveOutcome::Saved { changes })
     }
 

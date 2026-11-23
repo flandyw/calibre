@@ -63,6 +63,11 @@ impl BookText {
 
 /// The canonical format name for a path, e.g. `EPUB`, `AZW3`, `HTML`.
 pub fn detect_format(path: &Path) -> String {
+    // Kobo's EPUB variant carries a double extension.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    if name.to_ascii_lowercase().ends_with(".kepub.epub") {
+        return "KEPUB".to_string();
+    }
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         let upper = ext.trim().to_ascii_uppercase();
         return match upper.as_str() {
@@ -111,7 +116,7 @@ pub fn import(path: &Path) -> Result<ImportedBook> {
     let format = detect_format(path);
     let (mut metadata, cover) =
         match format.as_str() {
-            "EPUB" => epub::metadata(path)?,
+            "EPUB" | "KEPUB" => epub::metadata(path)?,
             "FB2" => fb2::read(path)?,
             "TXT" => (txt::metadata(path), None),
             "HTML" => (html_metadata(path)?, None),
@@ -154,7 +159,7 @@ pub fn extract_text(path: &Path, format: Option<&str>) -> Result<BookText> {
         .map(str::to_ascii_uppercase)
         .unwrap_or_else(|| detect_format(path));
     match format.as_str() {
-        "EPUB" => epub::text(path),
+        "EPUB" | "KEPUB" => epub::text(path),
         "FB2" => fb2::text(path),
         "TXT" => txt::text(path),
         "HTML" => txt::html_text(path),
@@ -229,6 +234,8 @@ mod tests {
     #[test]
     fn detects_formats() {
         assert_eq!(detect_format(Path::new("book.epub")), "EPUB");
+        assert_eq!(detect_format(Path::new("book.kepub.epub")), "KEPUB");
+        assert_eq!(detect_format(Path::new("book.kepub")), "KEPUB");
         assert_eq!(detect_format(Path::new("book.xhtml")), "HTML");
         assert_eq!(detect_format(Path::new("book.azw3")), "AZW3");
         assert_eq!(detect_format(Path::new("book.azw")), "AZW");

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cr_core::device::{self, Device, SendOptions};
-use cr_core::formats::editing::{EpubDir, Severity};
+use cr_core::formats::editing::{EpubDir, Severity, EDITABLE_FORMATS};
 use cr_core::formats::reading::{Book, Hit, Locator};
 use cr_core::jobs::{self, Canceller, JobContext, Progress};
 use cr_core::library::{
@@ -182,6 +182,14 @@ pub enum Tone {
 const EXPORT_TEMPLATE: &str = "{author_sort}/{title} ({id})/{title} - {author}";
 const RECENTLY_ADDED_LIMIT: usize = 50;
 /// Formats tried first when opening or dragging a book out of the app.
+/// The format of a book the editor opens, if it has one.
+pub fn editable_format(formats: &[String]) -> Option<&'static str> {
+    EDITABLE_FORMATS
+        .iter()
+        .find(|format| formats.iter().any(|own| own.eq_ignore_ascii_case(format)))
+        .copied()
+}
+
 const PREFERRED_FORMATS: &[&str] = &["EPUB", "PDF", "AZW3", "MOBI", "FB2", "TXT"];
 
 /// A long operation running off the UI thread, shown in the status bar.
@@ -240,6 +248,8 @@ pub struct CalibreApp {
     pub chapter_list_visible: bool,
     pub screen: Screen,
     pub editing: bool,
+    /// The format of the book open in the editor.
+    pub epub_format: String,
     pub status: String,
     pub status_tone: Tone,
     pub query: String,
@@ -407,6 +417,7 @@ impl CalibreApp {
             chapter_list_visible: true,
             screen: Screen::Library,
             editing: false,
+            epub_format: "EPUB".to_string(),
             status: String::new(),
             status_tone: Tone::Info,
             query: String::new(),
@@ -2707,20 +2718,16 @@ impl CalibreApp {
         if self.editing || self.screen != Screen::Library {
             return;
         }
-        if !self
-            .selected_formats
-            .iter()
-            .any(|format| format.eq_ignore_ascii_case("EPUB"))
-        {
+        let Some(format) = editable_format(&self.selected_formats) else {
             self.announce(
-                "This book has no EPUB file to edit.",
+                "This book has no EPUB, KEPUB or AZW3 file to edit.",
                 Tone::Info,
                 window,
                 cx,
             );
             cx.notify();
             return;
-        }
+        };
         let dir = std::env::temp_dir().join(format!("calibre-rust-edit-{id}-{}", temp_stamp()));
         if let Err(err) = std::fs::create_dir_all(&dir) {
             self.announce(
@@ -2735,11 +2742,11 @@ impl CalibreApp {
         let unpacked = self
             .library
             .as_ref()
-            .map(|library| library.unpack_book(id, "EPUB", &dir));
+            .map(|library| library.unpack_book(id, format, &dir));
         if let Some(Err(err)) = unpacked {
             let _ = std::fs::remove_dir_all(&dir);
             self.announce(
-                format!("Could not unpack EPUB: {err}"),
+                format!("Could not unpack the {format} file: {err}"),
                 Tone::Error,
                 window,
                 cx,
@@ -2751,7 +2758,7 @@ impl CalibreApp {
         if files.is_empty() {
             let _ = std::fs::remove_dir_all(&dir);
             self.announce(
-                "This EPUB has no editable text files.",
+                "This book has no editable text files.",
                 Tone::Info,
                 window,
                 cx,
@@ -2760,6 +2767,7 @@ impl CalibreApp {
             return;
         }
         self.epub_book_id = Some(id);
+        self.epub_format = format.to_string();
         self.epub_dir = Some(dir);
         self.epub_files = files;
         self.epub_selected = None;
@@ -2852,11 +2860,12 @@ impl CalibreApp {
             return false;
         }
         // Checked first, written atomically, and the first save keeps the
-        // old file as ORIGINAL_EPUB.
+        // old file as ORIGINAL_<FORMAT>.
+        let format = self.epub_format.clone();
         let outcome = match self.library.as_mut() {
             Some(library) => library
-                .save_edited_book(id, &dir, false)
-                .map_err(|err| format!("Could not save the EPUB: {err}")),
+                .save_edited_format(id, &format, &dir, false)
+                .map_err(|err| format!("Could not save the {format} file: {err}")),
             None => Err("Open a library first.".to_string()),
         };
         let ok = match outcome {
@@ -2880,10 +2889,10 @@ impl CalibreApp {
                 window.focus(&self.list_focus, cx);
                 let message = match saved {
                     SaveOutcome::Saved { changes } => format!(
-                        "Saved {} changed file(s); the original is kept as ORIGINAL_EPUB.",
+                        "Saved {} changed file(s); the original is kept as ORIGINAL_{format}.",
                         changes.len()
                     ),
-                    _ => "Nothing changed; the library EPUB was left as it is.".to_string(),
+                    _ => "Nothing changed; the library copy was left as it is.".to_string(),
                 };
                 self.announce(message, Tone::Success, window, cx);
                 true
@@ -2948,15 +2957,15 @@ impl CalibreApp {
     pub fn close_epub_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.epub_dirty {
             self.discard_epub_editor();
-            self.set_status("Closed the EPUB editor.", Tone::Info);
+            self.set_status("Closed the book editor.", Tone::Info);
             window.focus(&self.list_focus, cx);
             cx.notify();
             return;
         }
         let receiver = window.prompt(
             PromptLevel::Warning,
-            "Save changes to the EPUB before closing?",
-            Some("Your edits are only written to the library when the EPUB is repacked."),
+            "Save changes to the book before closing?",
+            Some("Your edits are only written to the library when the book is saved."),
             &["Repack & Close", "Discard Changes", "Cancel"],
             cx,
         );

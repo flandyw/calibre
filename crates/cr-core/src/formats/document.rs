@@ -564,7 +564,7 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
         Split::None
     };
     match format {
-        "EPUB" => read_epub(path, &mut document)?,
+        "EPUB" | "KEPUB" => read_epub(path, &mut document)?,
         "HTML" => read_html(path, headings, &mut document)?,
         "FB2" => read_fb2(path, options.split_chapters, &mut document)?,
         "DOCX" => read_docx(path, options.split_chapters, &mut document)?,

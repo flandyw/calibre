@@ -281,25 +281,26 @@ enum Command {
     /// Unpack or repack an EPUB for editing
     Edit {
         id: i64,
-        /// Unpack the EPUB into this directory
+        /// Unpack the book into this directory
         #[arg(long)]
         extract: Option<PathBuf>,
-        /// Repack this directory into an EPUB
+        /// Repack this directory into a book file
         #[arg(long)]
         pack: Option<PathBuf>,
-        /// Output EPUB for --pack (default: book-<id>.epub)
+        /// Output file for --pack (default: book-<id>.epub, .kepub.epub or .azw3)
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// The format to edit: EPUB, KEPUB or AZW3
         #[arg(long, default_value = "EPUB")]
         format: String,
         /// Do not replace the library copy after repacking
         #[arg(long)]
         no_replace: bool,
     },
-    /// Work on an EPUB's contents: check, fix, search, replace, toc, files, add, rm, mv, spine, compress, diff or restore
+    /// Work on the contents of an EPUB, KEPUB or AZW3 book: check, fix, search, replace, toc, files, add, rm, mv, spine, compress, diff or restore
     Epub {
         action: String,
-        /// A library book ID, an EPUB file, or an unpacked EPUB directory
+        /// A library book ID, an EPUB, KEPUB or AZW3 file, or an unpacked book directory
         target: PathBuf,
         /// search: PATTERN; replace: PATTERN REPLACEMENT; add: SOURCE PATH; rm: PATH;
         /// mv: FROM TO; spine: PATH POSITION; diff: OTHER.epub
@@ -2029,33 +2030,41 @@ fn epub_command(
     match action {
         "diff" => {
             let changes = match book_id {
-                Some(id) => Library::open(library_path)?.compare_with_original(id, "EPUB")?,
-                None => editing::compare(target, Path::new(argument(0, "a second EPUB")?))?,
+                Some(id) => {
+                    let library = Library::open(library_path)?;
+                    library.compare_with_original(id, &library.editable_format(id)?)?
+                }
+                None => editing::compare(target, Path::new(argument(0, "a second book")?))?,
             };
             show(&changes);
             return Ok(());
         }
         "restore" => {
             let id = book_id.context("restore needs a library book ID")?;
-            Library::open(library_path)?.restore_original(id, "EPUB")?;
-            println!("Restored the original EPUB of book {id}.");
+            let mut library = Library::open(library_path)?;
+            let format = library.editable_format(id)?;
+            library.restore_original(id, &format)?;
+            println!("Restored the original {format} of book {id}.");
             return Ok(());
         }
         _ => {}
     }
 
     let scratch = tempfile::tempdir()?;
+    let mut book_format = String::new();
     let directory = if target.is_dir() {
         target.to_path_buf()
     } else if let Some(id) = book_id {
-        Library::open(library_path)?.unpack_book(id, "EPUB", scratch.path())?;
+        let library = Library::open(library_path)?;
+        book_format = library.editable_format(id)?;
+        library.unpack_book(id, &book_format, scratch.path())?;
         scratch.path().to_path_buf()
     } else if target.is_file() {
-        cr_core::formats::epub::unpack(target, scratch.path())?;
+        editing::unpack(target, scratch.path())?;
         scratch.path().to_path_buf()
     } else {
         bail!(
-            "{} is not a book ID, an EPUB file or a directory",
+            "{} is not a book ID, an EPUB, KEPUB or AZW3 file, or a directory",
             target.display()
         );
     };
@@ -2179,11 +2188,17 @@ fn epub_command(
 
     if modified && !target.is_dir() {
         if let Some(id) = book_id {
-            match Library::open(library_path)?.save_edited_book(id, &directory, force)? {
+            let saved = Library::open(library_path)?.save_edited_format(
+                id,
+                &book_format,
+                &directory,
+                force,
+            )?;
+            match saved {
                 SaveOutcome::Saved { changes } => {
                     show(&changes);
                     println!(
-                        "Saved book {id}; the first edit keeps the old file as ORIGINAL_EPUB."
+                        "Saved book {id}; the first edit keeps the old file as ORIGINAL_{book_format}."
                     );
                 }
                 SaveOutcome::Unchanged => println!("Book {id} is unchanged."),
@@ -2217,22 +2232,27 @@ fn edit_book(
     if extract.is_none() && pack.is_none() {
         bail!("specify --extract DIR and/or --pack DIR");
     }
-    if !format.eq_ignore_ascii_case("EPUB") {
-        bail!("--format currently only supports EPUB");
+    let format = format.to_ascii_uppercase();
+    if !editing::EDITABLE_FORMATS.contains(&format.as_str()) {
+        bail!("--format supports {}", editing::EDITABLE_FORMATS.join(", "));
     }
     let mut library = Library::open(library_path)?;
 
     if let Some(directory) = extract {
-        let count = library.unpack_book(id, "EPUB", &directory)?;
+        let count = library.unpack_book(id, &format, &directory)?;
         println!("Extracted {count} files to {}", directory.display());
     }
     if let Some(directory) = pack {
-        let output = output.unwrap_or_else(|| PathBuf::from(format!("book-{id}.epub")));
-        let count = cr_core::formats::epub::repack(&directory, &output)?;
+        let extension = match format.as_str() {
+            "KEPUB" => "kepub.epub".to_string(),
+            other => other.to_ascii_lowercase(),
+        };
+        let output = output.unwrap_or_else(|| PathBuf::from(format!("book-{id}.{extension}")));
+        let count = editing::save(&directory, &output)?;
         println!("Packed {count} files into {}", output.display());
         if !no_replace {
-            library.replace_format(id, "EPUB", &output)?;
-            println!("Replaced EPUB in the library");
+            library.replace_format(id, &format, &output)?;
+            println!("Replaced {format} in the library");
         }
     }
     Ok(())
