@@ -1683,14 +1683,17 @@ pub fn change_toc(
         }
         TocChange::Remove => {
             entries.remove(index);
+            nest_properly(entries);
             (None, true)
         }
         TocChange::Up if index > 0 => {
             entries.swap(index, index - 1);
+            nest_properly(entries);
             (Some(index - 1), true)
         }
         TocChange::Down if index + 1 < entries.len() => {
             entries.swap(index, index + 1);
+            nest_properly(entries);
             (Some(index + 1), true)
         }
         // An entry can be at most one level below the one before it.
@@ -1700,9 +1703,20 @@ pub fn change_toc(
         }
         TocChange::Outdent if entries[index].level > 1 => {
             entries[index].level -= 1;
+            nest_properly(entries);
             (Some(index), true)
         }
         _ => (Some(index), false),
+    }
+}
+
+/// Keeps the first entry at the top level and every other entry at most
+/// one level below the one before it, so the levels describe a tree.
+fn nest_properly(entries: &mut [TocEntry]) {
+    let mut above = 0;
+    for entry in entries {
+        entry.level = entry.level.clamp(1, above + 1);
+        above = entry.level;
     }
 }
 
@@ -1954,5 +1968,20 @@ mod tests {
             change_toc(&mut entries, 5, TocChange::Remove, ""),
             (None, false)
         );
+
+        // Whatever moves, the levels still describe a tree.
+        let nested = vec![entry("A", 1), entry("B", 2), entry("C", 3), entry("D", 1)];
+        let mut entries = nested.clone();
+        change_toc(&mut entries, 0, TocChange::Remove, "");
+        assert_eq!(titles(&entries), ["B", "-C", "D"]);
+        let mut entries = nested.clone();
+        change_toc(&mut entries, 1, TocChange::Up, "");
+        assert_eq!(titles(&entries), ["B", "A", "-C", "D"]);
+        let mut entries = nested.clone();
+        change_toc(&mut entries, 1, TocChange::Outdent, "");
+        assert_eq!(titles(&entries), ["A", "B", "-C", "D"]);
+        let mut entries = nested;
+        change_toc(&mut entries, 2, TocChange::Down, "");
+        assert_eq!(titles(&entries), ["A", "-B", "D", "-C"]);
     }
 }
