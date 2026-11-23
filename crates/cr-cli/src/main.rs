@@ -2248,6 +2248,13 @@ fn edit_book(
             other => other.to_ascii_lowercase(),
         };
         let output = output.unwrap_or_else(|| PathBuf::from(format!("book-{id}.{extension}")));
+        // The name of the output decides what is written into it.
+        if !no_replace && cr_core::formats::detect_format(&output) != format {
+            bail!(
+                "{} is not a .{extension} file, so it cannot replace the {format}; rename it or use --no-replace",
+                output.display()
+            );
+        }
         let count = editing::save(&directory, &output)?;
         println!("Packed {count} files into {}", output.display());
         if !no_replace {
