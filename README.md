@@ -572,7 +572,7 @@ Currently missing:
 - Downloading metadata and covers from online sources.
 - Notes on authors/series/tags, composite (template) custom columns, and
   custom values in `metadata.opf` (calibre rewrites them there itself).
-- calibre's plugin system, content server/OPDS and annotations.
+- calibre's plugin system.
 - Live preview and spell check in the editor, cover cropping and
   thumbnail generation, DRM.
 - Opening libraries older than schema 28 without an upgrade step.
