@@ -147,17 +147,27 @@ pub fn search_term(field: &str, kind: TermMatch, value: &str) -> Result<String, 
     if value.is_empty() {
         return Err("Type a value for the term.".to_string());
     }
-    let plain = value
-        .chars()
-        .all(|c| !c.is_whitespace() && !matches!(c, '"' | '(' | ')'));
+    Ok(format!("{field}:{}", quoted(&format!("{prefix}{value}"))))
+}
+
+/// A search value, quoted when it would not survive as a bare word.
+fn quoted(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| !c.is_whitespace() && !matches!(c, '"' | '(' | ')'));
     if plain {
-        Ok(format!("{field}:{prefix}{value}"))
+        value.to_string()
     } else {
-        Ok(format!(
-            "{field}:\"{prefix}{}\"",
-            value.replace('"', "\\\"")
-        ))
+        format!("\"{}\"", value.replace('"', "\\\""))
     }
+}
+
+/// The search that shows a saved search (`search:name`) or a virtual
+/// library (`vl:name`).
+pub fn named_search(virtual_library: bool, name: &str) -> String {
+    let field = if virtual_library { "vl" } else { "search" };
+    format!("{field}:{}", quoted(name))
 }
 
 /// Add a term to a search. An existing search with alternatives is grouped,
@@ -387,8 +397,6 @@ pub struct Tools {
     pub editor_toc: Vec<TocEntry>,
     pub editor_toc_selected: Option<usize>,
     pub editor_toc_title: Entity<InputState>,
-    /// The contents list differs from the one in the book.
-    pub editor_toc_dirty: bool,
 }
 
 impl Tools {
@@ -450,7 +458,6 @@ impl Tools {
             editor_toc: Vec::new(),
             editor_toc_selected: None,
             editor_toc_title: text_input("Entry title", window, cx),
-            editor_toc_dirty: false,
         }
     }
 }
@@ -690,7 +697,12 @@ impl CalibreApp {
     }
 
     /// Asks, then deletes one trashed entry for good, or the whole trash.
-    pub fn confirm_purge(&mut self, index: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn confirm_purge(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let entry = index.and_then(|index| self.tools.trash.get(index).cloned());
         let (question, id) = match (&entry, index) {
             (Some(entry), _) => (
@@ -779,10 +791,7 @@ impl CalibreApp {
                 let query = append_term(&self.query, &term, join);
                 set_input(&self.tools.term_value, String::new(), window, cx);
                 self.set_query(query, window, cx);
-                self.set_status(
-                    format!("{} found.", books(self.books.len())),
-                    Tone::Info,
-                );
+                self.set_status(format!("{} found.", books(self.books.len())), Tone::Info);
             }
             Err(message) => self.announce(message, Tone::Info, window, cx),
         }
@@ -797,7 +806,12 @@ impl CalibreApp {
 
     /// Saves the current search under the typed name, as a saved search or
     /// as a virtual library.
-    pub fn save_search(&mut self, virtual_library: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn save_search(
+        &mut self,
+        virtual_library: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let name = value(&self.tools.search_name, cx).trim().to_string();
         let query = self.query.trim().to_string();
         let problem = if name.is_empty() {
@@ -828,7 +842,12 @@ impl CalibreApp {
                 } else {
                     "saved search"
                 };
-                self.announce(format!("Saved the {kind} “{name}”."), Tone::Success, window, cx);
+                self.announce(
+                    format!("Saved the {kind} “{name}”."),
+                    Tone::Success,
+                    window,
+                    cx,
+                );
             }
             Err(err) => self.announce(format!("Could not save: {err}"), Tone::Error, window, cx),
         }
@@ -945,7 +964,10 @@ impl CalibreApp {
         if self.tools.device_loading {
             return;
         }
-        let root = self.library.as_ref().map(|library| library.root().to_path_buf());
+        let root = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf());
         self.tools.device_index = index;
         self.tools.device_loading = true;
         self.tools.device_marked.clear();
@@ -1030,8 +1052,7 @@ impl CalibreApp {
             let Ok(0) = receiver.await else {
                 return;
             };
-            let removal =
-                cx.background_spawn(async move { device::remove(&device, &paths) });
+            let removal = cx.background_spawn(async move { device::remove(&device, &paths) });
             let result = removal.await;
             this.update_in(cx, |this, window, cx| {
                 match result {
@@ -1063,7 +1084,11 @@ impl CalibreApp {
         if self.tools.server.is_some() {
             return;
         }
-        let Some(root) = self.library.as_ref().map(|library| library.root().to_path_buf()) else {
+        let Some(root) = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf())
+        else {
             self.announce("Open a library first.", Tone::Info, window, cx);
             return;
         };
@@ -1075,7 +1100,8 @@ impl CalibreApp {
             &value(&tools.server_password, cx),
         );
         let started = options.and_then(|(options, warning)| {
-            let server = Server::bind(&root, &options).map_err(|err| capitalize(&err.to_string()))?;
+            let server =
+                Server::bind(&root, &options).map_err(|err| capitalize(&err.to_string()))?;
             let address = server.local_addr().map_err(|err| err.to_string())?;
             Ok((server, address, warning))
         });
@@ -1093,7 +1119,12 @@ impl CalibreApp {
                 // Each request is answered on its own thread; this one only
                 // accepts connections until the stopper is used.
                 std::thread::spawn(move || server.run());
-                self.announce(format!("Serving the library at {url}."), Tone::Success, window, cx);
+                self.announce(
+                    format!("Serving the library at {url}."),
+                    Tone::Success,
+                    window,
+                    cx,
+                );
                 self.tools.server = Some(RunningServer {
                     url,
                     warning,
@@ -1121,7 +1152,11 @@ impl CalibreApp {
     // ---------------------------------------------------------------------
 
     pub fn check_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(root) = self.library.as_ref().map(|library| library.root().to_path_buf()) else {
+        let Some(root) = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf())
+        else {
             self.announce("Open a library first.", Tone::Info, window, cx);
             return;
         };
@@ -1189,7 +1224,12 @@ impl CalibreApp {
     /// Asks, then rebuilds `metadata.db` from the books' `metadata.opf` files.
     pub fn confirm_rebuild(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.job.is_some() {
-            self.announce("Wait for the running job to finish first.", Tone::Info, window, cx);
+            self.announce(
+                "Wait for the running job to finish first.",
+                Tone::Info,
+                window,
+                cx,
+            );
             return;
         }
         let Some(root) = self.writable_root(window, cx) else {
@@ -1208,8 +1248,10 @@ impl CalibreApp {
         );
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(0) = receiver.await {
-                this.update_in(cx, |this, window, cx| this.rebuild_library(root, window, cx))
-                    .ok();
+                this.update_in(cx, |this, window, cx| {
+                    this.rebuild_library(root, window, cx)
+                })
+                .ok();
             }
         })
         .detach();
@@ -1231,6 +1273,9 @@ impl CalibreApp {
             move |_| Library::rebuild(&root).map(|(_, report)| report),
             move |this, result, window, cx| {
                 this.open_library(reopen, window, cx);
+                if this.library.is_none() {
+                    this.screen = Screen::Library;
+                }
                 match result {
                     Ok(report) => {
                         let mut message = format!("Rebuilt the database: {}", books(report.restored));
@@ -1267,7 +1312,7 @@ impl CalibreApp {
 
     pub fn show_editor_panel(&mut self, panel: EditorPanel, cx: &mut Context<Self>) {
         self.tools.editor_panel = panel;
-        if panel == EditorPanel::Contents && !self.tools.editor_toc_dirty {
+        if panel == EditorPanel::Contents {
             self.load_editor_toc();
         }
         cx.notify();
@@ -1280,7 +1325,6 @@ impl CalibreApp {
         tools.editor_matches = None;
         tools.editor_toc.clear();
         tools.editor_toc_selected = None;
-        tools.editor_toc_dirty = false;
     }
 
     fn editor_search_options(&self) -> SearchOptions {
@@ -1302,7 +1346,12 @@ impl CalibreApp {
         match EpubDir::open(&dir) {
             Ok(book) => Some(book),
             Err(err) => {
-                self.announce(format!("Cannot read the book: {err}"), Tone::Error, window, cx);
+                self.announce(
+                    format!("Cannot read the book: {err}"),
+                    Tone::Error,
+                    window,
+                    cx,
+                );
                 None
             }
         }
@@ -1388,6 +1437,8 @@ impl CalibreApp {
             .and_then(|index| self.epub_files.get(index))
             .and_then(|file| std::fs::read_to_string(&file.path).ok());
         match text {
+            // Left alone when nothing changed, so the cursor stays put.
+            Some(text) if text == self.epub_editor.read(cx).value().as_ref() => {}
             Some(text) => set_textarea(&self.epub_editor, text, window, cx),
             None => {
                 self.epub_selected = None;
@@ -1439,7 +1490,6 @@ impl CalibreApp {
             Ok(entries) => {
                 self.tools.editor_toc = entries;
                 self.tools.editor_toc_selected = None;
-                self.tools.editor_toc_dirty = false;
             }
             Err(err) => self.set_status(format!("Could not read the contents: {err}"), Tone::Error),
         }
@@ -1483,25 +1533,24 @@ impl CalibreApp {
         cx.notify();
     }
 
-    /// Changes the selected entry of the contents list; nothing is written
-    /// until [`Self::save_editor_toc`].
-    pub fn edit_toc_entry(&mut self, change: TocChange, window: &mut Window, cx: &mut Context<Self>) {
+    /// Changes the selected entry of the contents and writes the new
+    /// contents to the book being edited.
+    pub fn edit_toc_entry(
+        &mut self,
+        change: TocChange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(index) = self.tools.editor_toc_selected else {
             self.announce("Select an entry first.", Tone::Info, window, cx);
             return;
         };
         let title = value(&self.tools.editor_toc_title, cx);
-        let (selected, changed) = change_toc(&mut self.tools.editor_toc, index, change, &title);
-        self.tools.editor_toc_selected = selected;
-        self.tools.editor_toc_dirty |= changed;
-        if selected.is_none() {
-            set_input(&self.tools.editor_toc_title, String::new(), window, cx);
+        let mut entries = self.tools.editor_toc.clone();
+        let (selected, changed) = change_toc(&mut entries, index, change, &title);
+        if !changed {
+            return;
         }
-        cx.notify();
-    }
-
-    pub fn save_editor_toc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let entries = self.tools.editor_toc.clone();
         let Some(mut book) = self.editor_book(window, cx) else {
             return;
         };
@@ -1509,13 +1558,11 @@ impl CalibreApp {
             Ok(()) => {
                 self.epub_pending = true;
                 self.reload_editor_files(window, cx);
-                self.tools.editor_toc_dirty = false;
-                self.announce(
-                    format!("Wrote a table of contents with {} entries.", entries.len()),
-                    Tone::Success,
-                    window,
-                    cx,
-                );
+                self.tools.editor_toc = entries;
+                self.tools.editor_toc_selected = selected;
+                if selected.is_none() {
+                    set_input(&self.tools.editor_toc_title, String::new(), window, cx);
+                }
             }
             Err(err) => self.announce(
                 format!("Could not write the contents: {err}"),
@@ -1573,9 +1620,7 @@ pub fn change_toc(
             (Some(index + 1), true)
         }
         // An entry can be at most one level below the one before it.
-        TocChange::Indent
-            if index > 0 && entries[index].level <= entries[index - 1].level =>
-        {
+        TocChange::Indent if index > 0 && entries[index].level <= entries[index - 1].level => {
             entries[index].level += 1;
             (Some(index), true)
         }
@@ -1591,7 +1636,7 @@ pub fn change_toc(
 mod tests {
     use super::*;
 
-    #[test]
+    #[core::prelude::v1::test]
     fn search_terms_follow_the_search_language() {
         let term = |kind, value| search_term("title", kind, value);
         assert_eq!(term(TermMatch::Contains, " dune ").unwrap(), "title:dune");
@@ -1608,13 +1653,25 @@ mod tests {
             search_term("rating", TermMatch::Greater, "3").unwrap(),
             "rating:>3"
         );
-        assert_eq!(search_term("size", TermMatch::Less, "1M").unwrap(), "size:<1M");
-        assert_eq!(search_term("series", TermMatch::Present, "").unwrap(), "series:true");
-        assert_eq!(search_term("tag", TermMatch::Missing, "x").unwrap(), "tag:false");
+        assert_eq!(
+            search_term("size", TermMatch::Less, "1M").unwrap(),
+            "size:<1M"
+        );
+        assert_eq!(
+            search_term("series", TermMatch::Present, "").unwrap(),
+            "series:true"
+        );
+        assert_eq!(
+            search_term("tag", TermMatch::Missing, "x").unwrap(),
+            "tag:false"
+        );
         assert!(term(TermMatch::Contains, "  ").is_err());
+
+        assert_eq!(named_search(false, "unread"), "search:unread");
+        assert_eq!(named_search(true, "Sci Fi"), "vl:\"Sci Fi\"");
     }
 
-    #[test]
+    #[core::prelude::v1::test]
     fn terms_join_a_search_without_changing_its_meaning() {
         assert_eq!(append_term("", "tag:sf", Join::And), "tag:sf");
         assert_eq!(append_term(" ", "tag:sf", Join::Not), "not tag:sf");
@@ -1622,12 +1679,21 @@ mod tests {
         assert_eq!(append_term("a", "tag:sf", Join::Or), "a or tag:sf");
         assert_eq!(append_term("a", "tag:sf", Join::Not), "a not tag:sf");
         // Alternatives are grouped before they are narrowed.
-        assert_eq!(append_term("a OR b", "tag:sf", Join::And), "(a OR b) tag:sf");
-        assert_eq!(append_term("a or b", "tag:sf", Join::Not), "(a or b) not tag:sf");
-        assert_eq!(append_term("a or b", "tag:sf", Join::Or), "a or b or tag:sf");
+        assert_eq!(
+            append_term("a OR b", "tag:sf", Join::And),
+            "(a OR b) tag:sf"
+        );
+        assert_eq!(
+            append_term("a or b", "tag:sf", Join::Not),
+            "(a or b) not tag:sf"
+        );
+        assert_eq!(
+            append_term("a or b", "tag:sf", Join::Or),
+            "a or b or tag:sf"
+        );
     }
 
-    #[test]
+    #[core::prelude::v1::test]
     fn a_bulk_form_becomes_an_edit() {
         assert!(bulk_edit(&BulkForm::default()).is_err());
         let form = BulkForm {
@@ -1656,7 +1722,10 @@ mod tests {
         assert_eq!(edit.remove_tags, ["todo"]);
         assert!(!edit.clear_tags);
         let replace = edit.replace.unwrap();
-        assert_eq!((replace.pattern.as_str(), replace.replacement.as_str()), ("Vol.", "Volume"));
+        assert_eq!(
+            (replace.pattern.as_str(), replace.replacement.as_str()),
+            ("Vol.", "Volume")
+        );
         assert!(replace.ignore_case && !replace.regex);
 
         let only = |form: BulkForm| bulk_edit(&form);
@@ -1710,7 +1779,7 @@ mod tests {
         }
     }
 
-    #[test]
+    #[core::prelude::v1::test]
     fn server_settings_are_checked() {
         let (options, warning) = server_options("", "", "", "").unwrap();
         assert_eq!(options.bind, "127.0.0.1:8080");
@@ -1727,7 +1796,10 @@ mod tests {
         let (options, warning) = server_options("::1", "8081", "", "").unwrap();
         assert_eq!(options.bind, "[::1]:8081");
         assert!(warning.is_none());
-        assert!(server_options("localhost", "80", "", "").unwrap().1.is_none());
+        assert!(server_options("localhost", "80", "", "")
+            .unwrap()
+            .1
+            .is_none());
 
         assert!(server_options("", "70000", "", "").is_err());
         assert!(server_options("", "http", "", "").is_err());
@@ -1735,7 +1807,7 @@ mod tests {
         assert!(server_options("", "", "", "secret").is_err());
     }
 
-    #[test]
+    #[core::prelude::v1::test]
     fn contents_entries_are_edited_in_place() {
         let entry = |title: &str, level| TocEntry {
             title: title.into(),
@@ -1750,24 +1822,63 @@ mod tests {
         };
         let mut entries = vec![entry("One", 1), entry("Two", 1), entry("Three", 1)];
 
-        assert_eq!(change_toc(&mut entries, 1, TocChange::Rename, " 2 "), (Some(1), true));
-        assert_eq!(change_toc(&mut entries, 1, TocChange::Rename, "2"), (Some(1), false));
-        assert_eq!(change_toc(&mut entries, 1, TocChange::Rename, " "), (Some(1), false));
-        assert_eq!(change_toc(&mut entries, 1, TocChange::Indent, ""), (Some(1), true));
+        assert_eq!(
+            change_toc(&mut entries, 1, TocChange::Rename, " 2 "),
+            (Some(1), true)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 1, TocChange::Rename, "2"),
+            (Some(1), false)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 1, TocChange::Rename, " "),
+            (Some(1), false)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 1, TocChange::Indent, ""),
+            (Some(1), true)
+        );
         // No deeper than one below the entry before, and not the first.
-        assert_eq!(change_toc(&mut entries, 1, TocChange::Indent, ""), (Some(1), false));
-        assert_eq!(change_toc(&mut entries, 0, TocChange::Indent, ""), (Some(0), false));
+        assert_eq!(
+            change_toc(&mut entries, 1, TocChange::Indent, ""),
+            (Some(1), false)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 0, TocChange::Indent, ""),
+            (Some(0), false)
+        );
         assert_eq!(titles(&entries), ["One", "-2", "Three"]);
 
-        assert_eq!(change_toc(&mut entries, 2, TocChange::Up, ""), (Some(1), true));
-        assert_eq!(change_toc(&mut entries, 0, TocChange::Up, ""), (Some(0), false));
-        assert_eq!(change_toc(&mut entries, 2, TocChange::Down, ""), (Some(2), false));
+        assert_eq!(
+            change_toc(&mut entries, 2, TocChange::Up, ""),
+            (Some(1), true)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 0, TocChange::Up, ""),
+            (Some(0), false)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 2, TocChange::Down, ""),
+            (Some(2), false)
+        );
         assert_eq!(titles(&entries), ["One", "Three", "-2"]);
 
-        assert_eq!(change_toc(&mut entries, 2, TocChange::Outdent, ""), (Some(2), true));
-        assert_eq!(change_toc(&mut entries, 2, TocChange::Outdent, ""), (Some(2), false));
-        assert_eq!(change_toc(&mut entries, 1, TocChange::Remove, ""), (None, true));
+        assert_eq!(
+            change_toc(&mut entries, 2, TocChange::Outdent, ""),
+            (Some(2), true)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 2, TocChange::Outdent, ""),
+            (Some(2), false)
+        );
+        assert_eq!(
+            change_toc(&mut entries, 1, TocChange::Remove, ""),
+            (None, true)
+        );
         assert_eq!(titles(&entries), ["One", "2"]);
-        assert_eq!(change_toc(&mut entries, 5, TocChange::Remove, ""), (None, false));
+        assert_eq!(
+            change_toc(&mut entries, 5, TocChange::Remove, ""),
+            (None, false)
+        );
     }
 }

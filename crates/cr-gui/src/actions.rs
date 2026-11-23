@@ -63,6 +63,14 @@ actions!(
         SelectAll,
         SendToFirstDevice,
         RescanDevices,
+        // Tools
+        OpenBulkEdit,
+        OpenConvert,
+        OpenSearchTools,
+        OpenDevices,
+        OpenServer,
+        OpenTrash,
+        OpenMaintenance,
         // List navigation
         SelectPrevious,
         SelectNext,
@@ -146,6 +154,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("backspace"), RemoveBook, app),
         KeyBinding::new(primary!("d"), SendToFirstDevice, app),
         KeyBinding::new(primary!("shift-d"), RescanDevices, app),
+        KeyBinding::new(primary!("shift-m"), OpenBulkEdit, app),
+        KeyBinding::new(primary!("shift-f"), OpenSearchTools, app),
         // Book list
         KeyBinding::new("up", SelectPrevious, list),
         KeyBinding::new("down", SelectNext, list),
@@ -344,6 +354,8 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
         MenuItem::action("Remove Book…", RemoveBook),
     ]));
 
+    menus.push(Menu::new("Tools").items(tool_items()));
+
     let mut window = Vec::new();
     if cfg!(target_os = "macos") {
         window.extend([
@@ -361,6 +373,32 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
     ]));
 
     menus
+}
+
+/// The tools screen's panes, as `(menu label, action that opens it)`.
+pub fn tool_actions() -> [(&'static str, Box<dyn Action>); 7] {
+    [
+        ("Edit Metadata in Bulk…", Box::new(OpenBulkEdit)),
+        ("Convert Books…", Box::new(OpenConvert)),
+        ("Search Tools…", Box::new(OpenSearchTools)),
+        ("Devices…", Box::new(OpenDevices)),
+        ("Content Server…", Box::new(OpenServer)),
+        ("Trash…", Box::new(OpenTrash)),
+        ("Library Maintenance…", Box::new(OpenMaintenance)),
+    ]
+}
+
+fn tool_items() -> Vec<MenuItem> {
+    tool_actions()
+        .into_iter()
+        .map(|(name, action)| MenuItem::Action {
+            name: name.into(),
+            action,
+            os_action: None,
+            checked: false,
+            disabled: false,
+        })
+        .collect()
 }
 
 /// Items in the Dock (macOS) / taskbar jump list menu.

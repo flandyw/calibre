@@ -30,6 +30,7 @@ use crate::settings::{
     SavedBounds, Settings, ThemePreference, ViewMode, DEFAULT_READER_FONT_SIZE,
     MAX_READER_FONT_SIZE, MIN_READER_FONT_SIZE,
 };
+use crate::tools::ToolPane;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -599,7 +600,11 @@ impl CalibreApp {
     }
 
     /// The open library's folder, or a status message when it cannot be changed.
-    pub(crate) fn writable_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<PathBuf> {
+    pub(crate) fn writable_root(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PathBuf> {
         let Some(library) = &self.library else {
             self.set_status("Open a library first.", Tone::Info);
             cx.notify();
@@ -1518,8 +1523,8 @@ impl CalibreApp {
             PromptLevel::Warning,
             &question,
             Some(
-                "Removed books are kept in the library's trash folder and can be \
-                 restored with `cr trash restore`.",
+                "Removed books are kept in the library's trash and can be restored \
+                 from Tools > Trash.",
             ),
             &["Remove", "Cancel"],
             cx,
@@ -1831,7 +1836,7 @@ impl CalibreApp {
         .detach();
     }
 
-    fn rescan_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn rescan_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.set_status("Looking for e-readers…", Tone::Info);
         self.scan_devices(window, cx);
     }
@@ -3296,6 +3301,28 @@ impl CalibreApp {
             .on_action(
                 cx.listener(|this, _: &RescanDevices, window, cx| this.rescan_devices(window, cx)),
             )
+            // Tools
+            .on_action(cx.listener(|this, _: &OpenBulkEdit, window, cx| {
+                this.open_tools(ToolPane::BulkEdit, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenConvert, window, cx| {
+                this.open_tools(ToolPane::Convert, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenSearchTools, window, cx| {
+                this.open_tools(ToolPane::Search, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenDevices, window, cx| {
+                this.open_tools(ToolPane::Devices, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenServer, window, cx| {
+                this.open_tools(ToolPane::Server, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenTrash, window, cx| {
+                this.open_tools(ToolPane::Trash, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenMaintenance, window, cx| {
+                this.open_tools(ToolPane::Maintenance, window, cx)
+            }))
             // List navigation
             .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
                 let step = this.vertical_step();
@@ -3456,7 +3483,12 @@ fn text_area(
     })
 }
 
-pub(crate) fn set_textarea(input: &Entity<TextareaState>, value: String, window: &mut Window, cx: &mut App) {
+pub(crate) fn set_textarea(
+    input: &Entity<TextareaState>,
+    value: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
     input.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 

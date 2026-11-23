@@ -21,6 +21,7 @@ pub fn title_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         Screen::Reader => reader_bar(app, cx),
         Screen::Epub => epub_bar(app, cx),
         Screen::Crop => crop_bar(),
+        Screen::Tools => tools_bar(app, cx),
     };
     TitleBar::new()
         .child(
@@ -137,6 +138,20 @@ fn library_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .show(event.position(), window, cx);
         });
 
+    let tools = Button::new("tools-menu")
+        .ghost()
+        .small()
+        .icon(Lucide::Wrench)
+        .tooltip("Tools: bulk edit, convert, search, devices, server, trash, maintenance")
+        .accessibility_label("Tools")
+        .on_click(|event, window, cx| {
+            let mut menu = NativeMenu::new();
+            for (name, action) in tool_actions() {
+                menu = menu.menu(name, action);
+            }
+            menu.show(event.position(), window, cx);
+        });
+
     let appearance_icon = match theme_pref {
         ThemePreference::System => Lucide::SunMoon,
         ThemePreference::Light => Lucide::Sun,
@@ -200,6 +215,7 @@ fn library_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         ))
         .child(view_toggle)
         .child(devices)
+        .child(tools)
         .child(appearance)
         .child(tool_button(
             "toggle-inspector",
@@ -304,6 +320,37 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             )
             .disabled(app.section_index + 1 >= total),
         )
+        .into_any_element()
+}
+
+fn tools_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let selected = app.selection_ids().len();
+    h_flex()
+        .w_full()
+        .gap_2()
+        .items_center()
+        .child(
+            Button::new("tools-back")
+                .ghost()
+                .small()
+                .icon(IconName::ChevronLeft)
+                .label("Library")
+                .tooltip_with_action("Back to library", &Cancel, None)
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
+        )
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(app.tools.pane.title()),
+        )
+        .child(div().flex_1())
+        .child(div().text_xs().text_color(muted).child(match selected {
+            0 => "No books selected".to_string(),
+            1 => "1 book selected".to_string(),
+            count => format!("{count} books selected"),
+        }))
         .into_any_element()
 }
 
