@@ -522,7 +522,8 @@ q 200 0 0 150 72 400 cm /Im1 Do Q\n";
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(first.as_bytes()).unwrap();
     let first = encoder.finish().unwrap();
-    let second = b"BT /F1 20 Tf 72 720 Td (Closing) Tj ET\nBT /F1 11 Tf 72 690 Td <4C61737420776F7264732E> Tj ET\n";
+    let second = b"BT /F1 20 Tf 72 720 Td (Closing) Tj ET\nBT /F1 11 Tf 72 690 Td <4C61737420776F7264732E> Tj ET\n\
+BT /F1 11 Tf 72 640 Td (1984) Tj ET\nBT /F1 11 Tf 72 590 Td (After the year.) Tj ET\nBT /F1 9 Tf 300 40 Td (2) Tj ET\n";
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut object = |number: u32, dictionary: &str, stream: Option<&[u8]>| {
@@ -548,7 +549,11 @@ q 200 0 0 150 72 400 cm /Im1 Do Q\n";
     );
     object(
         5,
-        &format!("<< /Length {} /Filter /FlateDecode >>", first.len()),
+        // The row size is a lie far larger than the data.
+        &format!(
+            "<< /Length {} /Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 4000000000000 >> >>",
+            first.len()
+        ),
         Some(&first),
     );
     object(6, &format!("<< /Length {} >>", second.len()), Some(second));
@@ -601,6 +606,12 @@ fn pdf_text_images_and_outline_become_a_book() {
     );
     assert!(text.contains("A second paragraph (here)."), "{text}");
     assert!(text.contains("Last words."), "{text}");
+    // A number in the text stays; the one at the foot of the page goes.
+    assert!(
+        text.contains("1984") && text.contains("After the year."),
+        "{text}"
+    );
+    assert!(!text.lines().any(|line| line.trim() == "2"), "{text}");
 
     let document = cr_core::formats::read_document(&source, true).unwrap();
     let titles: Vec<&str> = document

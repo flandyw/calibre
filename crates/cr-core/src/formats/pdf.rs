@@ -1583,6 +1583,15 @@ pub(super) fn read_book(data: &[u8]) -> Result<PdfBook> {
         gaps.sort_by(f64::total_cmp);
         let usual = gaps.get(gaps.len() / 2).copied().unwrap_or(body * 1.2);
         let mut first_on_page = true;
+        // The top and bottom lines of the page, where page numbers sit.
+        let heights = || {
+            items.iter().filter_map(|item| match item {
+                Item::Line(line) => Some(line.y),
+                Item::Image(_) => None,
+            })
+        };
+        let top = heights().fold(f64::MIN, f64::max);
+        let bottom = heights().fold(f64::MAX, f64::min);
         for item in items {
             let line = match item {
                 Item::Image(data) => {
@@ -1598,8 +1607,11 @@ pub(super) fn read_book(data: &[u8]) -> Result<PdfBook> {
                 Item::Line(line) => line,
             };
             let text = line.text.trim();
-            // Page numbers.
-            if text.len() <= 4 && text.chars().all(|c| c.is_ascii_digit()) {
+            // Page numbers: a bare number at the top or bottom of the page.
+            if (line.y >= top || line.y <= bottom)
+                && text.len() <= 4
+                && text.chars().all(|c| c.is_ascii_digit())
+            {
                 continue;
             }
             if line.size >= body * 1.2 && text.chars().count() < 150 {
