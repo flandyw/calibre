@@ -83,6 +83,8 @@ pub struct Element {
 
 #[derive(Debug, Default)]
 struct Compound {
+    /// Joined to the part before it by `>`: that part must be the parent.
+    child: bool,
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
@@ -166,12 +168,21 @@ fn declarations(block: &str) -> Vec<(String, String)> {
 }
 
 fn selector(text: &str) -> Option<Vec<Compound>> {
-    let mut parts = Vec::new();
-    for word in text.split(|c: char| c.is_whitespace() || c == '>') {
-        if word.is_empty() {
+    let mut parts: Vec<Compound> = Vec::new();
+    let mut child = false;
+    let text = text.replace('>', " > ");
+    for word in text.split_whitespace() {
+        if word == ">" {
+            if child || parts.is_empty() {
+                return None;
+            }
+            child = true;
             continue;
         }
-        let mut compound = Compound::default();
+        let mut compound = Compound {
+            child: std::mem::take(&mut child),
+            ..Compound::default()
+        };
         let mut rest = word;
         let name_end = |text: &str| {
             text.find(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
@@ -185,22 +196,56 @@ fn selector(text: &str) -> Option<Vec<Compound>> {
             rest = after;
         }
         while !rest.is_empty() {
-            let kind = rest.as_bytes()[0];
-            let end = name_end(&rest[1..]);
+            let (is_class, named) = match rest.strip_prefix('.') {
+                Some(named) => (true, named),
+                None => (false, rest.strip_prefix('#')?),
+            };
+            let end = name_end(named);
             if end == 0 {
                 return None;
             }
-            let name = rest[1..=end].to_string();
-            match kind {
-                b'.' => compound.classes.push(name),
-                b'#' => compound.id = Some(name),
-                _ => return None,
+            let name = named[..end].to_string();
+            if is_class {
+                compound.classes.push(name);
+            } else {
+                compound.id = Some(name);
             }
-            rest = &rest[end + 1..];
+            rest = &named[end..];
         }
         parts.push(compound);
     }
-    (!parts.is_empty()).then_some(parts)
+    (!parts.is_empty() && !child).then_some(parts)
+}
+
+/// Whether `parts`, the selector without its last part, match the open
+/// elements `ancestors`; `child` says the innermost of them must be the
+/// parent. `failed` remembers what has been tried, so that a long selector
+/// over a deep tree is not tried again and again.
+fn ancestors_match(
+    parts: &[Compound],
+    ancestors: &[Element],
+    child: bool,
+    failed: &mut Vec<(usize, usize, bool)>,
+) -> bool {
+    let Some((part, outer)) = parts.split_last() else {
+        return true;
+    };
+    let state = (parts.len(), ancestors.len(), child);
+    if failed.contains(&state) {
+        return false;
+    }
+    let nearest = if child {
+        ancestors.len().saturating_sub(1)
+    } else {
+        0
+    };
+    let found = (nearest..ancestors.len()).rev().any(|at| {
+        part.matches(&ancestors[at]) && ancestors_match(outer, &ancestors[..at], part.child, failed)
+    });
+    if !found {
+        failed.push(state);
+    }
+    found
 }
 
 impl Stylesheet {
@@ -337,12 +382,10 @@ impl Stylesheet {
             add(&format!(".{class}"));
         }
         matched.retain(|rule| {
-            let mut parts = self.rules[*rule].selector.iter().rev();
-            if !parts.next().is_some_and(|last| last.matches(element)) {
+            let Some((last, outer)) = self.rules[*rule].selector.split_last() else {
                 return false;
-            }
-            let mut outer = ancestors.iter().rev();
-            parts.all(|part| outer.any(|ancestor| part.matches(ancestor)))
+            };
+            last.matches(element) && ancestors_match(outer, ancestors, last.child, &mut Vec::new())
         });
         matched.sort_by_key(|rule| (self.rules[*rule].specificity, *rule));
         matched.dedup();
@@ -542,6 +585,52 @@ mod tests {
             id: String::new(),
             classes: classes.iter().map(|class| class.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn child_selectors_need_the_parent_and_odd_names_are_ignored() {
+        let sheet = Stylesheet::parse(
+            ".box > p { display: none } div>.box em { font-weight: bold }\n\
+             .a\u{2013}b, \u{2013}x, p > , > p { display: none } .caf\u{e9} { font-style: italic }",
+        );
+        let root = Computed::default();
+        let (outer, boxed) = (element("div", &[]), element("div", &["box"]));
+        let quote = element("blockquote", &[]);
+        let direct = [outer.clone(), boxed.clone()];
+        assert!(
+            sheet
+                .compute(&root, &direct, &element("p", &[]), None)
+                .hidden
+        );
+        let nested = [outer.clone(), boxed.clone(), quote.clone()];
+        assert!(
+            !sheet
+                .compute(&root, &nested, &element("p", &[]), None)
+                .hidden
+        );
+        // A descendant part may sit anywhere above; a child part may not.
+        assert_eq!(
+            sheet
+                .compute(&root, &nested, &element("em", &[]), None)
+                .bold,
+            Some(true)
+        );
+        let apart = [outer, quote, boxed];
+        assert_eq!(
+            sheet.compute(&root, &apart, &element("em", &[]), None).bold,
+            None
+        );
+        assert!(
+            !sheet
+                .compute(&root, &[], &element("p", &["a"]), None)
+                .hidden
+        );
+        assert_eq!(
+            sheet
+                .compute(&root, &[], &element("p", &["caf\u{e9}"]), None)
+                .italic,
+            Some(true)
+        );
     }
 
     #[test]
