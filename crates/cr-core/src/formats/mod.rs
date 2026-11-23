@@ -1,6 +1,7 @@
 //! Ebook format detection, metadata import and text extraction.
 
 mod conversion;
+pub mod css;
 pub mod document;
 mod documents;
 pub mod editing;
