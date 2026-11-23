@@ -460,6 +460,20 @@ fn prefixed_packages_and_other_encodings_stay_valid() {
 }
 
 #[test]
+fn a_packed_output_replaces_only_a_format_it_is_written_as() {
+    use cr_core::formats::editing::output_matches;
+    let matches = |format, name: &str| output_matches(format, Path::new(name));
+    assert!(matches("AZW3", "book.azw3") && matches("AZW3", "book.kf8"));
+    assert!(!matches("AZW3", "book.epub") && !matches("AZW3", "book.pdf"));
+    assert!(matches("EPUB", "book.epub") && matches("KEPUB", "book.epub"));
+    assert!(matches("KEPUB", "book.kepub.epub"));
+    assert!(!matches("EPUB", "book.azw3") && !matches("KEPUB", "book.kf8"));
+    // An EPUB archive under another format's name would not open as it.
+    assert!(!matches("EPUB", "book.pdf") && !matches("KEPUB", "book.txt"));
+    assert!(!matches("EPUB", "book"));
+}
+
+#[test]
 fn kepub_and_azw3_books_are_edited_in_their_own_format() {
     let temp = tempdir().unwrap();
     let epub = make_epub(temp.path());
