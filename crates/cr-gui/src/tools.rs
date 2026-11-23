@@ -147,6 +147,20 @@ pub fn search_term(field: &str, kind: TermMatch, value: &str) -> Result<String, 
     if value.is_empty() {
         return Err("Type a value for the term.".to_string());
     }
+    // `identifier:isbn:=123`: the comparison belongs to the value, after
+    // the identifier's type.
+    if matches!(field, "identifier" | "identifiers") {
+        if let Some((kind, wanted)) = value.split_once(':') {
+            let wanted = wanted.trim_start();
+            if wanted.is_empty() {
+                return Err("Type a value for the term.".to_string());
+            }
+            return Ok(format!(
+                "{field}:{}",
+                quoted(&format!("{}:{prefix}{wanted}", kind.trim_end()))
+            ));
+        }
+    }
     Ok(format!("{field}:{}", quoted(&format!("{prefix}{value}"))))
 }
 
@@ -1744,6 +1758,22 @@ mod tests {
             search_term("size", TermMatch::Less, "1M").unwrap(),
             "size:<1M"
         );
+        // The comparison goes after an identifier's type.
+        let identifier = |kind, value| search_term("identifier", kind, value).unwrap();
+        assert_eq!(
+            identifier(TermMatch::Equals, "isbn:123"),
+            "identifier:isbn:=123"
+        );
+        assert_eq!(
+            identifier(TermMatch::Regex, "isbn: ^978"),
+            "identifier:isbn:~^978"
+        );
+        assert_eq!(
+            identifier(TermMatch::Contains, "isbn:123"),
+            "identifier:isbn:123"
+        );
+        assert_eq!(identifier(TermMatch::Equals, "123"), "identifier:=123");
+        assert!(search_term("identifier", TermMatch::Equals, "isbn:").is_err());
         assert_eq!(
             search_term("series", TermMatch::Present, "").unwrap(),
             "series:true"
