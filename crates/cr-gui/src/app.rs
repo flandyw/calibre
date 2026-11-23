@@ -336,7 +336,19 @@ impl CalibreApp {
         let crop_width = text_input("Width %", window, cx);
         let crop_height = text_input("Height %", window, cx);
 
+        let tools = crate::tools::Tools::new(window, cx);
+
         let subscriptions = vec![
+            cx.subscribe_in(&tools.editor_find, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.editor_find_all(window, cx);
+                }
+            }),
+            cx.subscribe_in(&tools.term_value, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.add_search_term(crate::tools::Join::And, window, cx);
+                }
+            }),
             cx.subscribe_in(&reader_search, window, |this, state, event, _, cx| {
                 if matches!(event, InputEvent::Change | InputEvent::PressEnter { .. }) {
                     let query = state.read(cx).value().to_string();
@@ -387,7 +399,6 @@ impl CalibreApp {
         let list_focus = cx.focus_handle();
         let reader_focus = cx.focus_handle();
 
-        let tools = crate::tools::Tools::new(window, cx);
         let mut app = Self {
             tools,
             settings,
