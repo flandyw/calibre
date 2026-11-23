@@ -499,3 +499,193 @@ fn docx_notes_are_kept_and_linked() {
     assert!(one < text.find("First.").unwrap() && text.find("First.").unwrap() < two);
     assert!(two < text.find("Second.").unwrap());
 }
+
+/// A two-page PDF: page one has compressed text and a JPEG, page two plain
+/// text, and the outline names both.
+fn write_pdf(path: &Path) {
+    use flate2::{write::ZlibEncoder, Compression};
+    let mut jpeg = Vec::new();
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+        40,
+        30,
+        image::Rgb([20, 90, 200]),
+    ))
+    .write_to(
+        &mut std::io::Cursor::new(&mut jpeg),
+        image::ImageFormat::Jpeg,
+    )
+    .unwrap();
+    let first = "BT /F1 20 Tf 72 720 Td (Opening) Tj ET\n\
+BT /F1 11 Tf 72 690 Td 14 TL (The quick brown fox jumps over) Tj T* (the lazy dog, twice.) Tj\n\
+0 -28 Td [(A sec) -20 (ond para) 15 (graph \\(here\\).)] TJ ET\n\
+q 200 0 0 150 72 400 cm /Im1 Do Q\n";
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(first.as_bytes()).unwrap();
+    let first = encoder.finish().unwrap();
+    let second = b"BT /F1 20 Tf 72 720 Td (Closing) Tj ET\nBT /F1 11 Tf 72 690 Td <4C61737420776F7264732E> Tj ET\n";
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut object = |number: u32, dictionary: &str, stream: Option<&[u8]>| {
+        pdf.extend(format!("{number} 0 obj\n{dictionary}\n").bytes());
+        if let Some(stream) = stream {
+            pdf.extend(b"stream\n");
+            pdf.extend(stream);
+            pdf.extend(b"\nendstream\n");
+        }
+        pdf.extend(b"endobj\n");
+    };
+    object(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 9 0 R >>", None);
+    object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>", None);
+    object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R /Resources << /Font << /F1 7 0 R >> /XObject << /Im1 8 0 R >> >> >>",
+        None,
+    );
+    object(
+        4,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 6 0 R /Resources << /Font << /F1 7 0 R >> >> >>",
+        None,
+    );
+    object(
+        5,
+        &format!("<< /Length {} /Filter /FlateDecode >>", first.len()),
+        Some(&first),
+    );
+    object(6, &format!("<< /Length {} >>", second.len()), Some(second));
+    object(
+        7,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        None,
+    );
+    object(
+        8,
+        &format!(
+            "<< /Type /XObject /Subtype /Image /Width 120 /Height 100 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>",
+            jpeg.len()
+        ),
+        Some(&jpeg),
+    );
+    object(
+        9,
+        "<< /Type /Outlines /First 10 0 R /Last 11 0 R /Count 2 >>",
+        None,
+    );
+    object(
+        10,
+        "<< /Title (Opening) /Parent 9 0 R /Next 11 0 R /Dest [3 0 R /Fit] >>",
+        None,
+    );
+    object(
+        11,
+        "<< /Title (Closing) /Parent 9 0 R /Prev 10 0 R /Dest [4 0 R /Fit] >>",
+        None,
+    );
+    object(12, "<< /Title (Pdf Book) /Author (Pat Writer) >>", None);
+    pdf.extend(b"trailer\n<< /Size 13 /Root 1 0 R /Info 12 0 R >>\n%%EOF\n");
+    fs::write(path, pdf).unwrap();
+}
+
+#[test]
+fn pdf_text_images_and_outline_become_a_book() {
+    let temp = tempdir().unwrap();
+    let source = temp.path().join("book.pdf");
+    write_pdf(&source);
+
+    let text = cr_core::formats::extract_text(&source, None)
+        .unwrap()
+        .full_text();
+    // Lines of one paragraph are joined; a gap starts a new one.
+    assert!(
+        text.contains("The quick brown fox jumps over the lazy dog, twice."),
+        "{text}"
+    );
+    assert!(text.contains("A second paragraph (here)."), "{text}");
+    assert!(text.contains("Last words."), "{text}");
+
+    let document = cr_core::formats::read_document(&source, true).unwrap();
+    let titles: Vec<&str> = document
+        .sections
+        .iter()
+        .map(|section| section.title.as_str())
+        .collect();
+    assert_eq!(titles, ["Opening", "Closing"]);
+    assert_eq!(document.images.len(), 1);
+    assert!(document.images[0].data.starts_with(&[0xff, 0xd8]));
+
+    let output = temp.path().join("book.epub");
+    convert(&source, &output).unwrap();
+    assert_well_formed(&output);
+    assert!(names(&output)
+        .iter()
+        .any(|name| name.starts_with("OEBPS/images/") && name.ends_with(".jpg")));
+
+    // A protected file says so instead of producing an empty book.
+    let locked = temp.path().join("locked.pdf");
+    let mut data = fs::read(&source).unwrap();
+    let at = data
+        .windows(7)
+        .position(|window| window == b"trailer")
+        .unwrap();
+    data.truncate(at);
+    data.extend(b"13 0 obj\n<< /Filter /Standard /V 2 >>\nendobj\ntrailer\n<< /Root 1 0 R /Encrypt 13 0 R >>\n");
+    fs::write(&locked, data).unwrap();
+    let refused = convert(&locked, &temp.path().join("locked.epub")).unwrap_err();
+    assert!(refused.to_string().contains("encrypted"), "{refused}");
+    assert!(!temp.path().join("locked.epub").exists());
+}
+
+#[test]
+fn comics_keep_their_pages_in_reading_order() {
+    let temp = tempdir().unwrap();
+    let page = png(8, 12);
+    let source = temp.path().join("comic.cbz");
+    let mut zip = zip::ZipWriter::new(File::create(&source).unwrap());
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for name in [
+        "pages/page10.png",
+        "pages/page2.png",
+        "__MACOSX/pages/._page2.png",
+        "pages/page1.png",
+        "notes.txt",
+    ] {
+        zip.start_file(name, stored).unwrap();
+        zip.write_all(&page).unwrap();
+    }
+    zip.finish().unwrap();
+
+    let document = cr_core::formats::read_document(&source, true).unwrap();
+    assert_eq!(document.sections.len(), 3);
+    assert_eq!(document.images.len(), 3);
+    let order: Vec<usize> = document
+        .sections
+        .iter()
+        .map(|section| {
+            document
+                .images
+                .iter()
+                .position(|image| section.html.contains(&image.name))
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(order, [0, 1, 2]);
+
+    let output = temp.path().join("comic.epub");
+    convert(&source, &output).unwrap();
+    assert_well_formed(&output);
+
+    // A CBR that is really a ZIP is read; a RAR archive is named as such.
+    let zipped = temp.path().join("zipped.cbr");
+    fs::copy(&source, &zipped).unwrap();
+    assert_eq!(
+        cr_core::formats::read_document(&zipped, true)
+            .unwrap()
+            .sections
+            .len(),
+        3
+    );
+    let rar = temp.path().join("real.cbr");
+    fs::write(&rar, b"Rar!\x1a\x07\x00rest").unwrap();
+    let refused = cr_core::formats::read_document(&rar, true).unwrap_err();
+    assert!(refused.to_string().contains("RAR"), "{refused}");
+}
