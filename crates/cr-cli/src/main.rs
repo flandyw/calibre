@@ -2249,9 +2249,9 @@ fn edit_book(
         };
         let output = output.unwrap_or_else(|| PathBuf::from(format!("book-{id}.{extension}")));
         // The name of the output decides what is written into it.
-        if !no_replace && cr_core::formats::detect_format(&output) != format {
+        if !no_replace && !editing::output_matches(&format, &output) {
             bail!(
-                "{} is not a .{extension} file, so it cannot replace the {format}; rename it or use --no-replace",
+                "{} would not be written as {format}, so it cannot replace the {format}; name it .{extension} or use --no-replace",
                 output.display()
             );
         }

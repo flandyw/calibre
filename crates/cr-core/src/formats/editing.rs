@@ -1547,6 +1547,13 @@ fn azw3_as_epub(path: &Path) -> Result<tempfile::NamedTempFile> {
     Ok(epub)
 }
 
+/// Whether [`save`] to `output` writes a file that can stand as `format`:
+/// its name decides between a Kindle file and an EPUB archive, and a KEPUB
+/// is an EPUB archive.
+pub fn output_matches(format: &str, output: &Path) -> bool {
+    (format == "AZW3") == is_azw3(output)
+}
+
 /// Unpack a book of one of the [`EDITABLE_FORMATS`] for editing.
 pub fn unpack(path: &Path, destination: &Path) -> Result<usize> {
     if is_azw3(path) {
