@@ -1583,15 +1583,29 @@ pub(super) fn read_book(data: &[u8]) -> Result<PdfBook> {
         gaps.sort_by(f64::total_cmp);
         let usual = gaps.get(gaps.len() / 2).copied().unwrap_or(body * 1.2);
         let mut first_on_page = true;
-        // The top and bottom lines of the page, where page numbers sit.
-        let heights = || {
-            items.iter().filter_map(|item| match item {
+        // The rows of text on the page, top first: page numbers sit in the
+        // outermost one, or next to it when a header or footer line lies
+        // beyond and the body is well away.
+        let mut rows: Vec<f64> = items
+            .iter()
+            .filter_map(|item| match item {
                 Item::Line(line) => Some(line.y),
                 Item::Image(_) => None,
             })
+            .collect();
+        rows.sort_by(|a, b| b.total_cmp(a));
+        rows.dedup_by(|a, b| (*a - *b).abs() < 0.5);
+        let at_edge = |y: f64| {
+            let Some(row) = rows.iter().position(|row| (row - y).abs() < 0.5) else {
+                return false;
+            };
+            let last = rows.len() - 1;
+            let apart = |near: usize, far: usize| (rows[near] - rows[far]).abs() > usual * 2.;
+            row == 0
+                || row == last
+                || (row == 1 && last >= 2 && apart(1, 2))
+                || (row + 1 == last && last >= 2 && apart(row, row - 1))
         };
-        let top = heights().fold(f64::MIN, f64::max);
-        let bottom = heights().fold(f64::MAX, f64::min);
         for item in items {
             let line = match item {
                 Item::Image(data) => {
@@ -1608,10 +1622,7 @@ pub(super) fn read_book(data: &[u8]) -> Result<PdfBook> {
             };
             let text = line.text.trim();
             // Page numbers: a bare number at the top or bottom of the page.
-            if (line.y >= top || line.y <= bottom)
-                && text.len() <= 4
-                && text.chars().all(|c| c.is_ascii_digit())
-            {
+            if at_edge(line.y) && text.len() <= 4 && text.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
             if line.size >= body * 1.2 && text.chars().count() < 150 {

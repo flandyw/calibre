@@ -523,7 +523,7 @@ q 200 0 0 150 72 400 cm /Im1 Do Q\n";
     encoder.write_all(first.as_bytes()).unwrap();
     let first = encoder.finish().unwrap();
     let second = b"BT /F1 20 Tf 72 720 Td (Closing) Tj ET\nBT /F1 11 Tf 72 690 Td <4C61737420776F7264732E> Tj ET\n\
-BT /F1 11 Tf 72 640 Td (1984) Tj ET\nBT /F1 11 Tf 72 590 Td (After the year.) Tj ET\nBT /F1 9 Tf 300 40 Td (2) Tj ET\n";
+BT /F1 11 Tf 72 640 Td (1984) Tj ET\nBT /F1 11 Tf 72 590 Td (After the year.) Tj ET\nBT /F1 9 Tf 300 40 Td (2) Tj ET\nBT /F1 7 Tf 72 25 Td (Printed edition) Tj ET\n";
 
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut object = |number: u32, dictionary: &str, stream: Option<&[u8]>| {
@@ -612,6 +612,12 @@ fn pdf_text_images_and_outline_become_a_book() {
         "{text}"
     );
     assert!(!text.lines().any(|line| line.trim() == "2"), "{text}");
+    // Also when a footer line lies below the number: the footer is kept
+    // without it.
+    assert!(
+        text.lines().any(|line| line.trim() == "Printed edition"),
+        "{text}"
+    );
 
     let document = cr_core::formats::read_document(&source, true).unwrap();
     let titles: Vec<&str> = document
