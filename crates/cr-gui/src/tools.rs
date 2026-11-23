@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use cr_core::device::{self, DeviceBook, DeviceReading};
+use cr_core::device::{self, Device, DeviceBook, DeviceReading};
 use cr_core::formats::editing::{EpubDir, Match, SearchOptions, TocEntry};
 use cr_core::formats::Profile;
 use cr_core::library::{
@@ -370,6 +370,8 @@ pub struct Tools {
     pub convert_no_split: bool,
 
     pub device_index: usize,
+    /// The device `device_books` was read from.
+    pub device_listed: Option<Device>,
     pub device_books: Vec<DeviceBook>,
     pub device_marked: HashSet<String>,
     pub device_reading: Vec<DeviceReading>,
@@ -400,6 +402,16 @@ pub struct Tools {
 }
 
 impl Tools {
+    /// Drops what was read from a device.
+    pub fn forget_device(&mut self) {
+        self.device_listed = None;
+        self.device_books.clear();
+        self.device_marked.clear();
+        self.device_reading.clear();
+        self.device_reading_note = None;
+        self.device_loaded = false;
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<CalibreApp>) -> Self {
         let server_password = cx.new(|cx| {
             InputState::new(window, cx)
@@ -437,6 +449,7 @@ impl Tools {
             convert_overwrite: false,
             convert_no_split: false,
             device_index: 0,
+            device_listed: None,
             device_books: Vec::new(),
             device_marked: HashSet::new(),
             device_reading: Vec::new(),
@@ -966,9 +979,7 @@ impl CalibreApp {
     /// Reads what is on a device, off the UI thread.
     pub fn load_device(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(device) = self.devices.get(index).cloned() else {
-            self.tools.device_books.clear();
-            self.tools.device_reading.clear();
-            self.tools.device_loaded = false;
+            self.tools.forget_device();
             cx.notify();
             return;
         };
@@ -983,6 +994,7 @@ impl CalibreApp {
         self.tools.device_loading = true;
         self.tools.device_marked.clear();
         cx.notify();
+        let listed = device.clone();
         let read = cx.background_spawn(async move {
             let library = root.map(|root| Library::open(&root)).transpose()?;
             let books = device::books(library.as_ref(), &device)?;
@@ -992,8 +1004,15 @@ impl CalibreApp {
             let result = read.await;
             this.update_in(cx, |this, window, cx| {
                 this.tools.device_loading = false;
+                // The device went away, or another took its place, meanwhile.
+                if this.devices.get(index) != Some(&listed) {
+                    this.tools.forget_device();
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok((books, reading)) => {
+                        this.tools.device_listed = Some(listed);
                         this.tools.device_books = books;
                         this.tools.device_loaded = true;
                         match reading {
@@ -1008,9 +1027,7 @@ impl CalibreApp {
                         }
                     }
                     Err(err) => {
-                        this.tools.device_books.clear();
-                        this.tools.device_reading.clear();
-                        this.tools.device_loaded = false;
+                        this.tools.forget_device();
                         this.announce(
                             format!("Could not read the device: {err}"),
                             Tone::Error,
@@ -1026,6 +1043,17 @@ impl CalibreApp {
         .detach();
     }
 
+    /// After a scan: what was read from a device that is no longer the one
+    /// shown is dropped, so nothing ticked there can be applied to another.
+    pub fn devices_changed(&mut self, cx: &mut Context<Self>) {
+        let index = self.tools.device_index;
+        let listed = self.tools.device_listed.as_ref();
+        if listed.is_some() && listed != self.devices.get(index) {
+            self.tools.forget_device();
+            cx.notify();
+        }
+    }
+
     pub fn toggle_device_book(&mut self, path: String, cx: &mut Context<Self>) {
         if !self.tools.device_marked.remove(&path) {
             self.tools.device_marked.insert(path);
@@ -1036,9 +1064,16 @@ impl CalibreApp {
     /// Asks, then deletes the ticked books from the device.
     pub fn confirm_device_removal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.tools.device_index;
-        let Some(device) = self.devices.get(index).cloned() else {
+        // Only the device the list was read from, and only while it is
+        // still the one shown.
+        let Some(device) = self.tools.device_listed.clone() else {
             return;
         };
+        if self.devices.get(index) != Some(&device) {
+            self.tools.forget_device();
+            cx.notify();
+            return;
+        }
         // In the order shown, and only what is still listed.
         let paths: Vec<String> = self
             .tools

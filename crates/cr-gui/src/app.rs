@@ -1837,7 +1837,10 @@ impl CalibreApp {
             this.update_in(cx, |this, _, cx| {
                 this.scanning_devices = false;
                 match result {
-                    Ok(devices) => this.devices = devices,
+                    Ok(devices) => {
+                        this.devices = devices;
+                        this.devices_changed(cx);
+                    }
                     Err(err) => this.set_status(format!("Device scan failed: {err}"), Tone::Error),
                 }
                 cx.notify();
