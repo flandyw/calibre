@@ -268,6 +268,8 @@ pub struct CalibreApp {
     pub epub_files: Vec<EpubFile>,
     pub epub_selected: Option<usize>,
     pub epub_dirty: bool,
+    /// Edits written to the unpacked files but not yet saved to the library.
+    pub epub_pending: bool,
 
     pub focus_handle: FocusHandle,
     pub list_focus: FocusHandle,
@@ -432,6 +434,7 @@ impl CalibreApp {
             epub_files: Vec::new(),
             epub_selected: None,
             epub_dirty: false,
+            epub_pending: false,
             focus_handle,
             list_focus,
             reader_focus,
@@ -678,7 +681,7 @@ impl CalibreApp {
     }
 
     pub fn has_unsaved_changes(&self) -> bool {
-        self.editing || self.epub_dirty
+        self.editing || self.epub_dirty || self.epub_pending
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -2772,6 +2775,7 @@ impl CalibreApp {
         self.epub_files = files;
         self.epub_selected = None;
         self.epub_dirty = false;
+        self.epub_pending = false;
         self.screen = Screen::Epub;
         window.focus(&self.focus_handle, cx);
         // Start on the first content document rather than META-INF.
@@ -2829,6 +2833,7 @@ impl CalibreApp {
             entry.size = text.len() as u64;
         }
         self.epub_dirty = false;
+        self.epub_pending = true;
         Ok(())
     }
 
@@ -2955,7 +2960,7 @@ impl CalibreApp {
     }
 
     pub fn close_epub_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.epub_dirty {
+        if !self.epub_dirty && !self.epub_pending {
             self.discard_epub_editor();
             self.set_status("Closed the book editor.", Tone::Info);
             window.focus(&self.list_focus, cx);
@@ -2979,7 +2984,7 @@ impl CalibreApp {
                     this.discard_epub_editor();
                     window.set_window_edited(this.has_unsaved_changes());
                     window.focus(&this.list_focus, cx);
-                    this.set_status("Discarded EPUB edits.", Tone::Info);
+                    this.set_status("Discarded the edits.", Tone::Info);
                     cx.notify();
                 }
                 _ => {}
@@ -2997,6 +3002,7 @@ impl CalibreApp {
         self.epub_files.clear();
         self.epub_selected = None;
         self.epub_dirty = false;
+        self.epub_pending = false;
         if self.screen == Screen::Epub {
             self.screen = Screen::Library;
         }
