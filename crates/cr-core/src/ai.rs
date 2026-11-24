@@ -517,7 +517,46 @@ impl OpenRouter {
         }
     }
 
+    fn validate_endpoint(&self) -> Result<()> {
+        let trimmed = self.base.trim();
+        if trimmed.starts_with("https://") {
+            return Ok(());
+        }
+        if let Some(rest) = trimmed.strip_prefix("http://") {
+            let authority = rest.split('/').next().unwrap_or("");
+            let host = if let Some(after_at) = authority.rsplit_once('@').map(|(_, h)| h) {
+                after_at
+            } else {
+                authority
+            };
+            let host = if host.starts_with('[') {
+                host.trim_start_matches('[')
+                    .split(']')
+                    .next()
+                    .unwrap_or("")
+            } else {
+                host.split(':').next().unwrap_or("")
+            };
+            let is_loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback());
+            if is_loopback {
+                return Ok(());
+            }
+            return Err(Error::Other(format!(
+                "{}: non-localhost URLs must use https:// to protect book data and credentials",
+                self.service
+            )));
+        }
+        Err(Error::Other(format!(
+            "{}: server URL must start with https:// (or http://localhost)",
+            self.service
+        )))
+    }
+
     pub fn test_connection(&self) -> Result<()> {
+        self.validate_endpoint()?;
         let auth = self.authorization()?;
         let mut req = self.agent.get(format!("{}/key", self.base));
         if let Some(auth) = auth {
@@ -546,6 +585,7 @@ impl OpenRouter {
         struct Models {
             data: Vec<RawModel>,
         }
+        self.validate_endpoint()?;
         let mut req = self.agent.get(format!("{}/models", self.base));
         if !self.require_auth {
             if let Some(auth) = self.authorization()? {
@@ -581,6 +621,7 @@ impl OpenRouter {
         if messages.is_empty() {
             return Err(Error::Other("Enter a message first".into()));
         }
+        self.validate_endpoint()?;
         let mut payload = json!({
             "model": self.model,
             "messages": messages,
@@ -1000,5 +1041,17 @@ mod tests {
         assert_eq!(suggestion.description, "Local blurb");
         assert_eq!(suggestion.tags, ["Local"]);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn local_server_rejects_unencrypted_non_loopback_http() {
+        let client = OpenRouter::local("http://192.168.1.50:11434/v1", Some("secret"), "llama3.2");
+        let err = client.test_connection().unwrap_err().to_string();
+        assert!(err.contains("https://"));
+
+        let loopback = OpenRouter::local("http://127.0.0.1:11434/v1", None, "llama3.2");
+        assert!(loopback.validate_endpoint().is_ok());
+        let remote_https = OpenRouter::local("https://ai.example.com/v1", None, "llama3.2");
+        assert!(remote_https.validate_endpoint().is_ok());
     }
 }
