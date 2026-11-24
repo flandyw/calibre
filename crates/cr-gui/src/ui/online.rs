@@ -713,11 +713,13 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 })
                 .checked(session.excerpt)
                 .disabled(busy)
-                .on_click(cx.listener(|app, checked: &bool, _, cx| {
+                .on_click(cx.listener(move |app, checked: &bool, _, cx| {
                     if let Some(session) = app.online.ai.as_mut() {
                         if session.excerpt != *checked {
                             session.excerpt = *checked;
-                            session.history.clear();
+                            if !has_reader_context {
+                                session.history.clear();
+                            }
                         }
                         cx.notify();
                     }
