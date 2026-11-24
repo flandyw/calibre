@@ -11,6 +11,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::reveal::{revealed, revealed_each, FollowFocus as _, RevealOnFocus as _};
 use super::widgets::{empty_state, field, section_label};
 use crate::app::{format_size, CalibreApp};
 use crate::tools::{named_search, Join, TermMatch, ToolPane, PROFILES, SEARCH_FIELDS, TEXT_FIELDS};
@@ -79,6 +80,7 @@ pub fn tools_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement 
                 .min_w_0()
                 .h_full()
                 .overflow_y_scroll()
+                .follow_focus(&app.focus_reveal.scroll("tool-scroll"))
                 .child(v_flex().max_w(px(760.)).p_6().gap_4().child(pane)),
         )
         .into_any_element()
@@ -118,14 +120,16 @@ fn toggle(
     checked: bool,
     cx: &mut Context<CalibreApp>,
     set: impl Fn(&mut CalibreApp, bool) + 'static,
-) -> Checkbox {
-    Checkbox::new(id)
-        .label(label)
-        .checked(checked)
-        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-            set(this, *checked);
-            cx.notify();
-        }))
+) -> Div {
+    revealed(
+        Checkbox::new(id)
+            .label(label)
+            .checked(checked)
+            .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                set(this, *checked);
+                cx.notify();
+            })),
+    )
 }
 
 /// A list row with a main line, a muted second line and trailing controls.
@@ -159,6 +163,7 @@ fn row(
                         .child(detail.into()),
                 ),
         )
+        .reveal_on_focus()
 }
 
 fn selection_note(app: &CalibreApp, verb: &str, cx: &App) -> Div {
@@ -269,7 +274,7 @@ fn bulk_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 )),
         )
         .child(section_label("Search and replace", cx))
-        .child(h_flex().gap_1().flex_wrap().children(field_choices))
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(field_choices)))
         .child(
             h_flex()
                 .gap_3()
@@ -303,7 +308,7 @@ fn bulk_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .label("Apply to Selected Books")
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, window, cx| this.apply_bulk_edit(window, cx))),
-            ),
+            ).reveal_on_focus(),
         )
         .into_any_element()
 }
@@ -355,9 +360,9 @@ fn convert_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             cx,
         ))
         .child(section_label("Convert to", cx))
-        .child(h_flex().gap_1().flex_wrap().children(targets))
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(targets)))
         .child(section_label("Device profile", cx))
-        .child(h_flex().gap_1().flex_wrap().children(profiles))
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(profiles)))
         .child(note(
             "Images larger than the profile's screen are scaled down. Generic keeps them as they are.",
             cx,
@@ -386,7 +391,7 @@ fn convert_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .label(format!("Convert to {}", tools.convert_target))
                     .disabled(app.job.is_some())
                     .on_click(cx.listener(|this, _, window, cx| this.convert_selection(window, cx))),
-            ),
+            ).reveal_on_focus(),
         )
         .into_any_element()
 }
@@ -518,11 +523,12 @@ fn search_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         .primary()
                         .label("Show in Library")
                         .on_click(cx.listener(|this, _, window, cx| this.close_tools(window, cx))),
-                ),
+                )
+                .reveal_on_focus(),
         )
         .child(section_label("Add a term", cx))
-        .child(h_flex().gap_1().flex_wrap().children(fields))
-        .child(h_flex().gap_1().flex_wrap().children(kinds))
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(fields)))
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(kinds)))
         .when(needs_value, |this| {
             this.child(field("Value", input(&tools.term_value), cx))
         })
@@ -531,7 +537,8 @@ fn search_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .gap_2()
                 .child(join("term-and", "Add (and)", Join::And, cx))
                 .child(join("term-or", "Add (or)", Join::Or, cx))
-                .child(join("term-not", "Add (not)", Join::Not, cx)),
+                .child(join("term-not", "Add (not)", Join::Not, cx))
+                .reveal_on_focus(),
         )
         .child(note(
             "Dates take 2024, 2024-06 or 2024-06-01; sizes take 500K or 2M; ratings are in stars. \
@@ -562,7 +569,8 @@ fn search_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.save_search(true, window, cx)
                         })),
-                ),
+                )
+                .reveal_on_focus(),
         )
         .child(section_label(
             format!("Saved searches · {}", saved.len()),
@@ -606,7 +614,7 @@ fn devices_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 "Connect a Kindle or Kobo, or mount a reader's storage, then rescan.",
                 cx,
             ))
-            .child(h_flex().child(rescan))
+            .child(h_flex().child(rescan).reveal_on_focus())
             .child(empty_state(
                 IconName::Inbox,
                 "No e-reader connected",
@@ -661,6 +669,7 @@ fn devices_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     detail,
                     cx,
                 ))
+                .reveal_on_focus()
                 .into_any_element()
         })
         .collect();
@@ -703,9 +712,9 @@ fn devices_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             h_flex()
                 .gap_1()
                 .flex_wrap()
-                .children(device_choices)
+                .children(revealed_each(device_choices))
                 .child(div().flex_1())
-                .child(rescan),
+                .child(revealed(rescan)),
         )
         .child(
             h_flex()
@@ -749,7 +758,8 @@ fn devices_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.confirm_device_removal(window, cx)
                         })),
-                ),
+                )
+                .reveal_on_focus(),
         )
         .child(section_label(
             format!("On the device · {}", tools.device_books.len()),
@@ -856,7 +866,8 @@ fn server_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                 }
                                 cx.notify();
                             })),
-                    ),
+                    )
+                    .reveal_on_focus(),
             )
             .child(note(
                 "The server stops when you close the window or switch library.",
@@ -889,13 +900,15 @@ fn server_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .child(field("Password", input(&tools.server_password), cx)),
         )
         .child(
-            h_flex().child(
-                Button::new("server-start")
-                    .small()
-                    .primary()
-                    .label("Start Server")
-                    .on_click(cx.listener(|this, _, window, cx| this.start_server(window, cx))),
-            ),
+            h_flex()
+                .child(
+                    Button::new("server-start")
+                        .small()
+                        .primary()
+                        .label("Start Server")
+                        .on_click(cx.listener(|this, _, window, cx| this.start_server(window, cx))),
+                )
+                .reveal_on_focus(),
         )
         .into_any_element()
 }
@@ -989,7 +1002,8 @@ fn trash_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.confirm_purge(None, window, cx)
                         })),
-                ),
+                )
+                .reveal_on_focus(),
         )
         .when(entries.is_empty(), |this| {
             this.child(note("The trash is empty.", cx))
@@ -1058,7 +1072,8 @@ fn maintenance_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElemen
                         })
                         .disabled(busy || repairable == 0)
                         .on_click(cx.listener(|this, _, window, cx| this.repair_library(window, cx))),
-                ),
+                )
+                .reveal_on_focus(),
         )
         .map(|this| match problems {
             None => this.child(note("The library has not been checked yet.", cx)),
@@ -1089,7 +1104,7 @@ fn maintenance_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElemen
                     .label("Rebuild Database…")
                     .disabled(busy)
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_rebuild(window, cx))),
-            ),
+            ).reveal_on_focus(),
         )
         .into_any_element()
 }

@@ -11,6 +11,7 @@ mod library_tools;
 pub(crate) mod online;
 mod preferences;
 mod reader;
+pub(crate) mod reveal;
 mod tools;
 mod widgets;
 
@@ -36,6 +37,7 @@ impl Render for CalibreApp {
         if window.focused(cx).is_none() {
             self.focus_main(window, cx);
         }
+        self.focus_reveal.begin_frame(window, cx);
 
         let (background, foreground) = (cx.theme().background, cx.theme().foreground);
 

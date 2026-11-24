@@ -9,6 +9,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::reveal::{revealed, FollowFocus as _, RevealOnFocus as _};
 use super::widgets::{field, section_label};
 use crate::app::{fit_dims, CalibreApp, Tone};
 
@@ -183,6 +184,7 @@ pub fn crop_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         .id("crop-scroll")
         .size_full()
         .overflow_y_scroll()
+        .follow_focus(&app.focus_reveal.scroll("crop-scroll"))
         .child(
             h_flex()
                 .w_full()
@@ -220,7 +222,8 @@ pub fn crop_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                         .child(preset("crop-2-3", "2:3 Ebook", Some(2.0 / 3.0)))
                                         .child(preset("crop-3-4", "3:4", Some(0.75)))
                                         .child(preset("crop-1-1", "Square", Some(1.0)))
-                                        .child(preset("crop-full", "Original", None)),
+                                        .child(preset("crop-full", "Original", None))
+                                        .reveal_on_focus(),
                                 ),
                         )
                         .child(
@@ -236,7 +239,7 @@ pub fn crop_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                         .child(number("Width", &app.crop_width))
                                         .child(number("Height", &app.crop_height)),
                                 )
-                                .child(
+                                .child(revealed(
                                     Button::new("crop-refresh")
                                         .ghost()
                                         .small()
@@ -248,7 +251,7 @@ pub fn crop_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                             }
                                             cx.notify();
                                         })),
-                                ),
+                                )),
                         ),
                 ),
         )

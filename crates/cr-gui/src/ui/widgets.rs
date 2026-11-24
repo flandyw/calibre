@@ -7,6 +7,8 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+use super::reveal::RevealOnFocus as _;
+
 /// An icon-only toolbar button that dispatches `action` and shows its
 /// keyboard shortcut in the tooltip.
 pub fn tool_button(
@@ -118,6 +120,7 @@ pub fn field(label: &str, control: impl IntoElement, cx: &App) -> AnyElement {
                 .text_color(cx.theme().muted_foreground),
         )
         .child(control)
+        .reveal_on_focus()
         .into_any_element()
 }
 
@@ -136,6 +139,7 @@ pub fn detail_row(label: &str, value: impl IntoElement, cx: &App) -> AnyElement 
                 .child(label.to_string()),
         )
         .child(div().flex_1().min_w_0().text_sm().child(value))
+        .reveal_on_focus()
         .into_any_element()
 }
 

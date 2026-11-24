@@ -16,6 +16,7 @@ use gpui_kit::*;
 use crate::app::{set_input, text_input, CalibreApp, Screen, Shelf, Tone};
 use crate::online::{until_stopped, StatusTone};
 use crate::ui::ai;
+use crate::ui::reveal::{revealed_each, FollowFocus as _, RevealOnFocus as _};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -613,6 +614,7 @@ fn cites(app: &CalibreApp, rows: &[Citation], busy: bool, cx: &mut Context<Calib
                         app.studio_book(id, window, cx)
                     })),
                 )
+                .reveal_on_focus()
         })
         .collect::<Vec<_>>();
     v_flex().w_full().children(children)
@@ -772,6 +774,7 @@ pub(crate) fn body(
                             "Edit the query if it is not quite right. Running it filters the library.",
                         )),
                 )
+                .reveal_on_focus()
                 .into_any_element(),
         ),
         Some(Reply::Shelves(rows, included, total)) => {
@@ -793,6 +796,7 @@ pub(crate) fn body(
                                 }
                             })),
                     )
+                    .reveal_on_focus()
                     .into_any_element(),
             );
             if rows.is_empty() {
@@ -828,7 +832,8 @@ pub(crate) fn body(
                                                 button.outline()
                                             }
                                         }),
-                                ),
+                                )
+                                .reveal_on_focus(),
                         )
                         .child(div().text_sm().child(shelf.reason.clone()))
                         .child(cites(app, &shelf.books, busy, cx))
@@ -918,6 +923,7 @@ pub(crate) fn body(
                                     app.apply_studio_cleanup(window, cx)
                                 })),
                         )
+                        .reveal_on_focus()
                         .into_any_element(),
                 );
             }
@@ -985,7 +991,8 @@ pub(crate) fn body(
                                                 )
                                                 .child(div().flex_1().min_w_0().text_sm().child(after)),
                                         ),
-                                ),
+                                )
+                                .reveal_on_focus(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1062,7 +1069,7 @@ pub(crate) fn body(
         .border_1()
         .border_color(theme.border)
         .overflow_y_scroll()
-        .track_scroll(&session.scroll)
+        .follow_focus(&session.scroll)
         .map(|area| {
             if turns.is_empty() {
                 let examples = mode.examples().iter().enumerate().map(|(index, example)| {
@@ -1083,7 +1090,7 @@ pub(crate) fn body(
                             .justify_center()
                             .gap_2()
                             .pt_1()
-                            .children(examples),
+                            .children(revealed_each(examples)),
                     ),
                 )
             } else {
