@@ -218,11 +218,22 @@ impl CalibreApp {
                 } else {
                     Vec::new()
                 };
-                let catalog = CatalogContext::for_request(
+                let prior_query = if mode == Mode::Librarian && !history.is_empty() {
+                    history
+                        .iter()
+                        .filter(|m| matches!(m.role, Role::User))
+                        .map(|m| m.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    String::new()
+                };
+                let catalog = CatalogContext::for_conversation(
                     &books,
                     &recent,
                     seed.filter(|_| mode == Mode::Next),
                     &prompt,
+                    &prior_query,
                     budget,
                 );
                 let (included, total) = (catalog.included(), catalog.total);

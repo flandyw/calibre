@@ -306,7 +306,40 @@ impl CatalogContext {
         query: &str,
         budget: ContextBudget,
     ) -> Self {
-        Self::build(books, recent, seed, 4, query, budget.catalog_books, budget.catalog_bytes)
+        Self::build(
+            books,
+            recent,
+            seed,
+            4,
+            query,
+            "",
+            budget.catalog_books,
+            budget.catalog_bytes,
+        )
+    }
+
+    /// Builds a catalog for a multi-turn conversation: current-turn `query` matches
+    /// always rank first, then `recent` (e.g. previously cited books), then matches
+    /// against `prior_query` so generic follow-ups retain the earlier topic without
+    /// crowding out newly requested books.
+    pub fn for_conversation(
+        books: &[BookSummary],
+        recent: &[i64],
+        seed: Option<i64>,
+        query: &str,
+        prior_query: &str,
+        budget: ContextBudget,
+    ) -> Self {
+        Self::build(
+            books,
+            recent,
+            seed,
+            4,
+            query,
+            prior_query,
+            budget.catalog_books,
+            budget.catalog_bytes,
+        )
     }
 
     fn with_author_limit(
@@ -315,24 +348,38 @@ impl CatalogContext {
         seed: Option<i64>,
         author_limit: usize,
     ) -> Self {
-        Self::build(books, recent, seed, author_limit, "", CATALOG_LIMIT, CATALOG_BYTES)
+        Self::build(
+            books,
+            recent,
+            seed,
+            author_limit,
+            "",
+            "",
+            CATALOG_LIMIT,
+            CATALOG_BYTES,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         books: &[BookSummary],
         recent: &[i64],
         seed: Option<i64>,
         author_limit: usize,
         query: &str,
+        prior_query: &str,
         limit: usize,
         max_bytes: usize,
     ) -> Self {
-        let terms: Vec<String> = query
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|word| word.chars().count() > 2)
-            .map(str::to_lowercase)
-            .collect();
-        let relevance = |book: &BookSummary| {
+        let parse_terms = |text: &str| -> Vec<String> {
+            text.split(|c: char| !c.is_alphanumeric())
+                .filter(|word| word.chars().count() > 2)
+                .map(str::to_lowercase)
+                .collect()
+        };
+        let terms = parse_terms(query);
+        let prior_terms = parse_terms(prior_query);
+        let relevance = |book: &BookSummary, terms: &[String]| {
             if terms.is_empty() {
                 return 0;
             }
@@ -350,11 +397,12 @@ impl CatalogContext {
         ordered.sort_by_key(|book| {
             (
                 seed != Some(book.id),
-                std::cmp::Reverse(relevance(book)),
+                std::cmp::Reverse(relevance(book, &terms)),
                 recent
                     .iter()
                     .position(|id| *id == book.id)
                     .unwrap_or(usize::MAX),
+                std::cmp::Reverse(relevance(book, &prior_terms)),
                 std::cmp::Reverse(book.rating.unwrap_or(0)),
                 book.id,
             )
