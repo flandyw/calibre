@@ -1351,7 +1351,12 @@ impl CalibreApp {
         }
     }
 
-    fn create_library_at(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_library_at(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.job.is_some() || self.has_unsaved_changes() {
             self.announce(
                 "Finish the current job or edit before creating a library.",
@@ -1359,11 +1364,10 @@ impl CalibreApp {
                 window,
                 cx,
             );
-            return;
+            return false;
         }
         if files::is_library(&path) {
-            self.open_library(path, window, cx);
-            return;
+            return self.open_library(path, window, cx);
         }
         match Library::create(&path) {
             Ok(library) => {
@@ -1374,6 +1378,7 @@ impl CalibreApp {
                     window,
                     cx,
                 );
+                true
             }
             Err(err) => {
                 self.announce(
@@ -1383,11 +1388,16 @@ impl CalibreApp {
                     cx,
                 );
                 cx.notify();
+                false
             }
         }
     }
 
     pub fn prompt_open_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_library(false, window, cx);
+    }
+
+    fn choose_library(&mut self, add_books: bool, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1401,29 +1411,33 @@ impl CalibreApp {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            if files::is_library(&path) {
-                this.update_in(cx, |this, window, cx| this.open_library(path, window, cx))
-                    .ok();
-                return;
-            }
-            // Offer to create a library in a folder that has none.
-            let answer = this.update_in(cx, |_, window, cx| {
-                window.prompt(
-                    PromptLevel::Info,
-                    &format!("“{}” is not a calibre library.", display_name(&path)),
-                    Some("Create a new, empty library in this folder?"),
-                    &["Create Library", "Cancel"],
-                    cx,
-                )
-            });
-            if let Ok(answer) = answer {
-                if let Ok(0) = answer.await {
-                    this.update_in(cx, |this, window, cx| {
-                        this.create_library_at(path, window, cx)
-                    })
-                    .ok();
+            let create = !files::is_library(&path);
+            if create {
+                let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Info,
+                        &format!("“{}” is not a calibre library.", display_name(&path)),
+                        Some("Create a new, empty library in this folder?"),
+                        &["Create Library", "Cancel"],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                if !matches!(answer.await, Ok(0)) {
+                    return;
                 }
             }
+            let _ = this.update_in(cx, |this, window, cx| {
+                let opened = if create {
+                    this.create_library_at(path, window, cx)
+                } else {
+                    this.open_library(path, window, cx)
+                };
+                if opened && add_books {
+                    this.prompt_add_books(window, cx);
+                }
+            });
         })
         .detach();
     }
@@ -1526,7 +1540,7 @@ impl CalibreApp {
 
     pub fn prompt_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.library.is_none() {
-            self.prompt_open_library(window, cx);
+            self.choose_library(true, window, cx);
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
