@@ -40,7 +40,21 @@ pub struct FtsHit {
     pub chapter_title: String,
     /// The matching passage, with matches wrapped in `[` and `]`.
     pub snippet: String,
+    /// The first highlighted phrase and its context, separate from display markup.
+    pub passage: Option<FtsPassage>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsPassage {
+    pub before: String,
+    pub matched: String,
+    pub after: String,
+    pub in_title: bool,
+}
+
+// Keep SQLite's match markers distinct from literal brackets in ebook text.
+const MATCH_START: char = '\x01';
+const MATCH_END: char = '\x02';
 
 impl Library {
     fn fts_connection(&self) -> Result<Connection> {
@@ -155,11 +169,16 @@ impl Library {
         let conn = self.fts_connection()?;
         let run = |expression: &str| -> rusqlite::Result<Vec<FtsHit>> {
             let mut stmt = conn.prepare(
-                "SELECT book, chapter, title, snippet(chapters, 1, '[', ']', '…', 24)
+                "SELECT book, chapter, title, snippet(chapters, 1, ?2, ?3, '…', 24),
+                        highlight(chapters, 0, ?2, ?3)
                  FROM chapters WHERE chapters MATCH ?1 ORDER BY rank",
             )?;
             let mut title = self.conn.prepare("SELECT title FROM books WHERE id=?1")?;
-            let mut rows = stmt.query([expression])?;
+            let mut rows = stmt.query(params![
+                expression,
+                MATCH_START.to_string(),
+                MATCH_END.to_string()
+            ])?;
             let mut hits = Vec::new();
             while hits.len() < limit {
                 let Some(row) = rows.next()? else {
@@ -172,13 +191,26 @@ impl Library {
                     title.query_row([book], |row| row.get(0)),
                 )?;
                 if let Some(title) = title {
-                    let snippet: String = row.get(3)?;
+                    let body: String = row.get(3)?;
+                    let in_title = !body.contains(MATCH_START);
+                    let source: String = if in_title { row.get(4)? } else { body };
+                    let source = source.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let passage = source.split_once(MATCH_START).and_then(|(before, marked)| {
+                        let (matched, after) = marked.split_once(MATCH_END)?;
+                        Some(FtsPassage {
+                            before: before.to_string(),
+                            matched: matched.to_string(),
+                            after: after.replace([MATCH_START, MATCH_END], ""),
+                            in_title,
+                        })
+                    });
                     hits.push(FtsHit {
                         book,
                         title,
                         chapter: row.get::<_, i64>(1)? as usize,
                         chapter_title: row.get(2)?,
-                        snippet: snippet.split_whitespace().collect::<Vec<_>>().join(" "),
+                        snippet: source.replace(MATCH_START, "[").replace(MATCH_END, "]"),
+                        passage,
                     });
                 }
             }

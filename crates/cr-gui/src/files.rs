@@ -1,14 +1,15 @@
 //! Helpers for paths handed to the app by the OS: drag and drop, "Open With"
 //! and file URLs.
 
+use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-
-use percent_encoding_lite::decode;
 
 /// File extensions calibre-rust can add to a library.
 pub const EBOOK_EXTENSIONS: &[&str] = &[
     "epub", "pdf", "mobi", "azw", "azw3", "prc", "kfx", "fb2", "txt", "html", "htm", "rtf", "docx",
-    "odt", "cbz", "cbr", "djvu", "lit", "pdb", "md",
+    "odt", "cbz", "cbr", "cb7", "djvu", "lit", "pdb", "md", "kepub", "kf8", "htmlz",
 ];
 
 /// Image types accepted as a cover.
@@ -35,13 +36,27 @@ pub fn classify(paths: impl IntoIterator<Item = PathBuf>) -> DroppedPaths {
                 collect_books(&path, 0, &mut result.books);
             }
         } else if path.file_name().is_some_and(|name| name == "metadata.db") {
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = path
+                .parent()
+                .map(|parent| {
+                    if parent.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        parent
+                    }
+                })
+                .filter(|parent| is_library(parent))
+            {
                 result.library.get_or_insert_with(|| parent.to_path_buf());
             }
-        } else if has_extension(&path, EBOOK_EXTENSIONS) {
+        } else if path.is_file() && has_extension(&path, EBOOK_EXTENSIONS) {
             result.books.push(path);
         }
     }
+    let mut seen = HashSet::new();
+    result
+        .books
+        .retain(|path| seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone())));
     result
 }
 
@@ -68,9 +83,10 @@ fn collect_books(directory: &Path, depth: usize, books: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
-    let mut entries: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-    entries.sort();
-    for path in entries {
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
         let hidden = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -78,9 +94,11 @@ fn collect_books(directory: &Path, depth: usize, books: &mut Vec<PathBuf>) {
         if hidden {
             continue;
         }
-        if path.is_dir() {
-            collect_books(&path, depth + 1, books);
-        } else if has_extension(&path, EBOOK_EXTENSIONS) {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if !is_library(&path) {
+                collect_books(&path, depth + 1, books);
+            }
+        } else if path.is_file() && has_extension(&path, EBOOK_EXTENSIONS) {
             books.push(path);
         }
     }
@@ -88,49 +106,108 @@ fn collect_books(directory: &Path, depth: usize, books: &mut Vec<PathBuf>) {
 
 /// Converts a `file://` URL (or a bare path) from the OS into a path.
 pub fn path_from_url(url: &str) -> Option<PathBuf> {
-    if let Some(rest) = url.strip_prefix("file://") {
-        // Drop an optional host ("file://localhost/path").
-        let path = match rest.find('/') {
-            Some(0) => rest,
-            Some(index) => &rest[index..],
-            None => return None,
-        };
-        let decoded = decode(path)?;
-        #[cfg(windows)]
-        let decoded = decoded.trim_start_matches('/').replace('/', "\\");
-        return Some(PathBuf::from(decoded));
+    if url
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        let parsed = url::Url::parse(url).ok()?;
+        if parsed.host().is_some() || parsed.query().is_some() || parsed.fragment().is_some() {
+            return None;
+        }
+        let path = parsed.to_file_path().ok()?;
+        return (!path.as_os_str().as_encoded_bytes().contains(&0)).then_some(path);
     }
-    if url.contains("://") {
+    if url.is_empty() || url.contains("://") || url.contains('\0') {
         return None;
     }
     Some(PathBuf::from(url))
 }
 
-/// Minimal percent-decoding so this crate does not need another dependency.
-mod percent_encoding_lite {
-    pub fn decode(input: &str) -> Option<String> {
-        let bytes = input.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%' {
-                let hex = input.get(index + 1..index + 3)?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                index += 3;
-            } else {
-                out.push(bytes[index]);
-                index += 1;
+#[derive(Debug, PartialEq, Eq)]
+pub enum Launch {
+    Paths(Vec<PathBuf>),
+    Preferences,
+    ChooseLibrary,
+    AddBooks,
+    OpenBook,
+    Read(PathBuf),
+    Help,
+    Version,
+}
+
+pub fn launch(args: impl IntoIterator<Item = OsString>) -> Result<Launch, String> {
+    let mut args = args.into_iter();
+    let mut bare = false;
+    let mut paths = Vec::new();
+    while let Some(arg) = args.next() {
+        let flag = (!bare).then(|| arg.to_str()).flatten();
+        let action = match flag {
+            Some("--") => {
+                bare = true;
+                continue;
             }
+            Some("--help" | "-h") => Launch::Help,
+            Some("--version" | "-V") => Launch::Version,
+            Some("--preferences") => Launch::Preferences,
+            Some("--choose-library") => Launch::ChooseLibrary,
+            Some("--add-books") => Launch::AddBooks,
+            Some("--open-book") => Launch::OpenBook,
+            Some("--read") => Launch::Read(launch_path(
+                args.next().ok_or("--read requires one ebook path.")?,
+            )?),
+            Some(flag) if flag.starts_with("-psn_") && cfg!(target_os = "macos") => continue,
+            Some(flag) if flag.starts_with('-') => return Err(format!("Unknown option: {flag}")),
+            _ => {
+                paths.push(launch_path(arg)?);
+                continue;
+            }
+        };
+        if !paths.is_empty() || args.next().is_some() {
+            return Err("Launch options must be used on their own.".into());
         }
-        String::from_utf8(out).ok()
+        return Ok(action);
     }
+    Ok(Launch::Paths(paths))
+}
+
+fn launch_path(arg: OsString) -> Result<PathBuf, String> {
+    let path = match arg.to_str() {
+        Some(arg) => path_from_url(arg).ok_or_else(|| format!("Expected a local path: {arg}"))?,
+        None => PathBuf::from(arg),
+    };
+    std::path::absolute(&path).map_err(|err| format!("Could not resolve {}: {err}", path.display()))
+}
+
+pub fn write_atomic(
+    output: &Path,
+    replace: bool,
+    context: &cr_core::jobs::JobContext,
+    write: impl FnOnce(&mut File) -> cr_core::Result<()>,
+) -> cr_core::Result<()> {
+    context.check()?;
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    write(file.as_file_mut())?;
+    file.as_file().sync_all()?;
+    context.check()?;
+    if replace {
+        file.persist(output)
+    } else {
+        file.persist_noclobber(output)
+    }
+    .map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
+    #[core::prelude::v1::test]
+    #[cfg(unix)]
     fn decodes_file_urls() {
         assert_eq!(
             path_from_url("file:///Users/me/My%20Books/a.epub"),
@@ -141,15 +218,106 @@ mod tests {
             Some(PathBuf::from("/tmp/b.pdf"))
         );
         assert_eq!(path_from_url("https://example.com/a.epub"), None);
+        assert_eq!(path_from_url("file://remote/etc/a.epub"), None);
+        assert_eq!(path_from_url("file:///tmp/a%00.epub"), None);
+        assert_eq!(
+            path_from_url("FILE:///tmp/a%23b.epub"),
+            Some(PathBuf::from("/tmp/a#b.epub"))
+        );
         assert_eq!(
             path_from_url("/tmp/c.txt"),
             Some(PathBuf::from("/tmp/c.txt"))
         );
     }
 
-    #[test]
+    #[core::prelude::v1::test]
     fn matches_extensions_case_insensitively() {
         assert!(has_extension(Path::new("a/B.EPUB"), EBOOK_EXTENSIONS));
         assert!(!has_extension(Path::new("a/notes"), EBOOK_EXTENSIONS));
+    }
+
+    #[core::prelude::v1::test]
+    fn launch_accepts_filenames_after_separator_and_exclusive_actions() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            launch(["--", "--preferences", "some book.epub"].map(OsString::from)).unwrap(),
+            Launch::Paths(vec![cwd.join("--preferences"), cwd.join("some book.epub")])
+        );
+        assert_eq!(
+            launch(["--read", "some book.epub"].map(OsString::from)).unwrap(),
+            Launch::Read(cwd.join("some book.epub"))
+        );
+        assert_eq!(
+            launch(["./My Library/metadata.db"].map(OsString::from)).unwrap(),
+            Launch::Paths(vec![cwd.join("My Library").join("metadata.db")])
+        );
+        assert!(launch(["--read"].map(OsString::from)).is_err());
+        assert!(launch(["--preferences", "book.epub"].map(OsString::from)).is_err());
+    }
+
+    #[core::prelude::v1::test]
+    fn folder_import_deduplicates_inputs_and_skips_nested_libraries() {
+        let dir = tempfile::tempdir().unwrap();
+        let book = dir.path().join("book.kepub");
+        let nested = dir.path().join("nested library");
+        std::fs::create_dir(&nested).unwrap();
+        for path in [
+            &book,
+            &nested.join("metadata.db"),
+            &nested.join("book.epub"),
+        ] {
+            std::fs::write(path, b"").unwrap();
+        }
+        let dropped = classify([dir.path().to_path_buf(), book.clone(), nested.clone()]);
+        assert_eq!(dropped.books, vec![book]);
+        assert_eq!(dropped.library, Some(nested));
+    }
+
+    #[core::prelude::v1::test]
+    fn failed_write_preserves_an_existing_export() {
+        use std::io::Write as _;
+
+        let context = cr_core::jobs::JobContext::detached();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.epub");
+        std::fs::write(&path, b"existing book").unwrap();
+        let result = write_atomic(&path, true, &context, |file| {
+            file.write_all(b"partial copy")?;
+            Err(cr_core::Error::Other("interrupted".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing book");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(write_atomic(&path, false, &context, |file| Ok(file.write_all(b"new")?)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing book");
+    }
+
+    #[core::prelude::v1::test]
+    fn cancelling_during_a_write_leaves_the_destination_untouched() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("catalog.csv");
+        std::fs::write(&destination, b"original").unwrap();
+        let target = destination.clone();
+        let (written, staged) = std::sync::mpsc::channel();
+        let (resume, proceed) = std::sync::mpsc::channel();
+        let job = cr_core::jobs::spawn("Export test", move |context| {
+            write_atomic(&target, true, context, |file| {
+                file.write_all(b"new catalog")?;
+                written.send(()).unwrap();
+                proceed.recv().unwrap();
+                Ok(())
+            })
+        })
+        .unwrap();
+        staged
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        job.cancel();
+        resume.send(()).unwrap();
+        assert!(matches!(job.join(), Err(cr_core::Error::Cancelled)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

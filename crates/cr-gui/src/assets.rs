@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         LayoutGrid,
         LibraryBig,
         List,
+        Settings,
         SquarePen,
         SunMoon,
         TabletSmartphone,
@@ -53,7 +54,7 @@ impl AssetSource for AppAssets {
 
 #[cfg(test)]
 mod tests {
-    use gpui_kit::assets::{IconName, IconNamed as _};
+    use gpui_kit::assets::IconName;
     use gpui_kit::AssetSource as _;
 
     use super::AppAssets;

@@ -2,9 +2,12 @@
 
 mod chrome;
 mod crop;
+mod custom_columns;
 mod epub;
 mod inspector;
 mod library;
+mod library_tools;
+mod preferences;
 mod reader;
 mod tools;
 mod widgets;
@@ -41,6 +44,7 @@ impl Render for CalibreApp {
             Screen::Epub => epub::epub_body(self, cx),
             Screen::Crop => crop::crop_body(self, cx),
             Screen::Tools => tools::tools_body(self, cx),
+            Screen::Preferences => preferences::preferences_body(self, cx),
         };
 
         let root = div()

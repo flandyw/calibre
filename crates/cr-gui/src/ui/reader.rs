@@ -32,6 +32,7 @@ pub fn reader_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
     let here = app.reader_locator();
     let progress = book.fraction(here) as f32;
     let font_size = app.settings.reader_font_size;
+    let column_width = px(font_size * app.settings.reader_width.ems());
     if let Some(block) = app.reader_jump.take() {
         app.reader_scroll.scroll_to_top_of_item(block);
     }
@@ -142,11 +143,13 @@ pub fn reader_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
             "Contents".into(),
             ReaderPanel::Contents,
         ))
-        .child(tab(
-            "panel-notes",
-            format!("Notes · {}", app.reader_annotations.len()),
-            ReaderPanel::Notes,
-        ))
+        .when(app.reader_book_id.is_some(), |this| {
+            this.child(tab(
+                "panel-notes",
+                format!("Notes · {}", app.reader_annotations.len()),
+                ReaderPanel::Notes,
+            ))
+        })
         .child(tab("panel-search", "Search".into(), ReaderPanel::Search));
 
     let blocks: Vec<AnyElement> = section
@@ -179,7 +182,7 @@ pub fn reader_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
             div()
                 .id(("block", index))
                 .w_full()
-                .max_w(px(font_size * 40.))
+                .max_w(column_width)
                 .pb(px(font_size * 0.9))
                 .pl(px(f32::from(block.indent) * font_size * 1.4 + 8.))
                 .border_l_2()
@@ -200,7 +203,7 @@ pub fn reader_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
     let next = (section_index + 1 < total).then_some(section_index + 2);
     let footer = h_flex()
         .w_full()
-        .max_w(px(font_size * 40.))
+        .max_w(column_width)
         .pt_8()
         .gap_3()
         .justify_between()
@@ -298,7 +301,7 @@ pub fn reader_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                         .overflow_y_scroll()
                         .track_scroll(&app.reader_scroll)
                         .text_size(px(font_size))
-                        .line_height(relative(1.65))
+                        .line_height(relative(app.settings.reader_spacing.factor()))
                         // Blocks must stay direct children: the scroll
                         // position is saved as the index of the top one.
                         .children(blocks)
@@ -483,6 +486,9 @@ fn block_element(
     cx: &mut Context<CalibreApp>,
 ) -> AnyElement {
     let style = &block.style;
+    if !app.settings.publisher_styles {
+        return plain_block(app, block, index, marked, found, font_size, cx);
+    }
     let scale = style
         .size
         .map_or(1., |size| f32::from(size.clamp(50, 300)) / 100.);

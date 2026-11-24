@@ -12,6 +12,8 @@ actions!(
         // Application
         Quit,
         About,
+        OpenPreferences,
+        ClosePreferences,
         HideApp,
         HideOtherApps,
         ShowAllApps,
@@ -24,6 +26,7 @@ actions!(
         ToggleFullScreen,
         // File
         AddBooks,
+        OpenBookFile,
         OpenLibrary,
         NewLibrary,
         ExportSelected,
@@ -50,6 +53,7 @@ actions!(
         ToggleSortDirection,
         // Book
         ReadBook,
+        AttachFormats,
         EditMetadata,
         ChangeCover,
         CropCover,
@@ -67,10 +71,14 @@ actions!(
         OpenBulkEdit,
         OpenConvert,
         OpenSearchTools,
+        OpenFullText,
         OpenDevices,
         OpenServer,
         OpenTrash,
         OpenMaintenance,
+        OpenTransfer,
+        OpenCatalog,
+        OpenCustomColumns,
         // List navigation
         SelectPrevious,
         SelectNext,
@@ -103,6 +111,21 @@ pub struct OpenRecentLibrary(pub usize);
 #[action(namespace = calibre, no_json)]
 pub struct SendToDevice(pub usize);
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum FormatCommand {
+    Read,
+    Edit,
+    Open,
+    Reveal,
+    CopyPath,
+    SaveCopy,
+    Remove,
+}
+
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = calibre, no_json)]
+pub struct BookFormatAction(pub FormatCommand, pub String);
+
 /// Key context of the main window. Its bindings work everywhere in the window
 /// unless a focused text field claims the same keystroke.
 pub const APP_CONTEXT: &str = "CalibreApp";
@@ -129,8 +152,10 @@ pub fn bind_keys(cx: &mut App) {
     let reader = Some(READER_CONTEXT);
 
     let mut bindings = vec![
+        KeyBinding::new(primary!(","), OpenPreferences, None),
         // File
         KeyBinding::new(primary!("o"), AddBooks, app),
+        KeyBinding::new(primary!("alt-shift-o"), OpenBookFile, app),
         KeyBinding::new(primary!("shift-o"), OpenLibrary, app),
         KeyBinding::new(primary!("shift-n"), NewLibrary, app),
         KeyBinding::new(primary!("shift-e"), ExportSelected, app),
@@ -147,6 +172,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("/"), ShowShortcuts, app),
         // Book
         KeyBinding::new(primary!("enter"), ReadBook, app),
+        KeyBinding::new(primary!("shift-a"), AttachFormats, app),
         KeyBinding::new(primary!("i"), EditMetadata, app),
         KeyBinding::new(primary!("alt-o"), OpenInDefaultApp, app),
         KeyBinding::new(primary!("shift-r"), RevealInFileManager, app),
@@ -156,6 +182,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(primary!("shift-d"), RescanDevices, app),
         KeyBinding::new(primary!("shift-m"), OpenBulkEdit, app),
         KeyBinding::new(primary!("shift-f"), OpenSearchTools, app),
+        KeyBinding::new(primary!("alt-f"), OpenFullText, app),
         // Book list
         KeyBinding::new("up", SelectPrevious, list),
         KeyBinding::new("down", SelectNext, list),
@@ -243,6 +270,8 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
         menus.push(Menu::new("calibre-rust").items([
             MenuItem::action("About calibre-rust", About),
             MenuItem::separator(),
+            MenuItem::action("Preferences…", OpenPreferences),
+            MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
             MenuItem::action("Hide calibre-rust", HideApp),
@@ -255,6 +284,7 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
 
     let mut file = vec![
         MenuItem::action("Add Books…", AddBooks),
+        MenuItem::action("Open Book File…", OpenBookFile),
         MenuItem::separator(),
         MenuItem::action("Open Library…", OpenLibrary),
         MenuItem::submenu(Menu::new("Open Recent").items(recent)),
@@ -271,7 +301,7 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
     }
     menus.push(Menu::new("File").items(file));
 
-    menus.push(Menu::new("Edit").items([
+    let mut edit = vec![
         MenuItem::os_action("Undo", input::Undo, OsAction::Undo),
         MenuItem::os_action("Redo", input::Redo, OsAction::Redo),
         MenuItem::separator(),
@@ -282,7 +312,12 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
         MenuItem::separator(),
         MenuItem::action("Find", FocusSearch),
         MenuItem::action("Save", SaveChanges),
-    ]));
+    ];
+    if !cfg!(target_os = "macos") {
+        edit.push(MenuItem::separator());
+        edit.push(MenuItem::action("Preferences…", OpenPreferences));
+    }
+    menus.push(Menu::new("Edit").items(edit));
 
     menus.push(
         Menu::new("View").items([
@@ -339,6 +374,7 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
     menus.push(Menu::new("Book").items([
         MenuItem::action("Read", ReadBook),
         MenuItem::action("Edit Metadata…", EditMetadata),
+        MenuItem::action("Attach Formats…", AttachFormats),
         MenuItem::separator(),
         MenuItem::action("Change Cover…", ChangeCover),
         MenuItem::action("Crop Cover…", CropCover),
@@ -376,15 +412,19 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
 }
 
 /// The tools screen's panes, as `(menu label, action that opens it)`.
-pub fn tool_actions() -> [(&'static str, Box<dyn Action>); 7] {
+pub fn tool_actions() -> [(&'static str, Box<dyn Action>); 11] {
     [
         ("Edit Metadata in Bulk…", Box::new(OpenBulkEdit)),
         ("Convert Books…", Box::new(OpenConvert)),
         ("Search Tools…", Box::new(OpenSearchTools)),
+        ("Full-text Search…", Box::new(OpenFullText)),
         ("Devices…", Box::new(OpenDevices)),
         ("Content Server…", Box::new(OpenServer)),
         ("Trash…", Box::new(OpenTrash)),
         ("Library Maintenance…", Box::new(OpenMaintenance)),
+        ("Transfer Books…", Box::new(OpenTransfer)),
+        ("Export Catalog…", Box::new(OpenCatalog)),
+        ("Custom Columns…", Box::new(OpenCustomColumns)),
     ]
 }
 
@@ -405,6 +445,7 @@ fn tool_items() -> Vec<MenuItem> {
 pub fn dock_menu() -> Vec<MenuItem> {
     vec![
         MenuItem::action("Add Books…", AddBooks),
+        MenuItem::action("Open Book File…", OpenBookFile),
         MenuItem::action("Open Library…", OpenLibrary),
     ]
 }
@@ -420,4 +461,4 @@ pub fn reveal_label() -> &'static str {
     }
 }
 
-pub const PROJECT_URL: &str = "https://github.com/calibre-rust/calibre-rust";
+pub const PROJECT_URL: &str = "https://github.com/flandyw/calibre";

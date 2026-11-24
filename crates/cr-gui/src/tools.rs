@@ -27,21 +27,29 @@ pub enum ToolPane {
     BulkEdit,
     Trash,
     Search,
+    FullText,
     Convert,
     Devices,
     Server,
     Maintenance,
+    Transfer,
+    Catalog,
+    CustomColumns,
 }
 
 impl ToolPane {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::BulkEdit,
         Self::Convert,
         Self::Search,
+        Self::FullText,
         Self::Devices,
         Self::Server,
         Self::Trash,
         Self::Maintenance,
+        Self::Transfer,
+        Self::Catalog,
+        Self::CustomColumns,
     ];
 
     pub fn title(self) -> &'static str {
@@ -49,10 +57,14 @@ impl ToolPane {
             Self::BulkEdit => "Edit Metadata in Bulk",
             Self::Trash => "Trash",
             Self::Search => "Search Tools",
+            Self::FullText => "Full-text Search",
             Self::Convert => "Convert Books",
             Self::Devices => "Devices",
             Self::Server => "Content Server",
             Self::Maintenance => "Library Maintenance",
+            Self::Transfer => "Transfer Books",
+            Self::Catalog => "Export Catalog",
+            Self::CustomColumns => "Custom Columns",
         }
     }
 }
@@ -539,6 +551,7 @@ impl CalibreApp {
         match pane {
             ToolPane::Trash => self.load_trash(),
             ToolPane::Search => self.load_searches(),
+            ToolPane::CustomColumns => self.load_custom_columns(window, cx),
             ToolPane::Devices if !self.tools.device_loaded && !self.devices.is_empty() => {
                 self.load_device(self.tools.device_index, window, cx)
             }

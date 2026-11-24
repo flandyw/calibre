@@ -94,6 +94,14 @@ fn is_kindle(format: &str) -> bool {
 
 /// Read a book of any convertible format into the document model.
 pub fn read_document(input: &Path, split_chapters: bool) -> Result<document::Document> {
+    let (document, _) = read_document_with_chapter_starts(input, split_chapters)?;
+    Ok(document)
+}
+
+pub(super) fn read_document_with_chapter_starts(
+    input: &Path,
+    split_chapters: bool,
+) -> Result<(document::Document, Option<Vec<usize>>)> {
     let source = detect_format(input);
     let options = document::ReadOptions { split_chapters };
     if is_kindle(&source) {
@@ -166,7 +174,7 @@ pub fn convert_with(input: &Path, output: &Path, options: &ConvertOptions) -> Re
     if source == "EPUB" && is_kindle(&target) && options.keeps_source() {
         write_kindle(input, temporary.path(), target == "AZW3")?;
     } else {
-        let mut document = document::read(
+        let (mut document, _) = document::read(
             input,
             source,
             document::ReadOptions {

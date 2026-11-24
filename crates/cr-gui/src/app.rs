@@ -2,7 +2,7 @@
 //! Rendering lives in [`crate::ui`].
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -13,8 +13,8 @@ use cr_core::formats::editing::{EpubDir, Severity, EDITABLE_FORMATS};
 use cr_core::formats::reading::{Book, Hit, Locator};
 use cr_core::jobs::{self, Canceller, JobContext, Progress};
 use cr_core::library::{
-    AddOutcome, Annotation, AnnotationKind, BookSort, BookUpdate, DuplicatePolicy, ExportOptions,
-    ImportOptions, Library, ListOptions, SaveOutcome,
+    AddOutcome, Annotation, AnnotationKind, BookSort, BookUpdate, ImportOptions, Library,
+    ListOptions, SaveOutcome,
 };
 use cr_core::metadata::{htmlize_comments, parse_user_date, BookSummary, Metadata};
 use cr_core::text::{self, split_authors};
@@ -25,10 +25,12 @@ use gpui_kit::*;
 use image::DynamicImage;
 
 use crate::actions::*;
+use crate::custom_columns::CustomColumns;
 use crate::files;
+use crate::library_tools::LibraryTools;
 use crate::settings::{
-    SavedBounds, Settings, ThemePreference, ViewMode, DEFAULT_READER_FONT_SIZE,
-    MAX_READER_FONT_SIZE, MIN_READER_FONT_SIZE,
+    OpenExternalBook, SavedBounds, Settings, StartupLibrary, ThemePreference, ViewMode,
+    DEFAULT_READER_FONT_SIZE, MAX_READER_FONT_SIZE, MIN_READER_FONT_SIZE,
 };
 use crate::tools::ToolPane;
 
@@ -39,6 +41,7 @@ pub enum Screen {
     Epub,
     Crop,
     Tools,
+    Preferences,
 }
 
 /// A sidebar entry that narrows the book list.
@@ -181,7 +184,6 @@ pub enum Tone {
     Error,
 }
 
-const EXPORT_TEMPLATE: &str = "{author_sort}/{title} ({id})/{title} - {author}";
 const RECENTLY_ADDED_LIMIT: usize = 50;
 /// Formats tried first when opening or dragging a book out of the app.
 /// The format of a book the editor opens, if it has one.
@@ -204,6 +206,11 @@ pub struct RunningJob {
 
 pub struct CalibreApp {
     pub settings: Settings,
+    saved_settings: Settings,
+    pub library_tools: LibraryTools,
+    pub custom_columns: CustomColumns,
+    preferences_return: Screen,
+    pending_opens: VecDeque<(Vec<PathBuf>, bool)>,
     pub job: Option<RunningJob>,
     /// Close or quit requested while a job was running; done once it stops.
     close_after_job: Option<AfterResolve>,
@@ -229,7 +236,9 @@ pub struct CalibreApp {
     pub selected_formats: Vec<String>,
     pub selected_path: Option<String>,
     pub book: Option<Rc<Book>>,
-    pub reader_book_id: i64,
+    pub reader_book_id: Option<i64>,
+    pub reader_return: Screen,
+    reader_file: Option<PathBuf>,
     pub section_index: usize,
     /// Decoded once per book; `None` for images that cannot be shown.
     pub reader_images: Vec<Option<std::sync::Arc<Image>>>,
@@ -285,6 +294,7 @@ pub struct CalibreApp {
     /// Width of the cover grid from the last layout, for keyboard navigation.
     pub grid_width: Rc<Cell<f32>>,
     last_window_title: String,
+    last_window_document: Option<PathBuf>,
 
     pub search: Entity<InputState>,
     pub title_input: Entity<InputState>,
@@ -337,8 +347,18 @@ impl CalibreApp {
         let crop_height = text_input("Height %", window, cx);
 
         let tools = crate::tools::Tools::new(window, cx);
+        let library_tools = LibraryTools::new(window, cx);
 
         let subscriptions = vec![
+            cx.subscribe_in(
+                &library_tools.text_query,
+                window,
+                |this, _, event, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.search_book_text(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(&tools.editor_find, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.editor_find_all(window, cx);
@@ -399,9 +419,15 @@ impl CalibreApp {
         let list_focus = cx.focus_handle();
         let reader_focus = cx.focus_handle();
 
+        let chapter_list_visible = settings.reader_contents;
         let mut app = Self {
             tools,
+            saved_settings: settings.clone(),
             settings,
+            library_tools,
+            custom_columns: CustomColumns::new(window, cx),
+            preferences_return: Screen::Library,
+            pending_opens: VecDeque::new(),
             job: None,
             close_after_job: None,
             library: None,
@@ -421,7 +447,9 @@ impl CalibreApp {
             selected_formats: Vec::new(),
             selected_path: None,
             book: None,
-            reader_book_id: 0,
+            reader_book_id: None,
+            reader_return: Screen::Library,
+            reader_file: None,
             section_index: 0,
             reader_images: Vec::new(),
             reader_fonts: HashMap::new(),
@@ -434,7 +462,7 @@ impl CalibreApp {
             reader_jump: Cell::new(None),
             reader_panel: ReaderPanel::Contents,
             reader_title: String::new(),
-            chapter_list_visible: true,
+            chapter_list_visible,
             screen: Screen::Library,
             editing: false,
             epub_format: "EPUB".to_string(),
@@ -461,6 +489,7 @@ impl CalibreApp {
             reader_scroll: ScrollHandle::new(),
             grid_width: Rc::new(Cell::new(0.0)),
             last_window_title: String::new(),
+            last_window_document: None,
             search,
             title_input,
             authors_input,
@@ -483,20 +512,29 @@ impl CalibreApp {
 
         app.apply_theme(window, cx);
 
-        let startup_library = app
-            .settings
-            .last_library
-            .clone()
-            .filter(|path| files::is_library(path))
-            .or_else(|| Some(default_library_path()).filter(|path| files::is_library(path)));
+        let default = || Some(default_library_path()).filter(|path| files::is_library(path));
+        let startup_library = match app.settings.startup_library {
+            StartupLibrary::LastUsed => app
+                .settings
+                .last_library
+                .clone()
+                .filter(|path| files::is_library(path))
+                .or_else(default),
+            StartupLibrary::Default => default(),
+            StartupLibrary::Ask => None,
+        };
         match startup_library {
-            Some(path) => app.open_library(path, window, cx),
+            Some(path) => {
+                app.open_library(path, window, cx);
+            }
             None => {
                 app.set_status(
                     "Open a library or create a new one to get started.",
                     Tone::Info,
                 );
-                app.scan_devices(window, cx);
+                if app.settings.auto_detect_devices {
+                    app.scan_devices(window, cx);
+                }
             }
         }
         window.focus(&app.list_focus, cx);
@@ -594,7 +632,14 @@ impl CalibreApp {
                         }
                     }
                     Some(AfterResolve::Quit) => this.request_quit(window, cx),
-                    None => {}
+                    None => {
+                        while this.job.is_none() {
+                            let Some((paths, external)) = this.pending_opens.pop_front() else {
+                                break;
+                            };
+                            this.handle_paths(paths, external, window, cx);
+                        }
+                    }
                 }
             })
             .ok();
@@ -608,6 +653,12 @@ impl CalibreApp {
             job.cancelling = true;
             cx.notify();
         }
+    }
+
+    pub(crate) fn can_write(&self) -> bool {
+        self.library
+            .as_ref()
+            .is_some_and(|library| library.read_only_reason().is_none())
     }
 
     /// The open library's folder, or a status message when it cannot be changed.
@@ -637,24 +688,115 @@ impl CalibreApp {
             let target = match self.screen {
                 Screen::Reader => self.reader_focus.clone(),
                 Screen::Library => self.list_focus.clone(),
-                Screen::Epub | Screen::Crop | Screen::Tools => self.focus_handle.clone(),
+                Screen::Epub | Screen::Crop | Screen::Tools | Screen::Preferences => {
+                    self.focus_handle.clone()
+                }
             };
             window.focus(&target, cx);
         }
         true
     }
 
-    fn save_settings(&mut self) {
-        if let Err(err) = self.settings.save() {
-            self.set_status(err, Tone::Error);
+    fn save_settings(&mut self, reset_preferences: bool) {
+        match self.settings.save(&self.saved_settings, reset_preferences) {
+            Ok(()) => self.saved_settings = self.settings.clone(),
+            Err(err) => self.set_status(err, Tone::Error),
         }
     }
 
     /// Persists settings and rebuilds the menu bar to match them.
     fn settings_changed(&mut self, cx: &mut Context<Self>) {
-        self.save_settings();
+        self.save_settings(false);
         cx.set_menus(app_menus(&self.settings));
         cx.notify();
+    }
+
+    pub fn update_preferences(
+        &mut self,
+        change: impl FnOnce(&mut Settings),
+        cx: &mut Context<Self>,
+    ) {
+        let contents = self.settings.reader_contents;
+        change(&mut self.settings);
+        if contents != self.settings.reader_contents {
+            self.chapter_list_visible = self.settings.reader_contents;
+        }
+        self.settings_changed(cx);
+    }
+
+    pub fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.screen {
+            Screen::Preferences => return,
+            Screen::Epub | Screen::Crop => {
+                self.announce(
+                    "Close the editor to open Preferences.",
+                    Tone::Info,
+                    window,
+                    cx,
+                );
+                return;
+            }
+            _ => {}
+        }
+        if self.editing {
+            self.announce(
+                "Save or cancel metadata changes to open Preferences.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.screen == Screen::Reader {
+            let position = self.reader_locator();
+            self.reader_jump.set(Some(position.block));
+        }
+        self.preferences_return = self.screen;
+        self.screen = Screen::Preferences;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.screen == Screen::Preferences {
+            self.screen = self.preferences_return;
+            let target = match self.screen {
+                Screen::Library => &self.list_focus,
+                Screen::Reader => &self.reader_focus,
+                _ => &self.focus_handle,
+            };
+            window.focus(target, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn reset_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let response = window.prompt(
+            PromptLevel::Warning,
+            "Restore default preferences?",
+            Some("This resets appearance, startup, book handling, and reader options."),
+            &["Restore Defaults", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(0) = response.await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.settings = Settings {
+                        last_library: this.settings.last_library.take(),
+                        recent_libraries: std::mem::take(&mut this.settings.recent_libraries),
+                        window: this.settings.window,
+                        ..Settings::default()
+                    };
+                    this.chapter_list_visible = this.settings.reader_contents;
+                    this.apply_theme(window, cx);
+                    this.reload();
+                    this.save_settings(true);
+                    cx.set_menus(app_menus(&this.settings));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn apply_theme(&self, window: &mut Window, cx: &mut App) {
@@ -688,8 +830,19 @@ impl CalibreApp {
         };
         if title != self.last_window_title {
             window.set_window_title(&title);
-            window.set_document_path(self.library.as_ref().map(|library| library.root()));
             self.last_window_title = title;
+        }
+        let reading = self.screen == Screen::Reader
+            || self.screen == Screen::Preferences && self.preferences_return == Screen::Reader;
+        let document = if reading {
+            self.reader_file.as_deref()
+        } else {
+            None
+        }
+        .or_else(|| self.library.as_ref().map(Library::root));
+        if document != self.last_window_document.as_deref() {
+            window.set_document_path(document);
+            self.last_window_document = document.map(Path::to_path_buf);
         }
         window.set_window_edited(self.has_unsaved_changes());
     }
@@ -764,6 +917,19 @@ impl CalibreApp {
             self.shelf = Shelf::All;
         }
         self.reload();
+    }
+
+    pub(crate) fn refresh_after_book_change(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_all();
+        self.ensure_selection(window, cx);
+        if let Some(index) = self.selected_index() {
+            self.scroll_to(index);
+        }
+        cx.notify();
     }
 
     fn shelf_exists(&self, shelf: &Shelf) -> bool {
@@ -1097,12 +1263,16 @@ impl CalibreApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.save_reading_position();
+        self.clear_reader();
         self.discard_epub_editor();
         self.clear_crop();
         // The server and the tools' lists belong to the previous library.
         self.stop_server();
         self.tools.problems = None;
         self.tools.trash.clear();
+        self.library_tools.clear_results();
+        self.custom_columns.clear();
         self.library = Some(library);
         self.screen = Screen::Library;
         self.shelf = Shelf::All;
@@ -1135,21 +1305,40 @@ impl CalibreApp {
                 Tone::Info,
             ),
         }
-        self.scan_devices(window, cx);
+        if self.settings.auto_detect_devices {
+            self.scan_devices(window, cx);
+        }
         cx.notify();
     }
 
-    pub fn open_library(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_library(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.job.is_some() {
+            self.announce(
+                "Wait for the current job before switching libraries.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return false;
+        }
         if self.has_unsaved_changes() {
             self.set_status(
                 "Save or cancel your changes before switching libraries.",
                 Tone::Info,
             );
             cx.notify();
-            return;
+            return false;
         }
         match Library::open(&path) {
-            Ok(library) => self.install_library(library, &path, window, cx),
+            Ok(library) => {
+                self.install_library(library, &path, window, cx);
+                true
+            }
             Err(err) => {
                 self.settings
                     .recent_libraries
@@ -1162,14 +1351,28 @@ impl CalibreApp {
                     cx,
                 );
                 cx.notify();
+                false
             }
         }
     }
 
-    fn create_library_at(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn create_library_at(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.job.is_some() || self.has_unsaved_changes() {
+            self.announce(
+                "Finish the current job or edit before creating a library.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return false;
+        }
         if files::is_library(&path) {
-            self.open_library(path, window, cx);
-            return;
+            return self.open_library(path, window, cx);
         }
         match Library::create(&path) {
             Ok(library) => {
@@ -1180,6 +1383,7 @@ impl CalibreApp {
                     window,
                     cx,
                 );
+                true
             }
             Err(err) => {
                 self.announce(
@@ -1189,11 +1393,16 @@ impl CalibreApp {
                     cx,
                 );
                 cx.notify();
+                false
             }
         }
     }
 
     pub fn prompt_open_library(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_library(false, window, cx);
+    }
+
+    fn choose_library(&mut self, add_books: bool, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1207,29 +1416,33 @@ impl CalibreApp {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            if files::is_library(&path) {
-                this.update_in(cx, |this, window, cx| this.open_library(path, window, cx))
-                    .ok();
-                return;
-            }
-            // Offer to create a library in a folder that has none.
-            let answer = this.update_in(cx, |_, window, cx| {
-                window.prompt(
-                    PromptLevel::Info,
-                    &format!("“{}” is not a calibre library.", display_name(&path)),
-                    Some("Create a new, empty library in this folder?"),
-                    &["Create Library", "Cancel"],
-                    cx,
-                )
-            });
-            if let Ok(answer) = answer {
-                if let Ok(0) = answer.await {
-                    this.update_in(cx, |this, window, cx| {
-                        this.create_library_at(path, window, cx)
-                    })
-                    .ok();
+            let create = !files::is_library(&path);
+            if create {
+                let Ok(answer) = this.update_in(cx, |_, window, cx| {
+                    window.prompt(
+                        PromptLevel::Info,
+                        &format!("“{}” is not a calibre library.", display_name(&path)),
+                        Some("Create a new, empty library in this folder?"),
+                        &["Create Library", "Cancel"],
+                        cx,
+                    )
+                }) else {
+                    return;
+                };
+                if !matches!(answer.await, Ok(0)) {
+                    return;
                 }
             }
+            let _ = this.update_in(cx, |this, window, cx| {
+                let opened = if create {
+                    this.create_library_at(path, window, cx)
+                } else {
+                    this.open_library(path, window, cx)
+                };
+                if opened && add_books {
+                    this.prompt_add_books(window, cx);
+                }
+            });
         })
         .detach();
     }
@@ -1257,18 +1470,48 @@ impl CalibreApp {
         .detach();
     }
 
-    /// Handles files and folders from drag and drop or the OS ("Open With",
-    /// the Dock icon): libraries are opened and ebooks are added.
+    /// Opens dropped library folders and adds dropped ebook files.
     pub fn open_paths(&mut self, paths: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_paths(paths, false, window, cx);
+    }
+
+    pub fn open_external_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_paths(paths, true, window, cx);
+    }
+
+    fn handle_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        external: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.job.is_some() {
+            self.pending_opens.push_back((paths, external));
+            self.announce(
+                "Queued files until the current job finishes.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return;
+        }
         let dropped = files::classify(paths);
         let had_library = dropped.library.is_some();
         if let Some(library) = dropped.library {
-            self.open_library(library, window, cx);
+            if !self.open_library(library, window, cx) {
+                return;
+            }
         }
         if dropped.books.is_empty() {
             if !had_library {
                 self.announce(
-                    "Drop ebook files or a calibre library folder.",
+                    "No supported ebook files or calibre libraries were found.",
                     Tone::Info,
                     window,
                     cx,
@@ -1277,7 +1520,13 @@ impl CalibreApp {
             cx.notify();
             return;
         }
-        if self.library.is_none() {
+        let read_file =
+            external && !had_library && self.settings.open_external_book == OpenExternalBook::Read;
+        if dropped.books.len() == 1 && (self.library.is_none() || read_file) {
+            if let Some(path) = dropped.books.into_iter().next() {
+                self.read_file(path, window, cx);
+            }
+        } else if self.library.is_none() {
             self.announce(
                 "Open a library before adding books.",
                 Tone::Info,
@@ -1285,9 +1534,9 @@ impl CalibreApp {
                 cx,
             );
             cx.notify();
-            return;
+        } else {
+            self.add_paths(dropped.books, window, cx);
         }
-        self.add_paths(dropped.books, window, cx);
     }
 
     // ---------------------------------------------------------------------
@@ -1296,7 +1545,7 @@ impl CalibreApp {
 
     pub fn prompt_add_books(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.library.is_none() {
-            self.prompt_open_library(window, cx);
+            self.choose_library(true, window, cx);
             return;
         }
         let receiver = cx.prompt_for_paths(PathPromptOptions {
@@ -1340,14 +1589,14 @@ impl CalibreApp {
             1 => "Adding 1 book".to_string(),
             count => format!("Adding {count} books"),
         };
+        let duplicates = self.settings.import_duplicates.into();
         self.run_job(
             label,
             window,
             cx,
             move |context| {
-                // Another format of a book already here joins that record.
                 let options = ImportOptions {
-                    duplicates: DuplicatePolicy::Merge,
+                    duplicates,
                     ..Default::default()
                 };
                 Ok(Library::open(&root)?.import_books(&paths, &options, context))
@@ -1375,6 +1624,7 @@ impl CalibreApp {
                     count(|outcome| matches!(outcome, AddOutcome::Merged { added: true, .. }));
                 let present =
                     count(|outcome| matches!(outcome, AddOutcome::Merged { added: false, .. }));
+                let skipped = count(|outcome| matches!(outcome, AddOutcome::Skipped { .. }));
                 let mut summary = match added {
                     1 => "Added 1 book".to_string(),
                     _ => format!("Added {added} books"),
@@ -1385,6 +1635,9 @@ impl CalibreApp {
                 if present > 0 {
                     summary.push_str(&format!("; {present} already in the library"));
                 }
+                if skipped > 0 {
+                    summary.push_str(&format!("; {skipped} duplicate(s) skipped"));
+                }
                 let errors: Vec<String> = results
                     .iter()
                     .filter_map(|item| {
@@ -1392,18 +1645,20 @@ impl CalibreApp {
                         Some(format!("{}: {err}", display_name(&item.item)))
                     })
                     .collect();
-                // Show the new books: clear filters that might hide them.
-                this.shelf = Shelf::All;
-                this.query.clear();
-                set_input(&this.search, String::new(), window, cx);
-                this.refresh_all();
-                if let Some(id) = last_id {
-                    this.load_book(id, window, cx);
-                    if let Some(index) = this.selected_index() {
-                        this.scroll_to(index);
+                if added + merged > 0 {
+                    // Show the new books: clear filters that might hide them.
+                    this.shelf = Shelf::All;
+                    this.query.clear();
+                    set_input(&this.search, String::new(), window, cx);
+                    this.refresh_all();
+                    if let Some(id) = last_id {
+                        this.load_book(id, window, cx);
+                        if let Some(index) = this.selected_index() {
+                            this.scroll_to(index);
+                        }
                     }
                 }
-                let (message, tone) = match (added + merged + present, errors.last()) {
+                let (message, tone) = match (added + merged + present + skipped, errors.last()) {
                     (0, Some(err)) => (format!("No books added. {err}"), Tone::Error),
                     (_, Some(err)) => (
                         format!("{summary}; {} failed. Last error: {err}", errors.len()),
@@ -1423,6 +1678,13 @@ impl CalibreApp {
             cx.notify();
             return;
         }
+        let Some(root) = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf())
+        else {
+            return;
+        };
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -1433,7 +1695,13 @@ impl CalibreApp {
             if let Ok(Ok(Some(paths))) = receiver.await {
                 if let Some(destination) = paths.into_iter().next() {
                     this.update_in(cx, |this, window, cx| {
-                        this.export_books(ids, destination, window, cx);
+                        if this
+                            .library
+                            .as_ref()
+                            .is_some_and(|library| library.root() == root)
+                        {
+                            this.export_books(ids, destination, window, cx);
+                        }
                     })
                     .ok();
                 }
@@ -1456,16 +1724,13 @@ impl CalibreApp {
         };
         let book_count = ids.len();
         let target = destination.clone();
+        let options = self.settings.export_options();
         self.run_job(
             format!("Exporting {book_count} book(s)"),
             window,
             cx,
             move |context| {
                 let library = Library::open(&root)?;
-                let options = ExportOptions {
-                    template: EXPORT_TEMPLATE.to_string(),
-                    ..Default::default()
-                };
                 Ok(library.export_with(&ids, &target, &options, context))
             },
             move |this, result, window, cx| {
@@ -1476,10 +1741,13 @@ impl CalibreApp {
                         return;
                     }
                 };
-                let files: usize = results
+                let (books, files) = results
                     .iter()
-                    .filter_map(|item| item.result.as_ref().ok().map(Vec::len))
-                    .sum();
+                    .filter_map(|item| item.result.as_ref().ok())
+                    .filter(|paths| !paths.is_empty())
+                    .fold((0, 0), |(books, files), paths| {
+                        (books + 1, files + paths.len())
+                    });
                 let errors: Vec<String> = results
                     .iter()
                     .filter_map(|item| {
@@ -1497,16 +1765,10 @@ impl CalibreApp {
                         window,
                         cx,
                     ),
-                    (0, None) => this.announce(
-                        "Nothing exported: these books have no format files.",
-                        Tone::Info,
-                        window,
-                        cx,
-                    ),
+                    (0, None) => this.announce("No files were exported.", Tone::Info, window, cx),
                     (_, None) => this.announce(
                         format!(
-                            "Exported {files} file(s) from {} book(s) to {}.",
-                            results.len(),
+                            "Exported {files} file(s) from {books} book(s) to {}.",
                             destination.display()
                         ),
                         Tone::Success,
@@ -1514,7 +1776,7 @@ impl CalibreApp {
                         cx,
                     ),
                 }
-                if files > 0 {
+                if files > 0 && this.settings.reveal_export {
                     cx.reveal_path(&destination);
                 }
             },
@@ -1614,24 +1876,6 @@ impl CalibreApp {
                 );
             }
             None => self.announce("This book has no files to open.", Tone::Info, window, cx),
-        }
-        cx.notify();
-    }
-
-    pub fn open_format_externally(&mut self, format: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.selected else {
-            return;
-        };
-        let path = self
-            .library
-            .as_ref()
-            .and_then(|library| library.format_path(id, format).ok().flatten());
-        match path {
-            Some(path) => {
-                cx.open_with_system(&path);
-                self.set_status(format!("Opened {}.", display_name(&path)), Tone::Info);
-            }
-            None => self.set_status(format!("No {format} file was found."), Tone::Error),
         }
         cx.notify();
     }
@@ -1952,7 +2196,15 @@ impl CalibreApp {
             }
             self.title_input
                 .update(cx, |input, cx| input.focus(window, cx));
-            self.set_status("Editing metadata. ⌘S saves, Esc cancels.", Tone::Info);
+            let save = if cfg!(target_os = "macos") {
+                "⌘S"
+            } else {
+                "Ctrl+S"
+            };
+            self.set_status(
+                format!("Editing metadata. {save} saves, Esc cancels."),
+                Tone::Info,
+            );
             window.set_window_edited(true);
             cx.notify();
         }
@@ -2074,14 +2326,41 @@ impl CalibreApp {
         let Some(id) = self.selected else {
             return;
         };
-        if self.editing {
+        self.read_library_book(id, None, None, window, cx);
+    }
+
+    pub fn read_library_book(
+        &mut self,
+        id: i64,
+        format: Option<&str>,
+        text_hit: Option<&cr_core::library::FtsHit>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing || !matches!(self.screen, Screen::Library | Screen::Tools) {
             return;
         }
         let Some(library) = self.library.as_ref() else {
             self.set_status("Open a library first.", Tone::Info);
             return;
         };
-        let book = match library.open_book(id, None) {
+        let preferred = library.preferred_viewing_format(id);
+        let chosen = match format {
+            Some(format) => format,
+            None => match &preferred {
+                Ok(format) => format.as_str(),
+                Err(err) => {
+                    self.announce(
+                        format!("Cannot read this book: {err}"),
+                        Tone::Error,
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            },
+        };
+        let book = match library.open_book(id, Some(chosen)) {
             Ok(book)
                 if book
                     .sections
@@ -2104,6 +2383,16 @@ impl CalibreApp {
                 return;
             }
         };
+        self.reader_file = library.format_path(id, chosen).ok().flatten();
+        let location = text_hit.and_then(|hit| crate::library_tools::locate_text_hit(&book, hit));
+        // Reading state uses locators in the preferred format's layout.
+        if !preferred
+            .as_ref()
+            .is_ok_and(|preferred| preferred == chosen)
+        {
+            self.show_book(book, None, location, window, cx);
+            return;
+        }
         // Annotations follow their text if the file changed since.
         let mut problem = None;
         if library.read_only_reason().is_none() {
@@ -2115,10 +2404,110 @@ impl CalibreApp {
             problem = Some(format!("Could not load your notes: {err}"));
             Vec::new()
         });
-        let position = library.reading_position(id, &book).unwrap_or_else(|err| {
-            problem = Some(format!("Could not load your place: {err}"));
+        let position = if self.settings.reader_resume && text_hit.is_none() {
+            library.reading_position(id, &book).unwrap_or_else(|err| {
+                problem = Some(format!("Could not load your place: {err}"));
+                None
+            })
+        } else {
             None
+        };
+        let target = location
+            .filter(|locator| locator.section < book.sections.len())
+            .or_else(|| position.map(|position| position.locator));
+        self.show_book(book, Some(id), target, window, cx);
+        if let Some(problem) = problem {
+            self.set_status(problem, Tone::Error);
+        } else if text_hit.is_some() && location.is_none() {
+            self.set_status(
+                "The matching passage could not be located in this edition.",
+                Tone::Info,
+            );
+        } else if let Some(position) = position {
+            self.set_status(
+                format!("Resumed at {:.0}%.", position.fraction * 100.0),
+                Tone::Info,
+            );
+        }
+    }
+
+    pub fn prompt_read_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Read Book".into()),
         });
+        cx.spawn_in(window, async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = receiver.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update_in(cx, |this, window, cx| this.read_file(path, window, cx));
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub fn read_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_unsaved_changes() || matches!(self.screen, Screen::Epub | Screen::Crop) {
+            self.announce(
+                "Close the editor before opening another book.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        let source = path.clone();
+        self.run_job(
+            format!("Opening {}", display_name(&path)),
+            window,
+            cx,
+            move |_| Book::open(&source),
+            move |this, result, window, cx| match result {
+                Ok(book)
+                    if book
+                        .sections
+                        .iter()
+                        .any(|section| !section.blocks.is_empty()) =>
+                {
+                    if this.has_unsaved_changes()
+                        || matches!(this.screen, Screen::Epub | Screen::Crop)
+                    {
+                        this.announce(
+                            "Close the editor before opening another book.",
+                            Tone::Info,
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    this.save_reading_position();
+                    this.clear_reader();
+                    let path = path.canonicalize().unwrap_or(path);
+                    this.reader_file = Some(path.clone());
+                    this.show_book(book, None, None, window, cx);
+                    cx.add_recent_document(&path);
+                }
+                Ok(_) => this.announce("No readable content in this file.", Tone::Info, window, cx),
+                Err(err) => this.announce(
+                    format!("Cannot read this book: {err}"),
+                    Tone::Error,
+                    window,
+                    cx,
+                ),
+            },
+        );
+    }
+
+    fn show_book(
+        &mut self,
+        book: Book,
+        id: Option<i64>,
+        position: Option<Locator>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.reader_images = book
             .images
             .iter()
@@ -2168,24 +2557,20 @@ impl CalibreApp {
         self.reader_book_id = id;
         self.reader_hits.clear();
         self.reader_hit = 0;
-        self.screen = Screen::Reader;
-        self.go_to(
-            position
-                .map(|position| position.locator)
-                .unwrap_or_default(),
-            cx,
-        );
-        window.focus(&self.reader_focus, cx);
-        match problem {
-            Some(problem) => self.set_status(problem, Tone::Error),
-            None => self.set_status(
-                match position {
-                    Some(position) => format!("Resumed at {:.0}%.", position.fraction * 100.0),
-                    None => format!("Reading {sections} section(s)."),
-                },
-                Tone::Info,
-            ),
+        self.reader_panel = ReaderPanel::Contents;
+        set_input(&self.reader_search, String::new(), window, cx);
+        self.chapter_list_visible = self.settings.reader_contents;
+        match self.screen {
+            Screen::Library | Screen::Tools => self.reader_return = self.screen,
+            Screen::Preferences if self.preferences_return != Screen::Reader => {
+                self.reader_return = self.preferences_return;
+            }
+            _ => {}
         }
+        self.screen = Screen::Reader;
+        self.go_to(position.unwrap_or_default(), cx);
+        window.focus(&self.reader_focus, cx);
+        self.set_status(format!("Reading {sections} section(s)."), Tone::Info);
         self.sync_window_chrome(window);
         cx.notify();
     }
@@ -2207,37 +2592,60 @@ impl CalibreApp {
     fn save_reading_position(&mut self) {
         if self.screen == Screen::Reader {
             self.save_reading_position_at(self.reader_locator());
+        } else if self.screen == Screen::Preferences && self.preferences_return == Screen::Reader {
+            if let Some(block) = self.reader_jump.get() {
+                self.save_reading_position_at(Locator {
+                    section: self.section_index,
+                    block,
+                    offset: 0,
+                });
+            }
         }
     }
 
     fn save_reading_position_at(&mut self, locator: Locator) {
-        let (Some(library), Some(book)) = (self.library.as_ref(), self.book.as_ref()) else {
+        let (Some(library), Some(book), Some(id)) = (
+            self.library.as_ref(),
+            self.book.as_ref(),
+            self.reader_book_id,
+        ) else {
             return;
         };
         if library.read_only_reason().is_some() {
             return;
         }
-        if let Err(err) = library.set_reading_position(self.reader_book_id, book, locator) {
+        if let Err(err) = library.set_reading_position(id, book, locator) {
             self.set_status(format!("Could not save your place: {err}"), Tone::Error);
         }
     }
 
     pub fn close_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.save_reading_position();
+        self.clear_reader();
+        self.screen = self.reader_return;
+        self.sync_window_chrome(window);
+        if self.screen == Screen::Library {
+            window.focus(&self.list_focus, cx);
+            if let Some(index) = self.selected_index() {
+                self.scroll_to(index);
+            }
+        } else {
+            window.focus(&self.focus_handle, cx);
+        }
+        cx.notify();
+    }
+
+    fn clear_reader(&mut self) {
         self.book = None;
+        self.reader_book_id = None;
+        self.reader_file = None;
         self.reader_images.clear();
         self.reader_fonts.clear();
         self.reader_annotations.clear();
         self.reader_hits.clear();
         self.reader_block = None;
-        self.screen = Screen::Library;
+        self.reader_jump.set(None);
         self.reader_title.clear();
-        self.sync_window_chrome(window);
-        window.focus(&self.list_focus, cx);
-        if let Some(index) = self.selected_index() {
-            self.scroll_to(index);
-        }
-        cx.notify();
     }
 
     /// Show a place in the book.
@@ -2327,7 +2735,11 @@ impl CalibreApp {
     /// Bookmark or highlight the selected block (the block at the top of the
     /// page when none is selected). An existing one of that kind is removed.
     pub fn annotate(&mut self, highlight: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(library), Some(book)) = (self.library.as_ref(), self.book.clone()) else {
+        let (Some(library), Some(book), Some(book_id)) = (
+            self.library.as_ref(),
+            self.book.clone(),
+            self.reader_book_id,
+        ) else {
             return;
         };
         if library.read_only_reason().is_some() {
@@ -2355,13 +2767,11 @@ impl CalibreApp {
             None => {
                 let end = highlight.then(|| book.block(start).map_or(0, |block| block.text.len()));
                 library
-                    .add_annotation(self.reader_book_id, &book, start, end, "")
+                    .add_annotation(book_id, &book, start, end, "")
                     .map(|_| ())
             }
         };
-        self.reader_annotations = library
-            .annotations(Some(self.reader_book_id))
-            .unwrap_or_default();
+        self.reader_annotations = library.annotations(Some(book_id)).unwrap_or_default();
         if let Err(err) = result {
             self.announce(format!("Could not save: {err}"), Tone::Error, window, cx);
         }
@@ -2369,11 +2779,9 @@ impl CalibreApp {
     }
 
     pub fn remove_annotation(&mut self, id: i64, cx: &mut Context<Self>) {
-        if let Some(library) = self.library.as_ref() {
+        if let (Some(library), Some(book_id)) = (self.library.as_ref(), self.reader_book_id) {
             let result = library.remove_annotation(id);
-            self.reader_annotations = library
-                .annotations(Some(self.reader_book_id))
-                .unwrap_or_default();
+            self.reader_annotations = library.annotations(Some(book_id)).unwrap_or_default();
             if let Err(err) = result {
                 self.set_status(format!("Could not remove it: {err}"), Tone::Error);
             }
@@ -2381,7 +2789,7 @@ impl CalibreApp {
         cx.notify();
     }
 
-    fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
+    pub fn change_font_size(&mut self, delta: f32, cx: &mut Context<Self>) {
         let size = if delta == 0.0 {
             DEFAULT_READER_FONT_SIZE
         } else {
@@ -2390,7 +2798,7 @@ impl CalibreApp {
         };
         if size != self.settings.reader_font_size {
             self.settings.reader_font_size = size;
-            self.save_settings();
+            self.save_settings(false);
         }
         cx.notify();
     }
@@ -2744,13 +3152,23 @@ impl CalibreApp {
     // ---------------------------------------------------------------------
 
     pub fn begin_epub_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let format = editable_format(&self.selected_formats).map(str::to_string);
+        self.begin_edit_format(format.as_deref(), window, cx);
+    }
+
+    pub fn begin_edit_format(
+        &mut self,
+        format: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.selected else {
             return;
         };
         if self.editing || self.screen != Screen::Library {
             return;
         }
-        let Some(format) = editable_format(&self.selected_formats) else {
+        let Some(format) = format.filter(|format| EDITABLE_FORMATS.contains(format)) else {
             self.announce(
                 "This book has no EPUB, KEPUB or AZW3 file to edit.",
                 Tone::Info,
@@ -3136,6 +3554,9 @@ impl CalibreApp {
     }
 
     fn persist_window_state(&mut self, window: &Window) {
+        if !self.settings.restore_window {
+            return;
+        }
         let (bounds, maximized) = match window.window_bounds() {
             WindowBounds::Windowed(bounds) | WindowBounds::Fullscreen(bounds) => (bounds, false),
             WindowBounds::Maximized(bounds) => (bounds, true),
@@ -3147,7 +3568,7 @@ impl CalibreApp {
             height: bounds.size.height.as_f32(),
             maximized,
         });
-        self.save_settings();
+        self.save_settings(false);
     }
 
     /// Last chance to save state when the OS quits the app directly (Dock
@@ -3179,6 +3600,12 @@ impl CalibreApp {
             .on_action(cx.listener(|_, _: &Zoom, window, _| window.zoom_window()))
             .on_action(cx.listener(|_, _: &ToggleFullScreen, window, _| window.toggle_fullscreen()))
             .on_action(cx.listener(|this, _: &About, window, cx| this.show_about(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenPreferences, window, cx| {
+                this.open_preferences(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ClosePreferences, window, cx| {
+                this.close_preferences(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| {
                 this.show_shortcuts = !this.show_shortcuts;
                 cx.notify();
@@ -3186,6 +3613,9 @@ impl CalibreApp {
             // File
             .on_action(
                 cx.listener(|this, _: &AddBooks, window, cx| this.prompt_add_books(window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &OpenBookFile, window, cx| this.prompt_read_file(window, cx)),
             )
             .on_action(
                 cx.listener(|this, _: &OpenLibrary, window, cx| {
@@ -3280,6 +3710,12 @@ impl CalibreApp {
                     this.start_reading(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &AttachFormats, window, cx| {
+                this.prompt_attach_formats(window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &BookFormatAction, window, cx| {
+                this.act_on_format(action, window, cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &EditMetadata, window, cx| this.begin_edit(window, cx)),
             )
@@ -3325,6 +3761,9 @@ impl CalibreApp {
             .on_action(cx.listener(|this, _: &OpenSearchTools, window, cx| {
                 this.open_tools(ToolPane::Search, window, cx)
             }))
+            .on_action(cx.listener(|this, _: &OpenFullText, window, cx| {
+                this.open_tools(ToolPane::FullText, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &OpenDevices, window, cx| {
                 this.open_tools(ToolPane::Devices, window, cx)
             }))
@@ -3336,6 +3775,15 @@ impl CalibreApp {
             }))
             .on_action(cx.listener(|this, _: &OpenMaintenance, window, cx| {
                 this.open_tools(ToolPane::Maintenance, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenTransfer, window, cx| {
+                this.open_tools(ToolPane::Transfer, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenCatalog, window, cx| {
+                this.open_tools(ToolPane::Catalog, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenCustomColumns, window, cx| {
+                this.open_tools(ToolPane::CustomColumns, window, cx)
             }))
             // List navigation
             .on_action(cx.listener(|this, _: &SelectPrevious, window, cx| {
@@ -3410,7 +3858,7 @@ impl CalibreApp {
         }
     }
 
-    fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+    pub fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
         if self.settings.view != view {
             self.settings.view = view;
             if let Some(index) = self.selected_index() {
@@ -3431,6 +3879,7 @@ impl CalibreApp {
             Screen::Crop => self.cancel_crop(window, cx),
             Screen::Epub => self.close_epub_editor(window, cx),
             Screen::Tools => self.close_tools(window, cx),
+            Screen::Preferences => self.close_preferences(window, cx),
             Screen::Reader => self.close_reader(window, cx),
             Screen::Library if self.editing => self.cancel_edit(window, cx),
             Screen::Library if !self.query.is_empty() => {
@@ -3484,7 +3933,7 @@ pub fn set_input(input: &Entity<InputState>, value: String, window: &mut Window,
     input.update(cx, |state, cx| state.set_value(value, window, cx));
 }
 
-fn text_area(
+pub(crate) fn text_area(
     placeholder: &str,
     rows: usize,
     window: &mut Window,

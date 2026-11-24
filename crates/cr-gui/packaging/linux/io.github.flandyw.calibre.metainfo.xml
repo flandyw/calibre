@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.flandyw.calibre</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>calibre-rust</name>
+  <summary>Manage, read, edit, and convert ebooks</summary>
+  <description>
+    <p>Organize a calibre-compatible library, read and edit ebooks, convert between formats, and send books to e-readers.</p>
+  </description>
+  <launchable type="desktop-id">calibre-rust.desktop</launchable>
+  <url type="homepage">https://github.com/flandyw/calibre</url>
+  <url type="bugtracker">https://github.com/flandyw/calibre/issues</url>
+  <content_rating type="oars-1.1"/>
+</component>

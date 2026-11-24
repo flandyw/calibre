@@ -1,0 +1,858 @@
+//! Background full-text indexing and transfers between calibre libraries.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use cr_core::formats::reading::{Book, Locator};
+use cr_core::jobs::JobContext;
+use cr_core::library::{AddOutcome, CatalogFormat, FtsHit, FtsReport, Library};
+use gpui_kit::component::input::InputState;
+use gpui_kit::*;
+
+use crate::app::{
+    default_library_path, display_name, set_input, text_input, CalibreApp, Shelf, Tone,
+};
+use crate::settings::ImportDuplicates;
+
+const HIT_LIMIT: usize = 100;
+
+pub const CATALOG_FORMATS: [(&str, &str); 6] = [
+    ("CSV", "csv"),
+    ("EPUB", "epub"),
+    ("HTML", "html"),
+    ("JSON", "json"),
+    ("XML", "xml"),
+    ("BibTeX", "bib"),
+];
+
+pub struct LibraryTools {
+    pub text_query: Entity<InputState>,
+    pub text_hits: Option<Vec<FtsHit>>,
+    pub index_report: Option<FtsReport>,
+    pub transfer_target: Option<PathBuf>,
+    pub transfer_duplicates: ImportDuplicates,
+    pub transfer_report: Option<TransferReport>,
+    pub catalog_query: Entity<InputState>,
+    pub catalog_format: usize,
+    pub catalog_output: Option<PathBuf>,
+}
+
+pub struct TransferReport {
+    pub moved: bool,
+    pub written: usize,
+    pub merged: usize,
+    pub skipped: usize,
+    pub failures: Vec<String>,
+    pub cancelled: bool,
+}
+
+impl LibraryTools {
+    pub fn new(window: &mut Window, cx: &mut Context<CalibreApp>) -> Self {
+        Self {
+            text_query: text_input("Words or an exact phrase", window, cx),
+            text_hits: None,
+            index_report: None,
+            transfer_target: None,
+            transfer_duplicates: ImportDuplicates::Skip,
+            transfer_report: None,
+            catalog_query: text_input("Leave blank to export the entire library", window, cx),
+            catalog_format: 0,
+            catalog_output: None,
+        }
+    }
+
+    pub fn clear_results(&mut self) {
+        self.text_hits = None;
+        self.index_report = None;
+        self.transfer_target = None;
+        self.transfer_report = None;
+        self.catalog_output = None;
+    }
+}
+
+impl CalibreApp {
+    pub fn use_library_query_for_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        set_input(
+            &self.library_tools.catalog_query,
+            self.query.clone(),
+            window,
+            cx,
+        );
+    }
+
+    pub fn prompt_export_catalog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf())
+        else {
+            return;
+        };
+        let query = self
+            .library_tools
+            .catalog_query
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let (_, extension) = CATALOG_FORMATS[self.library_tools.catalog_format];
+        let default = default_library_path();
+        let home = default.parent().unwrap_or_else(|| Path::new("."));
+        let receiver = cx.prompt_for_new_path(home, Some(&format!("Library Catalog.{extension}")));
+        cx.spawn_in(window, async move |app, cx| {
+            let Ok(Ok(Some(mut output))) = receiver.await else {
+                return;
+            };
+            let replace = output.extension().is_some();
+            if !replace {
+                output.set_extension(extension);
+            }
+            let _ = app.update_in(cx, |app, window, cx| {
+                if !app
+                    .library
+                    .as_ref()
+                    .is_some_and(|library| library.root() == root)
+                {
+                    return;
+                }
+                if !output
+                    .extension()
+                    .and_then(|suffix| suffix.to_str())
+                    .is_some_and(|suffix| suffix.eq_ignore_ascii_case(extension))
+                {
+                    app.announce(
+                        format!("Choose a .{extension} filename."),
+                        Tone::Error,
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                app.run_job(
+                    "Exporting library catalog",
+                    window,
+                    cx,
+                    move |context| {
+                        write_catalog(
+                            &Library::open(&root)?,
+                            &query,
+                            extension,
+                            &output,
+                            replace,
+                            context,
+                        )?;
+                        Ok(output)
+                    },
+                    |app, result, window, cx| match result {
+                        Ok(output) => {
+                            app.announce(
+                                format!("Saved {}.", display_name(&output)),
+                                Tone::Success,
+                                window,
+                                cx,
+                            );
+                            app.library_tools.catalog_output = Some(output);
+                        }
+                        Err(cr_core::Error::Cancelled) => {
+                            app.announce("Catalog export cancelled.", Tone::Info, window, cx);
+                        }
+                        Err(err) => app.announce(
+                            format!("Could not export the catalog: {err}"),
+                            Tone::Error,
+                            window,
+                            cx,
+                        ),
+                    },
+                );
+            });
+        })
+        .detach();
+    }
+
+    pub fn index_book_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.writable_root(window, cx) else {
+            return;
+        };
+        self.run_job(
+            "Indexing book contents",
+            window,
+            cx,
+            move |context| Library::open(&root)?.fts_index(context),
+            |app, result, window, cx| match result {
+                Ok(report) => {
+                    let message = if report.cancelled {
+                        "Indexing stopped. Run Update Index to continue."
+                    } else {
+                        "Full-text index updated."
+                    };
+                    app.library_tools.index_report = Some(report);
+                    app.library_tools.text_hits = None;
+                    app.set_status(message, Tone::Info);
+                }
+                Err(err) => {
+                    app.announce(format!("Indexing failed: {err}"), Tone::Error, window, cx)
+                }
+            },
+        );
+    }
+
+    pub fn search_book_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self
+            .library
+            .as_ref()
+            .filter(|library| library.has_fts_index())
+            .map(|library| library.root().to_path_buf())
+        else {
+            return;
+        };
+        let query = self
+            .library_tools
+            .text_query
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.run_job(
+            "Searching book contents",
+            window,
+            cx,
+            move |_| Library::open(&root)?.fts_search(&query, HIT_LIMIT),
+            |app, result, window, cx| match result {
+                Ok(hits) => {
+                    app.set_status(
+                        if hits.len() == HIT_LIMIT {
+                            format!("Showing the best {HIT_LIMIT} results.")
+                        } else {
+                            format!("{} chapter(s) matched.", hits.len())
+                        },
+                        Tone::Info,
+                    );
+                    app.library_tools.text_hits = Some(hits);
+                }
+                Err(err) => app.announce(format!("Search failed: {err}"), Tone::Error, window, cx),
+            },
+        );
+    }
+
+    pub fn show_text_hit_in_library(
+        &mut self,
+        id: i64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_tools(window, cx);
+        self.select_shelf(Shelf::All, window, cx);
+        self.set_query(format!("id:{id}"), window, cx);
+        if let Some(index) = self.books.iter().position(|book| book.id == id) {
+            self.click_index(index, false, false, window, cx);
+        }
+    }
+
+    pub fn clear_text_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.library_tools.text_hits = None;
+        set_input(&self.library_tools.text_query, String::new(), window, cx);
+        cx.notify();
+    }
+
+    pub fn choose_transfer_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(source) = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf())
+        else {
+            return;
+        };
+        let response = cx.prompt_for_paths(PathPromptOptions {
+            directories: true,
+            files: false,
+            multiple: false,
+            prompt: Some("Choose Destination Library".into()),
+        });
+        cx.spawn_in(window, async move |app, cx| {
+            let Ok(Ok(Some(paths))) = response.await else {
+                return;
+            };
+            let Some(target) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = app.update_in(cx, |app, window, cx| {
+                if app
+                    .library
+                    .as_ref()
+                    .is_some_and(|library| library.root() == source)
+                {
+                    app.set_transfer_target(target, window, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn set_transfer_target(
+        &mut self,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(library) = &self.library else { return };
+        let validation = (|| {
+            let target = target.canonicalize()?;
+            let source = library.root().canonicalize()?;
+            if source == target {
+                return Err(cr_core::Error::Other(
+                    "Choose a different calibre library.".into(),
+                ));
+            }
+            let destination = Library::open(&target)?;
+            if let Some(reason) = destination.read_only_reason() {
+                return Err(cr_core::Error::Other(reason.to_string()));
+            }
+            Ok(target)
+        })();
+        match validation {
+            Ok(target) => {
+                self.library_tools.transfer_target = Some(target);
+                self.library_tools.transfer_report = None;
+                cx.notify();
+            }
+            Err(err) => self.announce(
+                format!("Cannot use this destination: {err}"),
+                Tone::Error,
+                window,
+                cx,
+            ),
+        }
+    }
+
+    pub fn start_transfer(
+        &mut self,
+        move_books: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.library_tools.transfer_target.clone() else {
+            return;
+        };
+        let ids = self.selection_ids();
+        if ids.is_empty() {
+            return;
+        }
+        let Some(source) = self
+            .library
+            .as_ref()
+            .map(|library| library.root().to_path_buf())
+        else {
+            return;
+        };
+        let duplicates = self.library_tools.transfer_duplicates;
+        if !move_books {
+            self.transfer_selection(source, target, ids, duplicates, false, window, cx);
+            return;
+        }
+        if self.writable_root(window, cx).is_none() || duplicates == ImportDuplicates::Merge {
+            return;
+        }
+        let question = format!("Move {} selected book(s)?", ids.len());
+        let response = window.prompt(
+            PromptLevel::Warning,
+            &question,
+            Some("Successfully transferred books go to the source library’s Trash."),
+            &["Move to Library", "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |app, cx| {
+            if let Ok(0) = response.await {
+                let _ = app.update_in(cx, |app, window, cx| {
+                    if app
+                        .library
+                        .as_ref()
+                        .is_some_and(|library| library.root() == source)
+                    {
+                        app.transfer_selection(source, target, ids, duplicates, true, window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn transfer_selection(
+        &mut self,
+        source: PathBuf,
+        target: PathBuf,
+        ids: Vec<i64>,
+        duplicates: ImportDuplicates,
+        move_books: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let label = if move_books {
+            "Moving books"
+        } else {
+            "Copying books"
+        };
+        self.run_job(
+            label,
+            window,
+            cx,
+            move |context| {
+                let mut source = Library::open(&source)?;
+                let mut target = Library::open(&target)?;
+                let outcomes = source.transfer_books(
+                    &ids,
+                    &mut target,
+                    duplicates.into(),
+                    move_books,
+                    context,
+                );
+                let mut report = TransferReport {
+                    moved: move_books,
+                    written: 0,
+                    merged: 0,
+                    skipped: 0,
+                    failures: Vec::new(),
+                    cancelled: outcomes.len() < ids.len() && context.is_cancelled(),
+                };
+                for item in outcomes {
+                    match item.result {
+                        Ok(AddOutcome::Added(_)) => report.written += 1,
+                        Ok(AddOutcome::Merged { .. }) => report.merged += 1,
+                        Ok(AddOutcome::Skipped { .. }) => report.skipped += 1,
+                        Err(err) => report.failures.push(format!("Book #{}: {err}", item.item)),
+                    }
+                }
+                Ok(report)
+            },
+            |app, result, window, cx| match result {
+                Ok(report) => {
+                    let tone = if report.failures.is_empty() {
+                        Tone::Info
+                    } else {
+                        Tone::Error
+                    };
+                    app.set_status(
+                        format!(
+                            "Transfer finished. {} added, {} merged, {} skipped, {} failed.",
+                            report.written,
+                            report.merged,
+                            report.skipped,
+                            report.failures.len()
+                        ),
+                        tone,
+                    );
+                    if report.moved {
+                        app.refresh_after_book_change(window, cx);
+                    }
+                    app.library_tools.transfer_report = Some(report);
+                }
+                Err(err) => {
+                    app.announce(format!("Transfer failed: {err}"), Tone::Error, window, cx)
+                }
+            },
+        );
+    }
+}
+
+/// Match indexed text against the reader's block layout. An indexed chapter
+/// and a reader section can have different boundaries.
+pub fn locate_text_hit(book: &Book, hit: &FtsHit) -> Option<Locator> {
+    let passage = hit.passage.as_ref()?;
+    if passage.in_title {
+        let title = normalize_text(&hit.chapter_title);
+        if title.is_empty() {
+            return None;
+        }
+        return only(
+            book.sections
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| normalize_text(&section.title) == title)
+                .map(|(section, _)| Locator {
+                    section,
+                    ..Default::default()
+                }),
+        )
+        .or_else(|| {
+            only(
+                book.toc
+                    .iter()
+                    .filter(|entry| normalize_text(&entry.title) == title)
+                    .map(|entry| entry.target),
+            )
+        })
+        .or_else(|| {
+            (book.sections.len() == 1 && normalize_text(&book.title) == title)
+                .then(Locator::default)
+        });
+    }
+
+    let needle = normalize_text(&passage.matched);
+    if needle.is_empty() {
+        return None;
+    }
+    // Keep context adjacent to the highlight when an ellipsis separates it
+    // from other parts of the snippet.
+    let before = passage.before.rsplit('…').next().unwrap_or_default();
+    let after = passage.after.split('…').next().unwrap_or_default();
+    let mut prefix = normalize_text(before);
+    if !prefix.is_empty() && before.ends_with(char::is_whitespace) {
+        prefix.push(' ');
+    }
+    let mut suffix = normalize_text(after);
+    if !suffix.is_empty() && after.starts_with(char::is_whitespace) {
+        suffix.insert(0, ' ');
+    }
+
+    // Join blocks within an indexed chapter, retaining their start positions.
+    // A newline keeps phrases and their context from spanning chapters.
+    let mut text = String::new();
+    let mut starts = Vec::new();
+    for (section, contents) in book.sections.iter().enumerate() {
+        if book.starts_text_chapter(section) && !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        for (block, contents) in contents.blocks.iter().enumerate() {
+            let line = normalize_text(&contents.text);
+            if line.is_empty() {
+                continue;
+            }
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push(' ');
+            }
+            starts.push((
+                text.len(),
+                Locator {
+                    section,
+                    block,
+                    offset: 0,
+                },
+            ));
+            text.push_str(&line);
+        }
+    }
+
+    let mut best = None;
+    let mut tied = false;
+    for (start, matched) in text.match_indices(&needle) {
+        let context = u8::from(!prefix.is_empty() && text[..start].ends_with(&prefix))
+            + u8::from(!suffix.is_empty() && text[start + matched.len()..].starts_with(&suffix));
+        let index = starts.partition_point(|(offset, _)| *offset <= start) - 1;
+        let location = starts[index].1;
+        match best {
+            Some((score, _)) if score > context => {}
+            Some((score, previous)) if score == context => tied |= previous != location,
+            _ => {
+                best = Some((context, location));
+                tied = false;
+            }
+        }
+    }
+    let (_, location) = best?;
+    (!tied).then_some(location)
+}
+
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
+    let first = items.next()?;
+    items.next().is_none().then_some(first)
+}
+
+fn write_catalog(
+    library: &Library,
+    query: &str,
+    extension: &str,
+    output: &Path,
+    replace: bool,
+    context: &JobContext,
+) -> cr_core::Result<()> {
+    crate::files::write_atomic(output, replace, context, |file| {
+        if extension == "epub" {
+            library.catalog_epub(query, file)?;
+        } else {
+            let format = CatalogFormat::parse(extension)
+                .ok_or_else(|| cr_core::Error::UnsupportedFormat(extension.to_string()))?;
+            file.write_all(library.catalog(query, format)?.as_bytes())?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use cr_core::formats::document::{Document, Section};
+    use cr_core::formats::reading::TocEntry;
+    use cr_core::library::FtsPassage;
+
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn text_hit_follows_the_passage_when_the_reader_has_extra_sections() {
+        let book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Cover".into(),
+                    html: String::new(),
+                },
+                Section {
+                    title: "Chapter 2".into(),
+                    html: "<p>The train came at dawn.</p>".into(),
+                },
+                Section {
+                    title: "Chapter 3".into(),
+                    html: "<p>A lighthouse stood in the bay.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let hit = FtsHit {
+            book: 1,
+            title: "A story".into(),
+            chapter: 2,
+            chapter_title: "Chapter 2".into(),
+            snippet: "A [lighthouse] stood in the bay.".into(),
+            passage: Some(FtsPassage {
+                before: "A ".into(),
+                matched: "lighthouse".into(),
+                after: " stood in the bay.".into(),
+                in_title: false,
+            }),
+        };
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 2);
+    }
+
+    #[core::prelude::v1::test]
+    fn html_phrase_can_span_a_section_heading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("The bay.html");
+        std::fs::write(
+            &path,
+            "<p>The train came at dawn.</p><h2>A lighthouse</h2><p>stood in the bay.</p>",
+        )
+        .unwrap();
+        let book = Book::open(&path).unwrap();
+        assert_eq!(book.sections.len(), 2);
+        let hit = FtsHit {
+            book: 1,
+            title: "The bay".into(),
+            chapter: 1,
+            chapter_title: "The bay".into(),
+            snippet: "The train came at [dawn. A lighthouse] stood in the bay.".into(),
+            passage: Some(FtsPassage {
+                before: "The train came at ".into(),
+                matched: "dawn. A lighthouse".into(),
+                after: " stood in the bay.".into(),
+                in_title: false,
+            }),
+        };
+        let target = locate_text_hit(&book, &hit).unwrap();
+        assert_eq!(book.block(target).unwrap().text, "The train came at dawn.");
+    }
+
+    #[core::prelude::v1::test]
+    fn text_hit_keeps_the_highlight_when_the_snippet_contains_an_ellipsis() {
+        let book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Introduction".into(),
+                    html: "<p>A long introductory paragraph precedes the search result.</p><p>There was an abandoned lighthouse.</p>".into(),
+                },
+                Section {
+                    title: "The bay".into(),
+                    html: "<p>The boats sailed away.</p><p>… The lighthouse shone.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let hit = FtsHit {
+            book: 1,
+            title: "A story".into(),
+            chapter: 1,
+            chapter_title: "Introduction".into(),
+            snippet: "A long introductory paragraph precedes the search result. … The [lighthouse] shone.".into(),
+            passage: Some(FtsPassage {
+                before: "A long introductory paragraph precedes the search result. … The ".into(),
+                matched: "lighthouse".into(),
+                after: " shone.".into(),
+                in_title: false,
+            }),
+        };
+        let location = locate_text_hit(&book, &hit).unwrap();
+        assert_eq!((location.section, location.block), (1, 1));
+    }
+
+    #[core::prelude::v1::test]
+    fn indexed_title_and_body_hits_open_their_reader_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = Library::create(&dir.path().join("Library")).unwrap();
+        let file = dir.path().join("The Lantern.txt");
+        std::fs::write(
+            &file,
+            "\
+Chapter 1
+The ship was quiet.
+
+Chapter 2: The Lantern
+[Editor’s note]
+
+The wind rattled the windows.
+
+The sailor watched the silver
+
+moon rising.
+
+A silver lantern glowed.
+",
+        )
+        .unwrap();
+        let id = library.add_book(&file).unwrap().id;
+        let book = library.open_book(id, None).unwrap();
+        library.fts_index(&JobContext::detached()).unwrap();
+        let title = &library.fts_search("title:lantern", 1).unwrap()[0];
+        assert!(title.passage.as_ref().unwrap().in_title);
+        assert_eq!(
+            locate_text_hit(&book, title),
+            Some(Locator {
+                section: 1,
+                ..Default::default()
+            })
+        );
+
+        let word = &library.fts_search("text:windows", 1).unwrap()[0];
+        assert!(word.snippet.contains("[Editor’s note]"));
+        assert_eq!(word.passage.as_ref().unwrap().matched, "windows");
+        let target = locate_text_hit(&book, word).unwrap();
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The wind rattled the windows."
+        );
+
+        let phrase = &library.fts_search(r#""silver moon""#, 1).unwrap()[0];
+        assert_eq!(phrase.passage.as_ref().unwrap().matched, "silver moon");
+        let target = locate_text_hit(&book, phrase).unwrap();
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The sailor watched the silver"
+        );
+
+        let repeated = &library.fts_search("silver AND moon", 1).unwrap()[0];
+        let target = locate_text_hit(&book, repeated).unwrap();
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The sailor watched the silver"
+        );
+    }
+
+    #[core::prelude::v1::test]
+    fn a_title_hit_prefers_a_section_heading_to_an_unrelated_contents_label() {
+        let mut book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Departure".into(),
+                    html: "<p>The ship left.</p>".into(),
+                },
+                Section {
+                    title: "Arrival".into(),
+                    html: "<p>The ship docked.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        book.toc = vec![TocEntry {
+            title: "Arrival".into(),
+            level: 1,
+            target: Locator::default(),
+        }];
+        let hit = FtsHit {
+            book: 1,
+            title: "The crossing".into(),
+            chapter: 2,
+            chapter_title: "Arrival".into(),
+            snippet: "[Arrival]".into(),
+            passage: Some(FtsPassage {
+                before: String::new(),
+                matched: "Arrival".into(),
+                after: String::new(),
+                in_title: true,
+            }),
+        };
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 1);
+    }
+
+    #[core::prelude::v1::test]
+    fn epub_does_not_match_a_phrase_joined_from_separate_chapters() {
+        let mut book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Departure".into(),
+                    html: "<p>The sailor watched the silver</p>".into(),
+                },
+                Section {
+                    title: "At sea".into(),
+                    html: "<p>moon rise.</p>".into(),
+                },
+                Section {
+                    title: "Arrival".into(),
+                    html: "<p>The sailor watched the silver moon rise.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let hit = FtsHit {
+            book: 1,
+            title: "The crossing".into(),
+            chapter: 3,
+            chapter_title: "Arrival".into(),
+            snippet: "The sailor watched the [silver moon] rise.".into(),
+            passage: Some(FtsPassage {
+                before: "The sailor watched the ".into(),
+                matched: "silver moon".into(),
+                after: " rise.".into(),
+                in_title: false,
+            }),
+        };
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 2);
+        book.sections.truncate(2);
+        assert!(locate_text_hit(&book, &hit).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn indexed_fb2_phrase_can_span_nested_sections_within_one_chapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut library = Library::create(&directory.path().join("Library")).unwrap();
+        let path = directory.path().join("The crossing.fb2");
+        std::fs::write(
+            &path,
+            r#"<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+                <body>
+                    <section><title><p>Arrival</p></title><p>The sailor watched the silver</p></section>
+                    <section><p>moon rise.</p></section>
+                    <section><title><p>Arrival</p></title><p>The sailor watched the silver</p>
+                        <section><p>moon rise.</p></section>
+                    </section>
+                </body>
+            </FictionBook>"#,
+        )
+        .unwrap();
+        let id = library.add_book(&path).unwrap().id;
+        let book = library.open_book(id, None).unwrap();
+        library.fts_index(&JobContext::detached()).unwrap();
+        let hits = library.fts_search(r#"text:"silver moon""#, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chapter, 3);
+        let target = locate_text_hit(&book, &hits[0]).unwrap();
+        assert_eq!(target.section, book.sections.len() - 2);
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The sailor watched the silver"
+        );
+    }
+}

@@ -233,7 +233,11 @@ fn books_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         let (title, subtitle) = if app.all_books.is_empty() {
             (
                 "Your library is empty",
-                "Add books with ⌘O, or drop ebook files into this window.",
+                if cfg!(target_os = "macos") {
+                    "Add books with ⌘O, or drop ebook files into this window."
+                } else {
+                    "Add books with Ctrl+O, or drop ebook files into this window."
+                },
             )
         } else if !app.query.is_empty() {
             (
@@ -607,6 +611,11 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .menu(reveal_label(), Box::new(RevealInFileManager))
         .separator()
         .menu("Edit Metadata…", Box::new(EditMetadata))
+        .menu_with_disabled(
+            "Attach Formats…",
+            !app.can_write() || app.job.is_some(),
+            Box::new(AttachFormats),
+        )
         .menu("Change Cover…", Box::new(ChangeCover))
         .menu_with_disabled("Crop Cover…", app.cover_path.is_none(), Box::new(CropCover))
         .menu_with_disabled("Edit Book…", !has_epub, Box::new(EditEpub))
