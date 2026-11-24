@@ -456,56 +456,106 @@ impl CalibreApp {
     }
 }
 
-/// Locate the highlighted term in the reader. Use its surrounding text to
-/// distinguish repeated occurrences without relying on index chapter numbers.
+/// Match indexed text against the reader's block layout. An indexed chapter
+/// and a reader section can have different boundaries.
 pub fn locate_text_hit(book: &Book, hit: &FtsHit) -> Option<Locator> {
-    let (before, marked) = hit.snippet.split_once('[')?;
-    let (term, after) = marked.split_once(']')?;
-    let mut locations: Vec<_> = book
-        .search(term, 0)
-        .into_iter()
-        .map(|hit| hit.start)
-        .collect();
-    locations.dedup_by_key(|location| (location.section, location.block));
-    match locations.as_slice() {
-        [] => return None,
-        [location] => return Some(*location),
-        _ => {}
+    let passage = hit.passage.as_ref()?;
+    if passage.in_title {
+        let title = normalize_text(&hit.chapter_title);
+        if title.is_empty() {
+            return None;
+        }
+        return only(
+            book.toc
+                .iter()
+                .filter(|entry| normalize_text(&entry.title) == title)
+                .map(|entry| entry.target),
+        )
+        .or_else(|| {
+            only(
+                book.sections
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, section)| normalize_text(&section.title) == title)
+                    .map(|(section, _)| Locator {
+                        section,
+                        ..Default::default()
+                    }),
+            )
+        })
+        .or_else(|| {
+            (book.sections.len() == 1 && normalize_text(&book.title) == title)
+                .then(Locator::default)
+        });
     }
 
-    // SQLite also uses ellipses when it truncates a snippet. Keep the
-    // context immediately surrounding the match, even with literal ellipses.
-    let before = before.rsplit('…').next().unwrap_or_default();
-    let after = after.split('…').next().unwrap_or_default();
-    let normalize = |text: &str| {
-        text.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
-    };
-    let context = normalize(&format!("{before}{term}{after}").replace(['[', ']'], ""));
-    if let Some(location) = only(locations.iter().copied().filter(|location| {
-        book.block(*location)
-            .is_some_and(|block| normalize(&block.text).contains(&context))
-    })) {
-        return Some(location);
+    let needle = normalize_text(&passage.matched);
+    if needle.is_empty() {
+        return None;
     }
-    // The snippet can span multiple reader blocks. Only jump if the
-    // matching section has a single candidate block.
-    let (section, _) = only(book.sections.iter().enumerate().filter(|(_, section)| {
-        let text = section
-            .blocks
-            .iter()
-            .map(|block| block.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" ");
-        normalize(&text).contains(&context)
-    }))?;
-    only(
-        locations
-            .into_iter()
-            .filter(|location| location.section == section),
-    )
+    // Keep context adjacent to the highlight when an ellipsis separates it
+    // from other parts of the snippet.
+    let before = passage.before.rsplit('…').next().unwrap_or_default();
+    let after = passage.after.split('…').next().unwrap_or_default();
+    let mut prefix = normalize_text(before);
+    if !prefix.is_empty() && before.ends_with(char::is_whitespace) {
+        prefix.push(' ');
+    }
+    let mut suffix = normalize_text(after);
+    if !suffix.is_empty() && after.starts_with(char::is_whitespace) {
+        suffix.insert(0, ' ');
+    }
+
+    // Treat each block break as a space, just as the index does for
+    // whitespace in its chapter text. Retain the starts for navigation.
+    let mut text = String::new();
+    let mut starts = Vec::new();
+    for (section, contents) in book.sections.iter().enumerate() {
+        for (block, contents) in contents.blocks.iter().enumerate() {
+            let line = normalize_text(&contents.text);
+            if line.is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            starts.push((
+                text.len(),
+                Locator {
+                    section,
+                    block,
+                    offset: 0,
+                },
+            ));
+            text.push_str(&line);
+        }
+    }
+
+    let mut best = None;
+    let mut tied = false;
+    for (start, matched) in text.match_indices(&needle) {
+        let context = u8::from(!prefix.is_empty() && text[..start].ends_with(&prefix))
+            + u8::from(!suffix.is_empty() && text[start + matched.len()..].starts_with(&suffix));
+        let index = starts.partition_point(|(offset, _)| *offset <= start) - 1;
+        let location = starts[index].1;
+        match best {
+            Some((score, _)) if score > context => {}
+            Some((score, previous)) if score == context => tied |= previous != location,
+            _ => {
+                best = Some((context, location));
+                tied = false;
+            }
+        }
+    }
+    let (_, location) = best?;
+    (!tied).then_some(location)
+}
+
+fn normalize_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
@@ -536,6 +586,7 @@ fn write_catalog(
 #[cfg(test)]
 mod tests {
     use cr_core::formats::document::{Document, Section};
+    use cr_core::library::FtsPassage;
 
     use super::*;
 
@@ -564,12 +615,22 @@ mod tests {
             chapter: 2,
             chapter_title: "Chapter 2".into(),
             snippet: "A [lighthouse] stood in the bay.".into(),
+            passage: Some(FtsPassage {
+                before: "A ".into(),
+                matched: "lighthouse".into(),
+                after: " stood in the bay.".into(),
+                in_title: false,
+            }),
         };
         assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 2);
         let spanning_sections = FtsHit {
             chapter: 1,
             chapter_title: "Chapter 2".into(),
             snippet: "The train came at dawn. A [lighthouse] stood in the bay.".into(),
+            passage: Some(FtsPassage {
+                before: "The train came at dawn. A ".into(),
+                ..hit.passage.clone().unwrap()
+            }),
             ..hit
         };
         assert_eq!(
@@ -599,8 +660,76 @@ mod tests {
             chapter: 1,
             chapter_title: "Introduction".into(),
             snippet: "A long introductory paragraph precedes the search result. … The [lighthouse] shone.".into(),
+            passage: Some(FtsPassage {
+                before: "A long introductory paragraph precedes the search result. … The ".into(),
+                matched: "lighthouse".into(),
+                after: " shone.".into(),
+                in_title: false,
+            }),
         };
         let location = locate_text_hit(&book, &hit).unwrap();
         assert_eq!((location.section, location.block), (1, 1));
+    }
+
+    #[core::prelude::v1::test]
+    fn indexed_title_and_body_hits_open_their_reader_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = Library::create(&dir.path().join("Library")).unwrap();
+        let file = dir.path().join("The Lantern.txt");
+        std::fs::write(
+            &file,
+            "\
+Chapter 1
+The ship was quiet.
+
+Chapter 2: The Lantern
+[Editor’s note]
+
+The wind rattled the windows.
+
+The sailor watched the silver
+
+moon rising.
+
+A silver lantern glowed.
+",
+        )
+        .unwrap();
+        let id = library.add_book(&file).unwrap().id;
+        let book = library.open_book(id, None).unwrap();
+        library.fts_index(&JobContext::detached()).unwrap();
+        let title = &library.fts_search("title:lantern", 1).unwrap()[0];
+        assert!(title.passage.as_ref().unwrap().in_title);
+        assert_eq!(
+            locate_text_hit(&book, title),
+            Some(Locator {
+                section: 1,
+                ..Default::default()
+            })
+        );
+
+        let word = &library.fts_search("text:windows", 1).unwrap()[0];
+        assert!(word.snippet.contains("[Editor’s note]"));
+        assert_eq!(word.passage.as_ref().unwrap().matched, "windows");
+        let target = locate_text_hit(&book, word).unwrap();
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The wind rattled the windows."
+        );
+
+        let phrase = &library.fts_search(r#""silver moon""#, 1).unwrap()[0];
+        assert_eq!(phrase.passage.as_ref().unwrap().matched, "silver moon");
+        let target = locate_text_hit(&book, phrase).unwrap();
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The sailor watched the silver"
+        );
+
+        let repeated = &library.fts_search("silver AND moon", 1).unwrap()[0];
+        let target = locate_text_hit(&book, repeated).unwrap();
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The sailor watched the silver"
+        );
     }
 }
