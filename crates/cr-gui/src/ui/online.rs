@@ -702,25 +702,27 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     ),
             )
         })
-        .when(!has_reader_context, |this| {
-            this.child(
-                Checkbox::new("ai-share-excerpt")
-                    .label(format!(
-                        "Also share opening excerpt (up to {excerpt_limit} characters)"
-                    ))
-                    .checked(session.excerpt)
-                    .disabled(busy)
-                    .on_click(cx.listener(|app, checked: &bool, _, cx| {
-                        if let Some(session) = app.online.ai.as_mut() {
-                            if session.excerpt != *checked {
-                                session.excerpt = *checked;
-                                session.history.clear();
-                            }
-                            cx.notify();
+        .child(
+            Checkbox::new("ai-share-excerpt")
+                .label(if has_reader_context {
+                    format!(
+                        "Also share opening excerpt for book-wide actions (up to {excerpt_limit} characters)"
+                    )
+                } else {
+                    format!("Also share opening excerpt (up to {excerpt_limit} characters)")
+                })
+                .checked(session.excerpt)
+                .disabled(busy)
+                .on_click(cx.listener(|app, checked: &bool, _, cx| {
+                    if let Some(session) = app.online.ai.as_mut() {
+                        if session.excerpt != *checked {
+                            session.excerpt = *checked;
+                            session.history.clear();
                         }
-                    })),
-            )
-        })
+                        cx.notify();
+                    }
+                })),
+        )
         .child(
             h_flex()
                 .gap_2()
