@@ -241,19 +241,52 @@ impl Settings {
         Ok(settings)
     }
 
-    pub fn save(&self) -> Result<(), String> {
+    pub fn save(&self, previous: &Self, reset_preferences: bool) -> Result<(), String> {
         let path = settings_path().ok_or("No configuration folder is available.")?;
-        self.write_to(&path)
+        self.write_changes(&path, previous, reset_preferences)
     }
 
-    fn write_to(&self, path: &Path) -> Result<(), String> {
+    fn write_changes(
+        &self,
+        path: &Path,
+        previous: &Self,
+        reset_preferences: bool,
+    ) -> Result<(), String> {
         let parent = path
             .parent()
             .ok_or("The settings path has no parent folder.")?;
         let write = || -> Result<(), Box<dyn std::error::Error>> {
+            let previous = serde_json::to_value(previous)?;
+            let serde_json::Value::Object(mut changes) = serde_json::to_value(self)? else {
+                unreachable!("Settings serialize as a JSON object");
+            };
+            changes.retain(|key, value| {
+                previous.get(key) != Some(value)
+                    || reset_preferences
+                        && !matches!(key.as_str(), "last_library" | "recent_libraries" | "window")
+            });
+            if changes.is_empty() {
+                return Ok(());
+            }
             std::fs::create_dir_all(parent)?;
+            // Lock a separate file so replacing settings.json leaves the lock
+            // valid across processes. Read the latest snapshot while holding it.
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(parent.join("settings.lock"))?;
+            lock.lock()?;
+            let latest = match Self::read_from(path) {
+                Err(_) if reset_preferences => Self::default(),
+                settings => settings?,
+            };
+            let mut merged = serde_json::to_value(latest)?;
+            for (key, value) in changes {
+                merged[key] = value;
+            }
             let mut file = tempfile::NamedTempFile::new_in(parent)?;
-            serde_json::to_writer_pretty(&mut file, self)?;
+            serde_json::to_writer_pretty(&mut file, &merged)?;
             file.write_all(b"\n")?;
             file.as_file().sync_all()?;
             file.persist(path)?;
@@ -343,7 +376,7 @@ mod tests {
     fn settings_replace_previous_file_and_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("profile/settings.json");
-        Settings::default().write_to(&path).unwrap();
+        let previous = Settings::default();
         let settings = Settings {
             export_cover: true,
             export_layout: ExportLayout::Flat,
@@ -354,7 +387,7 @@ mod tests {
             reader_width: ReaderWidth::Wide,
             ..Default::default()
         };
-        settings.write_to(&path).unwrap();
+        settings.write_changes(&path, &previous, false).unwrap();
         let loaded = Settings::read_from(&path).unwrap();
         let export = loaded.export_options();
         assert!(export.cover);
@@ -366,7 +399,43 @@ mod tests {
         assert_eq!(loaded.reader_width, ReaderWidth::Wide);
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
-            1
+            2
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn stale_window_save_preserves_preferences_from_another_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let initial = Settings::read_from(&path).unwrap();
+        let preferences = Settings {
+            theme: ThemePreference::Dark,
+            reveal_export: false,
+            ..initial.clone()
+        };
+        preferences.write_changes(&path, &initial, false).unwrap();
+
+        let window = Some(SavedBounds {
+            x: 10.0,
+            y: 20.0,
+            width: 1000.0,
+            height: 700.0,
+            maximized: false,
+        });
+        let stale = Settings {
+            window,
+            ..initial.clone()
+        };
+        stale.write_changes(&path, &initial, false).unwrap();
+        let loaded = Settings::read_from(&path).unwrap();
+        assert_eq!(loaded.theme, ThemePreference::Dark);
+        assert!(!loaded.reveal_export);
+        assert_eq!(loaded.window, window);
+
+        initial.write_changes(&path, &initial, true).unwrap();
+        let reset = Settings::read_from(&path).unwrap();
+        assert_eq!(reset.theme, ThemePreference::System);
+        assert!(reset.reveal_export);
+        assert_eq!(reset.window, window);
     }
 }

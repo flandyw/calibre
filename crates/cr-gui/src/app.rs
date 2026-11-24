@@ -206,6 +206,7 @@ pub struct RunningJob {
 
 pub struct CalibreApp {
     pub settings: Settings,
+    saved_settings: Settings,
     pub library_tools: LibraryTools,
     pub custom_columns: CustomColumns,
     preferences_return: Screen,
@@ -421,6 +422,7 @@ impl CalibreApp {
         let chapter_list_visible = settings.reader_contents;
         let mut app = Self {
             tools,
+            saved_settings: settings.clone(),
             settings,
             library_tools,
             custom_columns: CustomColumns::new(window, cx),
@@ -695,15 +697,16 @@ impl CalibreApp {
         true
     }
 
-    fn save_settings(&mut self) {
-        if let Err(err) = self.settings.save() {
-            self.set_status(err, Tone::Error);
+    fn save_settings(&mut self, reset_preferences: bool) {
+        match self.settings.save(&self.saved_settings, reset_preferences) {
+            Ok(()) => self.saved_settings = self.settings.clone(),
+            Err(err) => self.set_status(err, Tone::Error),
         }
     }
 
     /// Persists settings and rebuilds the menu bar to match them.
     fn settings_changed(&mut self, cx: &mut Context<Self>) {
-        self.save_settings();
+        self.save_settings(false);
         cx.set_menus(app_menus(&self.settings));
         cx.notify();
     }
@@ -787,7 +790,9 @@ impl CalibreApp {
                     this.chapter_list_visible = this.settings.reader_contents;
                     this.apply_theme(window, cx);
                     this.reload();
-                    this.settings_changed(cx);
+                    this.save_settings(true);
+                    cx.set_menus(app_menus(&this.settings));
+                    cx.notify();
                 });
             }
         })
@@ -2793,7 +2798,7 @@ impl CalibreApp {
         };
         if size != self.settings.reader_font_size {
             self.settings.reader_font_size = size;
-            self.save_settings();
+            self.save_settings(false);
         }
         cx.notify();
     }
@@ -3563,7 +3568,7 @@ impl CalibreApp {
             height: bounds.size.height.as_f32(),
             maximized,
         });
-        self.save_settings();
+        self.save_settings(false);
     }
 
     /// Last chance to save state when the OS quits the app directly (Dock
