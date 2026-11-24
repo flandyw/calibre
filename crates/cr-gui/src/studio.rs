@@ -60,6 +60,7 @@ pub struct Session {
     status: String,
     reply: Option<Reply>,
     history: Vec<Message>,
+    cited_ids: Vec<i64>,
 }
 
 enum Reply {
@@ -112,6 +113,7 @@ impl CalibreApp {
             status: String::new(),
             reply: None,
             history: Vec::new(),
+            cited_ids: Vec::new(),
         });
         let weak = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -156,6 +158,7 @@ impl CalibreApp {
         let seed = session.seed;
         let selected_only = session.selected_only;
         let mut history = session.history.clone();
+        let cited_ids = session.cited_ids.clone();
         let submitted = prompt.clone();
         session.status = format!("Waiting for {provider_name}…");
         session.saved_shelves.clear();
@@ -210,14 +213,28 @@ impl CalibreApp {
                 };
                 let recent = if mode == Mode::Next && seed.is_none() {
                     library.recent_read_ids(12)?
+                } else if mode == Mode::Librarian {
+                    cited_ids
                 } else {
                     Vec::new()
+                };
+                let relevance_query = if mode == Mode::Librarian && !history.is_empty() {
+                    let mut combined = history
+                        .iter()
+                        .map(|m| m.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    combined.push(' ');
+                    combined.push_str(&prompt);
+                    combined
+                } else {
+                    prompt.clone()
                 };
                 let catalog = CatalogContext::for_request(
                     &books,
                     &recent,
                     seed.filter(|_| mode == Mode::Next),
-                    &prompt,
+                    &relevance_query,
                     budget,
                 );
                 let (included, total) = (catalog.included(), catalog.total);
@@ -248,6 +265,11 @@ impl CalibreApp {
                             if mode == Mode::Librarian {
                                 if session.history.len() >= 6 {
                                     session.history.drain(..2);
+                                }
+                                for book in &answer.books {
+                                    if !session.cited_ids.contains(&book.id) {
+                                        session.cited_ids.push(book.id);
+                                    }
                                 }
                                 session.history.push(Message::new(Role::User, submitted));
                                 session
@@ -410,6 +432,7 @@ fn body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         session.saved_shelves.clear();
                         session.status.clear();
                         session.history.clear();
+                        session.cited_ids.clear();
                         cx.notify();
                     }
                 }
@@ -740,6 +763,7 @@ fn body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                             .on_click(cx.listener(|app, _, _, cx| {
                                 if let Some(session) = app.online.studio.session.as_mut() {
                                     session.history.clear();
+                                    session.cited_ids.clear();
                                     session.reply = None;
                                     cx.notify();
                                 }
