@@ -194,6 +194,10 @@ impl CalibreApp {
         } else {
             model
         };
+        if self.settings.ai_local_url != url {
+            self.online.models.clear();
+            self.online.connection = None;
+        }
         set_input(&self.online.local_url, url.clone(), window, cx);
         set_input(&self.online.local_model, model.clone(), window, cx);
         self.update_preferences(
