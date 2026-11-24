@@ -316,9 +316,12 @@ impl CalibreApp {
             window,
             cx,
             move |job| {
-                until_stopped(job, move || -> cr_core::Result<Reply> {
+                // Each `job.check()` comes right before a request, so nothing is
+                // sent to the provider once Stop was pressed.
+                until_stopped(job, move |job| -> cr_core::Result<Reply> {
                     let library = Library::open(&root)?;
                     if mode == Mode::Search {
+                        job.check()?;
                         return client.draft_search(&library, &prompt).map(Reply::Search);
                     }
                     if mode == Mode::Cleanup {
@@ -331,6 +334,7 @@ impl CalibreApp {
                             .iter()
                             .map(|id| library.get_summary(*id))
                             .collect::<cr_core::Result<Vec<_>>>()?;
+                        job.check()?;
                         let drafts = client.cleanup(&books)?;
                         return Ok(Reply::Cleanup(
                             drafts
@@ -384,6 +388,7 @@ impl CalibreApp {
                         budget,
                     );
                     let (included, total) = (catalog.included(), catalog.total);
+                    job.check()?;
                     if mode == Mode::Shelves {
                         return client
                             .shelves(&catalog, &prompt)

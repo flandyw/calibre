@@ -141,16 +141,19 @@ pub struct AiSession {
 
 /// Runs a provider call that cannot be interrupted on a thread of its own,
 /// so Stop takes effect at once. An abandoned call finishes in the
-/// background and what it returns, a reply or an error, is dropped.
+/// background and what it returns, a reply or an error, is dropped. `work`
+/// gets the job so it can check for Stop before it sends anything.
 pub(crate) fn until_stopped<T: Send + 'static>(
     job: &JobContext,
-    work: impl FnOnce() -> cr_core::Result<T> + Send + 'static,
+    work: impl FnOnce(&JobContext) -> cr_core::Result<T> + Send + 'static,
 ) -> cr_core::Result<T> {
+    job.check()?;
     let (sender, receiver) = mpsc::channel();
+    let worker_job = job.clone();
     std::thread::Builder::new()
         .name("ai-request".into())
         .spawn(move || {
-            let _ = sender.send(work());
+            let _ = sender.send(work(&worker_job));
         })?;
     loop {
         job.check()?;
@@ -1177,7 +1180,7 @@ impl CalibreApp {
                 };
                 let (label, messages) = match task {
                     BookTask::Suggest => {
-                        return until_stopped(job, move || client.suggest(&context))
+                        return until_stopped(job, move |_| client.suggest(&context))
                             .map(AiReply::Suggestion);
                     }
                     BookTask::ReadingTime => {
@@ -1465,7 +1468,7 @@ mod tests {
         let (release, blocked) = mpsc::channel::<()>();
         let (started, running) = mpsc::channel();
         let handle = cr_core::jobs::spawn("ask", move |job| {
-            until_stopped(job, move || -> cr_core::Result<()> {
+            until_stopped(job, move |_| -> cr_core::Result<()> {
                 started.send(()).ok();
                 // Stands in for a provider that answers late, with an error.
                 blocked.recv().ok();
@@ -1481,10 +1484,32 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn work_abandoned_on_stop_can_see_it_was_stopped() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel();
+        let (seen, outcome) = mpsc::channel();
+        let handle = cr_core::jobs::spawn("ask", move |job| {
+            until_stopped(job, move |job| -> cr_core::Result<()> {
+                started.send(()).ok();
+                // Stands in for loading the library before the request.
+                blocked.recv().ok();
+                seen.send(job.is_cancelled()).ok();
+                job.check()
+            })
+        })
+        .unwrap();
+        running.recv().unwrap();
+        handle.cancel();
+        assert!(matches!(handle.join(), Err(Error::Cancelled)));
+        release.send(()).unwrap();
+        assert!(outcome.recv().unwrap());
+    }
+
+    #[core::prelude::v1::test]
     fn a_finished_provider_call_passes_its_result_through() {
         let job = JobContext::detached();
-        assert_eq!(until_stopped(&job, || Ok(7)).unwrap(), 7);
-        let failed = until_stopped(&job, || -> cr_core::Result<()> {
+        assert_eq!(until_stopped(&job, |_| Ok(7)).unwrap(), 7);
+        let failed = until_stopped(&job, |_| -> cr_core::Result<()> {
             Err(Error::Other("provider failed".into()))
         });
         assert!(matches!(failed, Err(Error::Other(message)) if message == "provider failed"));
