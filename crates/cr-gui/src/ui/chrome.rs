@@ -324,7 +324,9 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 Button::new("reader-ask-ai")
                     .ghost()
                     .small()
+                    .icon(Lucide::Sparkles)
                     .label("Ask AI…")
+                    .tooltip("Ask about this chapter, or click a paragraph first to ask about it")
                     .on_click(cx.listener(|app, _, window, cx| app.open_ai(window, cx))),
             )
         })

@@ -1,5 +1,6 @@
 //! Rendering for the main window. State and behaviour live in [`crate::app`].
 
+pub(crate) mod ai;
 mod chrome;
 mod crop;
 mod custom_columns;

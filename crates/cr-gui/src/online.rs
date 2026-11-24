@@ -4,8 +4,7 @@ use std::sync::Arc;
 use cr_core::ai::{
     reader_chapter_text, reading_minutes, recap_reader_messages_with_budget, AiClient, AiConfig,
     BookAction, BookContext, ChatReply, Message, Model, Provider, Role, Suggestion,
-    DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_URL, READING_CJK_CHARS_PER_MINUTE,
-    READING_WORDS_PER_MINUTE,
+    DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_URL, READING_CJK_CHARS_PER_MINUTE, READING_WORDS_PER_MINUTE,
 };
 use cr_core::formats::reading::BlockKind;
 use cr_core::online_metadata::{Candidate, Catalog, Field, Query, Source};
@@ -26,6 +25,8 @@ pub struct Online {
     pub model: Entity<InputState>,
     pub models: Vec<Model>,
     pub connection: Option<String>,
+    /// Whether the last check or model listing worked; `None` while it runs.
+    pub connection_ok: Option<bool>,
     pub title: Entity<InputState>,
     pub author: Entity<InputState>,
     pub isbn: Entity<InputState>,
@@ -57,12 +58,13 @@ impl Online {
             model: text_input("Model ID", window, cx),
             models: Vec::new(),
             connection: None,
+            connection_ok: None,
             title: text_input("Title", window, cx),
             author: text_input("Author", window, cx),
             isbn: text_input("ISBN (optional)", window, cx),
             question: text_input("Ask a question about this book", window, cx),
             chapter: text_input("Contents #", window, cx),
-            language: text_input("Target language (e.g. Spanish)", window, cx),
+            language: text_input("Language, e.g. Spanish", window, cx),
             preset_name: text_input("Action name", window, cx),
             preset_prompt: text_input("Prompt template", window, cx),
             preset_edit: None,
@@ -118,10 +120,26 @@ pub struct AiSession {
     pub translation: Option<(String, String, bool)>,
     pub fields: Vec<Field>,
     pub status: String,
+    pub tone: StatusTone,
+    /// The request shown as the user's turn while the reply is on its way.
+    pub pending: Option<String>,
     pub streaming: String,
     pub usage: String,
+    pub local_title: String,
     pub local_result: String,
     pub last_copyable: Option<(AiCopySource, String)>,
+    /// How many chat messages precede each result card, so the conversation
+    /// reads in the order things happened: suggestion, translation, action.
+    pub card_at: [usize; 3],
+    pub scroll: ScrollHandle,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatusTone {
+    #[default]
+    Info,
+    Success,
+    Error,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,7 +157,7 @@ impl AiSession {
             .is_some_and(|(source, _)| *source == removed)
         {
             self.last_copyable = if !self.local_result.trim().is_empty() {
-                Some((AiCopySource::Local, self.local_result.clone()))
+                Some((AiCopySource::Local, self.local_copy_text()))
             } else if let Some(last) = self
                 .history
                 .iter()
@@ -153,6 +171,42 @@ impl AiSession {
                 None
             };
         }
+    }
+}
+
+impl AiSession {
+    /// The latest action result as it is copied: its title, then the text.
+    pub fn local_copy_text(&self) -> String {
+        if self.local_title.is_empty() {
+            self.local_result.clone()
+        } else {
+            format!("{}\n\n{}", self.local_title, self.local_result)
+        }
+    }
+
+    /// Appends one question and its answer, dropping the oldest exchange
+    /// once the conversation holds six.
+    pub fn push_exchange(&mut self, question: String, answer: String) {
+        if self.history.len() >= 12 {
+            self.history.drain(..2);
+            for at in &mut self.card_at {
+                *at = at.saturating_sub(2);
+            }
+        }
+        self.last_copyable = Some((AiCopySource::Chat, answer.clone()));
+        self.history.push(Message::new(Role::User, question));
+        self.history.push(Message::new(Role::Assistant, answer));
+    }
+
+    pub fn clear_chat(&mut self) {
+        self.history.clear();
+        self.card_at = [0; 3];
+        self.sync_copyable_after_removal(AiCopySource::Chat);
+    }
+
+    pub fn set_status(&mut self, tone: StatusTone, status: impl Into<String>) {
+        self.tone = tone;
+        self.status = status.into();
     }
 }
 
@@ -257,12 +311,14 @@ impl CalibreApp {
         let client = self.ai_client(cx);
         let provider = client.provider_name();
         self.online.connection = Some(format!("Checking {provider}…"));
+        self.online.connection_ok = None;
         self.run_job(
             format!("Testing {provider}"),
             window,
             cx,
             move |_| client.test_connection(),
             |app, result, _, _| {
+                app.online.connection_ok = Some(result.is_ok());
                 app.online.connection = Some(match result {
                     Ok(summary) => summary,
                     Err(error) => error.to_string(),
@@ -275,17 +331,19 @@ impl CalibreApp {
         let client = self.ai_client(cx);
         let provider = client.provider_name();
         self.online.connection = Some(format!("Loading models from {provider}…"));
+        self.online.connection_ok = None;
         self.run_job(
             format!("Loading {provider} models"),
             window,
             cx,
             move |_| client.models(),
             |app, result, _, _| {
+                app.online.connection_ok = Some(result.is_ok());
                 app.online.connection = Some(match result {
                     Ok(models) => {
                         app.online.models = models;
                         format!(
-                            "{} models available. Choose a model below.",
+                            "{} models available. Click one to use it.",
                             app.online.models.len()
                         )
                     }
@@ -592,7 +650,10 @@ impl CalibreApp {
                                             next_anchor_block.unwrap_or(section.blocks.len());
                                         let mut out = String::new();
                                         for block in section.blocks.iter().take(limit_blocks) {
-                                            if matches!(block.kind, BlockKind::Image(_) | BlockKind::Rule) {
+                                            if matches!(
+                                                block.kind,
+                                                BlockKind::Image(_) | BlockKind::Rule
+                                            ) {
                                                 continue;
                                             }
                                             out.push_str(&block.text);
@@ -655,18 +716,22 @@ impl CalibreApp {
             translation: None,
             fields: Vec::new(),
             status: String::new(),
+            tone: StatusTone::Info,
+            pending: None,
             streaming: String::new(),
             usage: String::new(),
+            local_title: String::new(),
             local_result: String::new(),
             last_copyable: None,
+            card_at: [0; 3],
+            scroll: ScrollHandle::new(),
         });
-        let title = format!("Ask AI · {}", client.provider_name());
         let weak = cx.entity().downgrade();
-        window.open_dialog(cx, move |dialog, _, cx| {
+        window.open_dialog(cx, move |dialog, window, cx| {
             let closing = weak.clone();
             let dialog = dialog
-                .title(title.clone())
-                .w(px(780.))
+                .title("Ask AI")
+                .w(px(760.))
                 .overlay_closable(false)
                 .on_ok(|_, _, _| false)
                 .on_close(move |_, _, cx| {
@@ -675,7 +740,8 @@ impl CalibreApp {
                         cx.notify();
                     });
                 });
-            match weak.update(cx, |app, cx| crate::ui::online::ai_dialog(app, cx)) {
+            let height = window.viewport_size().height;
+            match weak.update(cx, |app, cx| crate::ui::online::ai_dialog(app, height, cx)) {
                 Ok(body) => dialog.child(body),
                 Err(_) => dialog,
             }
@@ -814,11 +880,57 @@ impl CalibreApp {
         let Some((_, text)) = session.last_copyable.clone() else {
             return;
         };
+        self.copy_ai_text(text, window, cx);
+    }
+
+    pub fn copy_ai_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         if let Some(session) = self.online.ai.as_mut() {
-            session.status = "Copied response to clipboard.".into();
+            session.set_status(StatusTone::Success, "Copied to clipboard.");
         }
-        self.announce("Copied response to clipboard.", Tone::Info, window, cx);
+        self.expire_ai_status(window, cx);
+        self.announce("Copied to clipboard.", Tone::Info, window, cx);
+    }
+
+    /// Clears the current confirmation after a few seconds, unless something
+    /// else has replaced it by then.
+    fn expire_ai_status(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shown) = self
+            .online
+            .ai
+            .as_ref()
+            .map(|session| session.status.clone())
+        else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(4))
+                .await;
+            let _ = this.update(cx, |app, cx| {
+                if let Some(session) = app.online.ai.as_mut() {
+                    if session.status == shown && session.tone == StatusTone::Success {
+                        session.status.clear();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Sends `question` as a chat turn, as if it had been typed and sent.
+    pub fn ask_ai_question(
+        &mut self,
+        question: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.online.ai.is_none() || self.job.is_some() {
+            return;
+        }
+        set_input(&self.online.question, question.into(), window, cx);
+        self.run_book_task(BookTask::Chat, window, cx);
     }
 
     pub fn apply_ai_translation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -851,7 +963,10 @@ impl CalibreApp {
                 }
                 session.translation = None;
                 session.sync_copyable_after_removal(AiCopySource::Translation);
-                session.status = format!("Applied {language} description.");
+                session.set_status(
+                    StatusTone::Success,
+                    format!("Applied {language} description."),
+                );
             }
         }
     }
@@ -888,18 +1003,21 @@ impl CalibreApp {
             || task == BookTask::ExplainPassage && session.reader_passage.is_none()
             || task == BookTask::SummarizeChapter && session.reader_chapter_text.is_none()
         {
-            session.status = match task {
+            let hint = match task {
                 BookTask::Recap => {
                     "Enter the position in Contents of the last chapter you've read."
                 }
-                BookTask::Translate => "Enter a target language for a book with a description.",
+                BookTask::Translate if session.current.comments.is_none() => {
+                    "This book has no description to translate."
+                }
+                BookTask::Translate => "Enter a target language first.",
                 BookTask::ExplainPassage => {
                     "Click a paragraph in the reader first, then open Ask AI."
                 }
                 BookTask::SummarizeChapter => "Open a book in the reader to summarize its chapter.",
-                _ => "Enter a question first.",
-            }
-            .into();
+                _ => "Type a question first.",
+            };
+            session.set_status(StatusTone::Info, hint);
             cx.notify();
             return;
         }
@@ -919,14 +1037,33 @@ impl CalibreApp {
         let reader_chapter_text = session.reader_chapter_text.clone();
         let reader_passage = session.reader_passage.clone();
         let history = session.history.clone();
-        session.status = if task == BookTask::ReadingTime {
-            "Counting words locally…".into()
-        } else {
-            format!("Waiting for {provider_name}…")
-        };
+        session.set_status(
+            StatusTone::Info,
+            if task == BookTask::ReadingTime {
+                "Counting words locally…".to_string()
+            } else {
+                format!("Waiting for {provider_name}…")
+            },
+        );
+        session.pending = Some(match task {
+            BookTask::Chat => prompt.clone(),
+            BookTask::Suggest => "Suggest a description and tags".into(),
+            BookTask::Characters => "Who are the main characters?".into(),
+            BookTask::Discussion => "Give me discussion questions".into(),
+            BookTask::Translate => format!("Translate the description into {language}"),
+            BookTask::Recap => format!(
+                "Recap the story through chapter {}",
+                chapter.unwrap_or_default()
+            ),
+            BookTask::ReadingTime => "How long will this take to read?".into(),
+            BookTask::ExplainPassage => "Explain the selected passage".into(),
+            BookTask::SummarizeChapter => "Summarize this chapter".into(),
+        });
         session.streaming.clear();
         session.usage.clear();
+        session.local_title.clear();
         session.local_result.clear();
+        session.scroll.scroll_to_bottom();
         if task == BookTask::Suggest {
             session.suggestion = None;
             session.fields.clear();
@@ -945,6 +1082,7 @@ impl CalibreApp {
                         .filter(|session| session.id == id && app.job.is_some())
                     {
                         session.streaming.push_str(&part);
+                        session.scroll.scroll_to_bottom();
                         cx.notify();
                     }
                 });
@@ -1106,10 +1244,13 @@ impl CalibreApp {
                 let Some(session) = app.online.ai.as_mut() else {
                     return;
                 };
-                session.status.clear();
-                session.streaming.clear();
+                session.set_status(StatusTone::Info, "");
+                let partial = std::mem::take(&mut session.streaming);
+                let pending = session.pending.take();
+                session.scroll.scroll_to_bottom();
                 match result {
                     Ok(AiReply::Suggestion(suggestion)) => {
+                        session.card_at[0] = session.history.len();
                         session.suggestion = Some(suggestion);
                     }
                     Ok(AiReply::Answer(prompt, answer, usage)) => {
@@ -1118,6 +1259,7 @@ impl CalibreApp {
                             let text = answer.text.trim().to_string();
                             session.last_copyable = (!text.is_empty())
                                 .then_some((AiCopySource::Translation, text.clone()));
+                            session.card_at[1] = session.history.len();
                             session.translation = Some((
                                 translate_lang.clone(),
                                 text,
@@ -1126,28 +1268,40 @@ impl CalibreApp {
                             return;
                         }
                         if task != BookTask::Chat {
-                            let formatted = format!("{prompt}\n\n{}", answer.text);
+                            session.card_at[2] = session.history.len();
+                            session.local_title = prompt;
+                            session.local_result = answer.text;
                             session.last_copyable =
-                                Some((AiCopySource::Local, formatted.clone()));
-                            session.local_result = formatted;
+                                Some((AiCopySource::Local, session.local_copy_text()));
                             return;
                         }
-                        if session.history.len() >= 12 {
-                            session.history.drain(..2);
-                        }
-                        session.last_copyable =
-                            Some((AiCopySource::Chat, answer.text.clone()));
-                        session.history.push(Message::new(Role::User, prompt));
-                        session
-                            .history
-                            .push(Message::new(Role::Assistant, answer.text));
+                        session.push_exchange(prompt, answer.text);
                         set_input(&app.online.question, String::new(), window, cx);
                     }
                     Ok(AiReply::Local(answer)) => {
-                        session.last_copyable = Some((AiCopySource::Local, answer.clone()));
+                        session.card_at[2] = session.history.len();
+                        session.local_title = "Reading time".into();
                         session.local_result = answer;
+                        session.last_copyable =
+                            Some((AiCopySource::Local, session.local_copy_text()));
                     }
-                    Err(error) => session.status = error.to_string(),
+                    Err(Error::Cancelled) => {
+                        // A stopped chat reply keeps what had arrived.
+                        match pending {
+                            Some(question)
+                                if task == BookTask::Chat && !partial.trim().is_empty() =>
+                            {
+                                session.push_exchange(question, partial.trim().to_string());
+                                set_input(&app.online.question, String::new(), window, cx);
+                                session.set_status(
+                                    StatusTone::Info,
+                                    "Stopped. The partial reply was kept.",
+                                );
+                            }
+                            _ => session.set_status(StatusTone::Info, "Stopped."),
+                        }
+                    }
+                    Err(error) => session.set_status(StatusTone::Error, error.to_string()),
                 }
             },
         );
@@ -1183,7 +1337,7 @@ impl CalibreApp {
                 }
                 session.suggestion = None;
                 session.fields.clear();
-                session.status = "Selected fields applied.".into();
+                session.set_status(StatusTone::Success, "Selected fields applied.");
             }
         }
     }
@@ -1222,4 +1376,71 @@ enum AiReply {
     Answer(String, ChatReply, String),
     Local(String),
     Suggestion(Suggestion),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session() -> AiSession {
+        AiSession {
+            id: 1,
+            current: Metadata::default(),
+            reader_format: None,
+            reader_chapter_num: None,
+            reader_chapter_title: None,
+            reader_chapter_text: None,
+            reader_passage: None,
+            excerpt: false,
+            history: Vec::new(),
+            suggestion: None,
+            translation: None,
+            fields: Vec::new(),
+            status: String::new(),
+            tone: StatusTone::Info,
+            pending: None,
+            streaming: String::new(),
+            usage: String::new(),
+            local_title: String::new(),
+            local_result: String::new(),
+            last_copyable: None,
+            card_at: [0; 3],
+            scroll: ScrollHandle::new(),
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn dropping_the_oldest_exchange_keeps_cards_in_place() {
+        let mut session = session();
+        for turn in 0..6 {
+            session.push_exchange(format!("q{turn}"), format!("a{turn}"));
+        }
+        // A card produced after the second exchange, one before any chat.
+        session.card_at = [4, 0, 12];
+        session.push_exchange("q6".into(), "a6".into());
+        assert_eq!(session.history.len(), 12);
+        assert_eq!(session.history[0].content, "q1");
+        assert_eq!(session.card_at, [2, 0, 10]);
+        assert!(matches!(
+            &session.last_copyable,
+            Some((AiCopySource::Chat, text)) if text == "a6"
+        ));
+    }
+
+    #[core::prelude::v1::test]
+    fn clearing_the_chat_falls_back_to_the_latest_action_result() {
+        let mut session = session();
+        session.local_title = "Character guide".into();
+        session.local_result = "Ilse, the mapmaker's daughter.".into();
+        session.card_at[2] = 2;
+        session.push_exchange("Who is Ilse?".into(), "The narrator.".into());
+        session.clear_chat();
+        assert!(session.history.is_empty());
+        assert_eq!(session.card_at, [0; 3]);
+        assert!(matches!(
+            &session.last_copyable,
+            Some((AiCopySource::Local, text))
+                if text == "Character guide\n\nIlse, the mapmaker's daughter."
+        ));
+    }
 }

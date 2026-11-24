@@ -17,18 +17,36 @@ gpui_kit::assets::icon_assets!(
         AArrowUp,
         BookCopy,
         Bookmark,
+        BrushCleaning,
         Clock,
+        Cloud,
+        Compass,
         Download,
+        Eraser,
         Highlighter,
+        Languages,
+        Laptop,
         LayoutGrid,
         LibraryBig,
         List,
+        ListChecks,
+        Lock,
+        MessagesSquare,
+        ScanText,
+        Server,
         Settings,
+        ShieldCheck,
+        Sparkles,
         SquarePen,
         SunMoon,
         TabletSmartphone,
         Tag,
+        TextQuote,
+        TextSearch,
+        Timer,
         Usb,
+        Users,
+        WandSparkles,
         Wrench,
     ]
 );
@@ -94,11 +112,32 @@ mod tests {
     /// Every `Lucide::Name` in the UI sources must be in the bundle.
     #[core::prelude::v1::test]
     fn every_icon_used_by_the_ui_is_bundled() {
-        let ui = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let this_file = include_str!("assets.rs");
-        let default_bundle = ["FileText", "Moon", "Sun", "User"];
-        for entry in std::fs::read_dir(ui).expect("src/ui exists") {
-            let path = entry.expect("readable entry").path();
+        let default_bundle = [
+            "ArrowRight",
+            "ArrowUp",
+            "BookOpen",
+            "Check",
+            "CircleCheck",
+            "Copy",
+            "FileText",
+            "Info",
+            "Moon",
+            "Network",
+            "Search",
+            "Square",
+            "Sun",
+            "TriangleAlert",
+            "User",
+        ];
+        let mut sources: Vec<_> = std::fs::read_dir(src.join("ui"))
+            .expect("src/ui exists")
+            .map(|entry| entry.expect("readable entry").path())
+            .collect();
+        // Views that live beside their state rather than under ui/.
+        sources.push(src.join("studio.rs"));
+        for path in sources {
             let source = std::fs::read_to_string(&path).expect("readable source");
             for (index, _) in source.match_indices("Lucide::") {
                 let name: String = source[index + "Lucide::".len()..]
