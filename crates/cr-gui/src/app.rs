@@ -1299,8 +1299,7 @@ impl CalibreApp {
         self.tools.trash.clear();
         self.library_tools.clear_results();
         self.custom_columns.clear();
-        if self.online.metadata.is_some() || self.online.ai.is_some() {
-            self.online.clear_dialogs();
+        if self.online.clear_dialogs() {
             window.close_dialog(cx);
         }
         self.library = Some(library);

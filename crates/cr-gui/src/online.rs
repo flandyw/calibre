@@ -61,10 +61,10 @@ impl Online {
         }
     }
 
-    pub fn clear_dialogs(&mut self) {
-        self.metadata = None;
-        self.ai = None;
-        self.studio.session = None;
+    pub fn clear_dialogs(&mut self) -> bool {
+        self.metadata.take().is_some()
+            | self.ai.take().is_some()
+            | self.studio.session.take().is_some()
     }
 }
 
