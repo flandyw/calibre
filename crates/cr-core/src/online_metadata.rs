@@ -191,6 +191,9 @@ impl Catalog {
         if title.is_empty() && author.is_empty() && isbn.is_empty() {
             return Err(Error::Other("Enter a title, author, or ISBN".into()));
         }
+        if source == Source::OpenLibrary && !isbn.is_empty() {
+            return self.open_library_isbn(isbn);
+        }
         let value: Value = match source {
             Source::OpenLibrary => {
                 let mut request = self
@@ -201,15 +204,11 @@ impl Catalog {
                         "fields",
                         "key,title,author_name,publisher,first_publish_year,publish_date,subject,isbn,cover_i",
                     );
-                if !isbn.is_empty() {
-                    request = request.query("isbn", isbn);
-                } else {
-                    if !title.is_empty() {
-                        request = request.query("title", title);
-                    }
-                    if !author.is_empty() {
-                        request = request.query("author", author);
-                    }
+                if !title.is_empty() {
+                    request = request.query("title", title);
+                }
+                if !author.is_empty() {
+                    request = request.query("author", author);
                 }
                 network::json("Open Library", request.call())?
             }
@@ -246,6 +245,41 @@ impl Catalog {
             .as_array()
             .ok_or_else(|| Error::Other(format!("{source}: missing search results in response")))?;
         Ok(results.iter().filter_map(parse).take(8).collect())
+    }
+
+    fn open_library_isbn(&self, isbn: &str) -> Result<Vec<Candidate>> {
+        let isbn = isbn
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '-')
+            .collect::<String>()
+            .to_ascii_uppercase();
+        let valid = match isbn.len() {
+            10 => {
+                isbn.bytes().take(9).all(|c| c.is_ascii_digit())
+                    && isbn
+                        .bytes()
+                        .last()
+                        .is_some_and(|c| c.is_ascii_digit() || c == b'X')
+            }
+            13 => isbn.bytes().all(|c| c.is_ascii_digit()),
+            _ => false,
+        };
+        if !valid {
+            return Err(Error::Other(
+                "Open Library: enter a 10- or 13-digit ISBN".into(),
+            ));
+        }
+        let response = self
+            .agent
+            .get(format!("{}/isbn/{isbn}.json", self.open_library))
+            .call();
+        if matches!(response, Err(ureq::Error::StatusCode(404))) {
+            return Ok(Vec::new());
+        }
+        let value: Value = network::json("Open Library", response)?;
+        let edition = open_library_edition(&value, isbn)
+            .ok_or_else(|| Error::Other("Open Library: missing edition in ISBN response".into()))?;
+        Ok(vec![edition])
     }
 
     pub fn enrich(&self, candidate: &mut Candidate) -> Result<()> {
@@ -357,6 +391,38 @@ fn open_library_candidate(value: &Value) -> Option<Candidate> {
         tags: strings(&value["subject"], 12),
         isbn: strings(&value["isbn"], 1).pop(),
         cover: value["cover_i"].as_u64().map(CoverId::OpenLibrary),
+    })
+}
+
+fn open_library_edition(value: &Value, isbn: String) -> Option<Candidate> {
+    let id = value["key"].as_str()?.strip_prefix("/books/")?;
+    if !open_library_id(id, 'M') {
+        return None;
+    }
+    let description = &value["description"];
+    Some(Candidate {
+        source: Source::OpenLibrary,
+        id: id.into(),
+        title: string(&value["title"])?,
+        authors: value["authors"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|author| string(&author["name"]))
+            .take(20)
+            .collect(),
+        publisher: strings(&value["publishers"], 1).pop(),
+        published: string(&value["publish_date"]),
+        description: string(description).or_else(|| string(&description["value"])),
+        tags: strings(&value["subjects"], 12),
+        isbn: Some(isbn),
+        cover: value["covers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_u64)
+            .find(|id| *id != 0)
+            .map(CoverId::OpenLibrary),
     })
 }
 
@@ -518,6 +584,39 @@ mod tests {
             candidates[0].description.as_deref(),
             Some("Edition description")
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn open_library_isbn_uses_edition_metadata_and_the_requested_isbn() {
+        let (open_library, server) = serve(
+            "200 OK",
+            r#"{"key":"/books/OL12M","title":"Edition title","isbn_10":["0140328726"],"isbn_13":["9780140328721"],"publishers":["Edition publisher"],"publish_date":"1988-10-01","covers":[-1,42],"works":[{"key":"/works/OL321W"}]}"#,
+            |headers, _| assert!(headers.starts_with("GET /isbn/9780140328721.json HTTP/1.1")),
+        );
+        let catalog = Catalog {
+            open_library,
+            ..Default::default()
+        };
+        let candidates = catalog
+            .search(
+                Source::OpenLibrary,
+                &Query {
+                    isbn: "978-0-14-032872-1".into(),
+                    title: "Work title".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let [candidate] = candidates.as_slice() else {
+            panic!("expected exactly one edition")
+        };
+        assert_eq!(candidate.id, "OL12M");
+        assert_eq!(candidate.title, "Edition title");
+        assert_eq!(candidate.isbn.as_deref(), Some("9780140328721"));
+        assert_eq!(candidate.publisher.as_deref(), Some("Edition publisher"));
+        assert_eq!(candidate.published.as_deref(), Some("1988-10-01"));
+        assert!(matches!(candidate.cover, Some(CoverId::OpenLibrary(42))));
         server.join().unwrap();
     }
 
