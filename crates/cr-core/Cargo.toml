@@ -22,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+ureq = "3"
 uuid.workspace = true
 walkdir.workspace = true
 zip.workspace = true

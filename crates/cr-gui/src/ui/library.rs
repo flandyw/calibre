@@ -611,6 +611,12 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .menu(reveal_label(), Box::new(RevealInFileManager))
         .separator()
         .menu("Edit Metadata…", Box::new(EditMetadata))
+        .menu_with_disabled("Ask AI…", app.job.is_some(), Box::new(AskAi))
+        .menu_with_disabled(
+            "Download Metadata…",
+            app.job.is_some(),
+            Box::new(DownloadMetadata),
+        )
         .menu_with_disabled(
             "Attach Formats…",
             !app.can_write() || app.job.is_some(),

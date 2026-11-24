@@ -209,6 +209,7 @@ pub struct CalibreApp {
     saved_settings: Settings,
     pub library_tools: LibraryTools,
     pub custom_columns: CustomColumns,
+    pub online: crate::online::Online,
     preferences_return: Screen,
     pending_opens: VecDeque<(Vec<PathBuf>, bool)>,
     pub job: Option<RunningJob>,
@@ -348,8 +349,19 @@ impl CalibreApp {
 
         let tools = crate::tools::Tools::new(window, cx);
         let library_tools = LibraryTools::new(window, cx);
+        let online = crate::online::Online::new(window, cx);
 
         let subscriptions = vec![
+            cx.subscribe_in(&online.model, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&online.question, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) && this.job.is_none() {
+                    this.run_ai(false, window, cx);
+                }
+            }),
             cx.subscribe_in(
                 &library_tools.text_query,
                 window,
@@ -426,6 +438,7 @@ impl CalibreApp {
             settings,
             library_tools,
             custom_columns: CustomColumns::new(window, cx),
+            online,
             preferences_return: Screen::Library,
             pending_opens: VecDeque::new(),
             job: None,
@@ -753,6 +766,12 @@ impl CalibreApp {
         }
         self.preferences_return = self.screen;
         self.screen = Screen::Preferences;
+        set_input(
+            &self.online.model,
+            self.settings.openrouter_model.clone(),
+            window,
+            cx,
+        );
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -788,6 +807,13 @@ impl CalibreApp {
                         ..Settings::default()
                     };
                     this.chapter_list_visible = this.settings.reader_contents;
+                    set_input(
+                        &this.online.model,
+                        this.settings.openrouter_model.clone(),
+                        window,
+                        cx,
+                    );
+                    set_input(&this.online.key, String::new(), window, cx);
                     this.apply_theme(window, cx);
                     this.reload();
                     this.save_settings(true);
@@ -1273,6 +1299,10 @@ impl CalibreApp {
         self.tools.trash.clear();
         self.library_tools.clear_results();
         self.custom_columns.clear();
+        if self.online.metadata.is_some() || self.online.ai.is_some() {
+            self.online.clear_dialogs();
+            window.close_dialog(cx);
+        }
         self.library = Some(library);
         self.screen = Screen::Library;
         self.shelf = Shelf::All;
@@ -3605,6 +3635,10 @@ impl CalibreApp {
             }))
             .on_action(cx.listener(|this, _: &ClosePreferences, window, cx| {
                 this.close_preferences(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AskAi, window, cx| this.open_ai(window, cx)))
+            .on_action(cx.listener(|this, _: &DownloadMetadata, window, cx| {
+                this.open_online_metadata(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| {
                 this.show_shortcuts = !this.show_shortcuts;

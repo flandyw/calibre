@@ -178,6 +178,7 @@ pub struct Settings {
     pub reader_contents: bool,
     pub reader_resume: bool,
     pub publisher_styles: bool,
+    pub openrouter_model: String,
 }
 
 impl Default for Settings {
@@ -208,6 +209,7 @@ impl Default for Settings {
             reader_contents: true,
             reader_resume: true,
             publisher_styles: true,
+            openrouter_model: cr_core::ai::DEFAULT_MODEL.into(),
         }
     }
 }

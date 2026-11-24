@@ -55,6 +55,8 @@ actions!(
         ReadBook,
         AttachFormats,
         EditMetadata,
+        AskAi,
+        DownloadMetadata,
         ChangeCover,
         CropCover,
         EditEpub,
@@ -374,6 +376,8 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
     menus.push(Menu::new("Book").items([
         MenuItem::action("Read", ReadBook),
         MenuItem::action("Edit Metadata…", EditMetadata),
+        MenuItem::action("Ask AI…", AskAi),
+        MenuItem::action("Download Metadata…", DownloadMetadata),
         MenuItem::action("Attach Formats…", AttachFormats),
         MenuItem::separator(),
         MenuItem::action("Change Cover…", ChangeCover),

@@ -5,6 +5,7 @@ mod book_formats;
 mod custom_columns;
 mod files;
 mod library_tools;
+mod online;
 mod settings;
 mod tools;
 mod ui;

@@ -255,6 +255,7 @@ pub fn preferences_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEl
                             cx,
                         )),
                 )
+                .child(section("AI · OpenRouter", cx).child(super::online::preferences(app, cx)))
                 .child(
                     section("Settings storage", cx)
                         .child(div().text_sm().text_color(muted).child(config_path))

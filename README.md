@@ -97,6 +97,39 @@ Read/write calibre's `metadata.opf` (v2.0). Editable fields:
 Editing metadata renames the author/title directory and format files, then
 rewrites `metadata.opf`, exactly as calibre expects.
 
+### Online metadata and OpenRouter
+
+The desktop **Download Metadata…** action searches Open Library or Google
+Books by title, author, or ISBN, without an API key. Choose a result to compare
+its metadata and cover against the current book. Check only the fields you
+want to keep. For a multi-selection, the dialog reviews each book in turn;
+skip any book or end the review at any point.
+
+Set an OpenRouter API key in desktop **Preferences → AI · OpenRouter** for
+the current app session, or provide `OPENROUTER_API_KEY` in the environment.
+Preferences can verify the key, browse the live model catalog, and save the
+model ID. The **Ask AI…** action chats about the selected book and can suggest
+a description and tags for selective application. Book text is not sent
+unless you opt in to sharing an opening excerpt. Requests send metadata,
+prompts, and recent chat context to OpenRouter and the chosen model provider;
+check its data policy and pricing before use. AI suggestions can be inaccurate.
+
+```sh
+cr fetch-metadata --title 'Frankenstein' --author 'Mary Shelley'
+cr fetch-metadata 42 --result OL450063W                       # preview
+cr fetch-metadata 42 --result OL450063W --apply description,cover
+cr fetch-metadata --source google-books --isbn 9780141439471
+cr ai models
+cr ai test
+cr ai ask 42 'What themes does this book explore?'
+cr ai suggest 42 --model openrouter/auto --excerpt           # preview
+```
+
+The CLI uses `OPENROUTER_API_KEY` and accepts `OPENROUTER_MODEL` or
+`--model`. `cr ai suggest` writes nothing unless passed
+`--apply description,tags`. Choose a model with JSON output support for
+metadata suggestions.
+
 ### Reading
 
 `cr read` converts a book to terminal text:
