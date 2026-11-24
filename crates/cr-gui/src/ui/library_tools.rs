@@ -166,6 +166,7 @@ pub fn full_text_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElem
             }
             pane.children(results.iter().enumerate().map(|(index, hit)| {
                 let (id, chapter) = (hit.book, hit.chapter);
+                let selected_hit = hit.clone();
                 let title = if hit.chapter_title.is_empty() {
                     format!("Chapter {chapter}")
                 } else {
@@ -182,8 +183,8 @@ pub fn full_text_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElem
                     .child(
                         h_flex().gap_2().pt_1()
                             .child(Button::new(("read-chapter", index)).outline().small()
-                                .label("Read Chapter").disabled(busy)
-                                .on_click(cx.listener(move |app, _, window, cx| app.read_text_hit(id, chapter, window, cx))))
+                                .label("Read Book").disabled(busy)
+                                .on_click(cx.listener(move |app, _, window, cx| app.read_library_book(id, None, Some(&selected_hit), window, cx))))
                             .child(Button::new(("show-hit", index)).ghost().small()
                                 .label("Show Book in Library")
                                 .on_click(cx.listener(move |app, _, window, cx| app.show_text_hit_in_library(id, window, cx)))),

@@ -237,6 +237,7 @@ pub struct CalibreApp {
     pub book: Option<Rc<Book>>,
     pub reader_book_id: Option<i64>,
     pub reader_return: Screen,
+    reader_file: Option<PathBuf>,
     pub section_index: usize,
     /// Decoded once per book; `None` for images that cannot be shown.
     pub reader_images: Vec<Option<std::sync::Arc<Image>>>,
@@ -292,6 +293,7 @@ pub struct CalibreApp {
     /// Width of the cover grid from the last layout, for keyboard navigation.
     pub grid_width: Rc<Cell<f32>>,
     last_window_title: String,
+    last_window_document: Option<PathBuf>,
 
     pub search: Entity<InputState>,
     pub title_input: Entity<InputState>,
@@ -445,6 +447,7 @@ impl CalibreApp {
             book: None,
             reader_book_id: None,
             reader_return: Screen::Library,
+            reader_file: None,
             section_index: 0,
             reader_images: Vec::new(),
             reader_fonts: HashMap::new(),
@@ -484,6 +487,7 @@ impl CalibreApp {
             reader_scroll: ScrollHandle::new(),
             grid_width: Rc::new(Cell::new(0.0)),
             last_window_title: String::new(),
+            last_window_document: None,
             search,
             title_input,
             authors_input,
@@ -821,8 +825,19 @@ impl CalibreApp {
         };
         if title != self.last_window_title {
             window.set_window_title(&title);
-            window.set_document_path(self.library.as_ref().map(|library| library.root()));
             self.last_window_title = title;
+        }
+        let reading = self.screen == Screen::Reader
+            || self.screen == Screen::Preferences && self.preferences_return == Screen::Reader;
+        let document = if reading {
+            self.reader_file.as_deref()
+        } else {
+            None
+        }
+        .or_else(|| self.library.as_ref().map(Library::root));
+        if document != self.last_window_document.as_deref() {
+            window.set_document_path(document);
+            self.last_window_document = document.map(Path::to_path_buf);
         }
         window.set_window_edited(self.has_unsaved_changes());
     }
@@ -2299,7 +2314,7 @@ impl CalibreApp {
         &mut self,
         id: i64,
         format: Option<&str>,
-        location: Option<Locator>,
+        text_hit: Option<&cr_core::library::FtsHit>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2310,7 +2325,23 @@ impl CalibreApp {
             self.set_status("Open a library first.", Tone::Info);
             return;
         };
-        let book = match library.open_book(id, format) {
+        let preferred = library.preferred_viewing_format(id);
+        let chosen = match format {
+            Some(format) => format,
+            None => match &preferred {
+                Ok(format) => format.as_str(),
+                Err(err) => {
+                    self.announce(
+                        format!("Cannot read this book: {err}"),
+                        Tone::Error,
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            },
+        };
+        let book = match library.open_book(id, Some(chosen)) {
             Ok(book)
                 if book
                     .sections
@@ -2333,15 +2364,15 @@ impl CalibreApp {
                 return;
             }
         };
+        self.reader_file = library.format_path(id, chosen).ok().flatten();
+        let location = text_hit.and_then(|hit| crate::library_tools::locate_text_hit(&book, hit));
         // Reading state uses locators in the preferred format's layout.
-        if let Some(format) = format {
-            if !library
-                .preferred_viewing_format(id)
-                .is_ok_and(|preferred| preferred == format)
-            {
-                self.show_book(book, None, location, window, cx);
-                return;
-            }
+        if !preferred
+            .as_ref()
+            .is_ok_and(|preferred| preferred == chosen)
+        {
+            self.show_book(book, None, location, window, cx);
+            return;
         }
         // Annotations follow their text if the file changed since.
         let mut problem = None;
@@ -2354,7 +2385,7 @@ impl CalibreApp {
             problem = Some(format!("Could not load your notes: {err}"));
             Vec::new()
         });
-        let position = if self.settings.reader_resume && location.is_none() {
+        let position = if self.settings.reader_resume && text_hit.is_none() {
             library.reading_position(id, &book).unwrap_or_else(|err| {
                 problem = Some(format!("Could not load your place: {err}"));
                 None
@@ -2368,6 +2399,11 @@ impl CalibreApp {
         self.show_book(book, Some(id), target, window, cx);
         if let Some(problem) = problem {
             self.set_status(problem, Tone::Error);
+        } else if text_hit.is_some() && location.is_none() {
+            self.set_status(
+                "The matching passage could not be located in this edition.",
+                Tone::Info,
+            );
         } else if let Some(position) = position {
             self.set_status(
                 format!("Resumed at {:.0}%.", position.fraction * 100.0),
@@ -2429,6 +2465,8 @@ impl CalibreApp {
                     }
                     this.save_reading_position();
                     this.clear_reader();
+                    let path = path.canonicalize().unwrap_or(path);
+                    this.reader_file = Some(path.clone());
                     this.show_book(book, None, None, window, cx);
                     cx.add_recent_document(&path);
                 }
@@ -2581,6 +2619,7 @@ impl CalibreApp {
     fn clear_reader(&mut self) {
         self.book = None;
         self.reader_book_id = None;
+        self.reader_file = None;
         self.reader_images.clear();
         self.reader_fonts.clear();
         self.reader_annotations.clear();

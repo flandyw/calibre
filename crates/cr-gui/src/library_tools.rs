@@ -3,7 +3,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use cr_core::formats::reading::Locator;
+use cr_core::formats::reading::{Book, Locator};
 use cr_core::library::{AddOutcome, CatalogFormat, FtsHit, FtsReport, Library};
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
@@ -222,29 +222,6 @@ impl CalibreApp {
                 }
                 Err(err) => app.announce(format!("Search failed: {err}"), Tone::Error, window, cx),
             },
-        );
-    }
-
-    pub fn read_text_hit(
-        &mut self,
-        id: i64,
-        chapter: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let format = self
-            .library
-            .as_ref()
-            .and_then(|library| library.preferred_readable_format(id).ok());
-        self.read_library_book(
-            id,
-            format.as_deref(),
-            Some(Locator {
-                section: chapter.saturating_sub(1),
-                ..Default::default()
-            }),
-            window,
-            cx,
         );
     }
 
@@ -467,6 +444,74 @@ impl CalibreApp {
     }
 }
 
+/// The text index can omit image-only pages or split text differently from the
+/// reader. Prefer a matching passage, then a uniquely named reading section.
+pub fn locate_text_hit(book: &Book, hit: &FtsHit) -> Option<Locator> {
+    let excerpt = hit.snippet.replace(['[', ']'], "");
+    let passage = excerpt
+        .split('…')
+        .max_by_key(|part| part.len())
+        .unwrap_or_default();
+    let normalize = |text: &str| {
+        text.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase()
+    };
+    let needle = normalize(passage);
+    if !needle.is_empty() {
+        let mut matches = book.sections.iter().enumerate().filter(|(_, section)| {
+            let text = section
+                .blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            normalize(&text).contains(&needle)
+        });
+        if let Some((section, contents)) = matches.next() {
+            if matches.next().is_none() {
+                let block = contents
+                    .blocks
+                    .iter()
+                    .position(|block| normalize(&block.text).contains(&needle))
+                    .unwrap_or(0);
+                return Some(Locator {
+                    section,
+                    block,
+                    offset: 0,
+                });
+            }
+        }
+    }
+    // An extraction chapter can span multiple reader sections, so the
+    // surrounding words may cross a section boundary.
+    if let Some((_, rest)) = hit.snippet.split_once('[') {
+        if let Some((term, _)) = rest.split_once(']') {
+            let mut matches = book.search(term, 2).into_iter();
+            if let Some(first) = matches.next() {
+                if matches.next().is_none() {
+                    return Some(first.start);
+                }
+            }
+        }
+    }
+    let title = normalize(&hit.chapter_title);
+    if title.is_empty() {
+        return None;
+    }
+    let mut matches = book
+        .sections
+        .iter()
+        .enumerate()
+        .filter(|(_, section)| normalize(&section.title) == title);
+    let (section, _) = matches.next()?;
+    matches.next().is_none().then_some(Locator {
+        section,
+        ..Default::default()
+    })
+}
+
 fn write_catalog(
     library: &Library,
     query: &str,
@@ -488,4 +533,50 @@ fn write_catalog(
     file.as_file().sync_all()?;
     file.persist(output).map_err(|error| error.error)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use cr_core::formats::document::{Document, Section};
+
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn text_hit_follows_the_passage_when_the_reader_has_extra_sections() {
+        let book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Cover".into(),
+                    html: String::new(),
+                },
+                Section {
+                    title: "Chapter 2".into(),
+                    html: "<p>The train came at dawn.</p>".into(),
+                },
+                Section {
+                    title: "Chapter 3".into(),
+                    html: "<p>A lighthouse stood in the bay.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let hit = FtsHit {
+            book: 1,
+            title: "A story".into(),
+            chapter: 2,
+            chapter_title: "Chapter 2".into(),
+            snippet: "A [lighthouse] stood in the bay.".into(),
+        };
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 2);
+        let spanning_sections = FtsHit {
+            chapter: 1,
+            chapter_title: "Chapter 2".into(),
+            snippet: "The train came at dawn. A [lighthouse] stood in the bay.".into(),
+            ..hit
+        };
+        assert_eq!(
+            locate_text_hit(&book, &spanning_sections).unwrap().section,
+            2
+        );
+    }
 }
