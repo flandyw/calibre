@@ -199,7 +199,7 @@ impl Catalog {
                     .query("limit", "8")
                     .query(
                         "fields",
-                        "key,title,author_name,publisher,first_publish_year,subject,isbn,cover_i",
+                        "key,title,author_name,publisher,first_publish_year,publish_date,subject,isbn,cover_i",
                     );
                 if !isbn.is_empty() {
                     request = request.query("isbn", isbn);
@@ -252,13 +252,20 @@ impl Catalog {
         if candidate.source != Source::OpenLibrary || candidate.description.is_some() {
             return Ok(());
         }
-        if !open_library_work_id(&candidate.id) {
+        let path = if open_library_id(&candidate.id, 'W') {
+            "works"
+        } else if open_library_id(&candidate.id, 'M') {
+            "books"
+        } else {
             return Ok(());
-        }
+        };
         let work: Value = network::json(
             "Open Library",
             self.agent
-                .get(format!("{}/works/{}.json", self.open_library, candidate.id))
+                .get(format!(
+                    "{}/{path}/{}.json",
+                    self.open_library, candidate.id
+                ))
                 .call(),
         )?;
         let description = &work["description"];
@@ -315,15 +322,19 @@ impl Catalog {
     }
 }
 
-fn open_library_work_id(id: &str) -> bool {
+fn open_library_id(id: &str, kind: char) -> bool {
     id.strip_prefix("OL")
-        .and_then(|id| id.strip_suffix('W'))
+        .and_then(|id| id.strip_suffix(kind))
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
 }
 
 fn open_library_candidate(value: &Value) -> Option<Candidate> {
-    let id = value["key"].as_str()?.strip_prefix("/works/")?;
-    if !open_library_work_id(id) {
+    let key = value["key"].as_str()?;
+    let id = key
+        .strip_prefix("/works/")
+        .or_else(|| key.strip_prefix("/books/"))
+        .unwrap_or(key);
+    if !open_library_id(id, 'W') && !open_library_id(id, 'M') {
         return None;
     }
     Some(Candidate {
@@ -332,9 +343,16 @@ fn open_library_candidate(value: &Value) -> Option<Candidate> {
         title: string(&value["title"])?,
         authors: strings(&value["author_name"], 20),
         publisher: strings(&value["publisher"], 1).pop(),
-        published: value["first_publish_year"]
-            .as_u64()
-            .map(|year| year.to_string()),
+        published: value["publish_date"]
+            .as_array()
+            .and_then(|dates| dates.first())
+            .and_then(string)
+            .or_else(|| string(&value["publish_date"]))
+            .or_else(|| {
+                value["first_publish_year"]
+                    .as_u64()
+                    .map(|year| year.to_string())
+            }),
         description: None,
         tags: strings(&value["subject"], 12),
         isbn: strings(&value["isbn"], 1).pop(),
@@ -458,6 +476,49 @@ mod tests {
             patch.pubdate.flatten().unwrap().date_naive().to_string(),
             "1999-01-01"
         );
+    }
+
+    #[test]
+    fn open_library_search_keeps_edition_keys_and_enriches_them() {
+        let (open_library, server) = serve(
+            "200 OK",
+            r#"{"docs":[{"key":"/books/OL12M","title":"First","publish_date":["2002"]},{"key":"OL34M","title":"Second"},{"key":"/books/../x","title":"Invalid"}]}"#,
+            |headers, _| assert!(headers.starts_with("GET /search.json?")),
+        );
+        let mut catalog = Catalog {
+            open_library,
+            ..Default::default()
+        };
+        let mut candidates = catalog
+            .search(
+                Source::OpenLibrary,
+                &Query {
+                    title: "Book".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<Vec<_>>(),
+            ["OL12M", "OL34M"]
+        );
+        assert_eq!(candidates[0].published.as_deref(), Some("2002"));
+        let (base, server) = serve(
+            "200 OK",
+            r#"{"description":"Edition description"}"#,
+            |headers, _| assert!(headers.starts_with("GET /books/OL12M.json HTTP/1.1")),
+        );
+        catalog.open_library = base;
+        catalog.enrich(&mut candidates[0]).unwrap();
+        assert_eq!(
+            candidates[0].description.as_deref(),
+            Some("Edition description")
+        );
+        server.join().unwrap();
     }
 
     #[test]
