@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use cr_core::ai::{
-    reading_minutes, recap_messages, BookAction, BookContext, CatalogContext, CleanupField,
+    reading_minutes, recap_reader_messages, BookAction, BookContext, CatalogContext, CleanupField,
     LibraryAnswer, Message, OpenRouter, Role, CLEANUP_LIMIT,
 };
 use cr_core::{Library, ListOptions};
@@ -179,7 +179,7 @@ pub struct BookArgs {
 
 #[derive(Debug, Subcommand)]
 enum BookCommand {
-    /// Recap excerpts through the chosen chapter without sending later chapters
+    /// Recap through the chosen entry number in the reader's contents
     Recap {
         id: i64,
         #[arg(long)]
@@ -222,9 +222,9 @@ pub fn book(args: BookArgs, client: &OpenRouter, path: &Path, machine: bool) -> 
             }
             return Ok(());
         }
-        BookCommand::Recap { id, through } => recap_messages(
+        BookCommand::Recap { id, through } => recap_reader_messages(
             &library.get_metadata(id)?,
-            &library.read_book(id, None)?,
+            &library.open_book(id, None)?,
             through,
         )?,
         BookCommand::Characters { id, excerpt } => {

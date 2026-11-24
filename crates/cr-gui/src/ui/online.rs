@@ -462,7 +462,7 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             .child(Input::new(&app.online.language).w(px(140.)).disabled(busy))
             .child(Button::new("ai-translate").outline().small().label("Translate Description").disabled(busy)
                 .on_click(cx.listener(|app, _, window, cx| app.run_book_task(BookTask::Translate, window, cx)))))
-        .child(div().text_xs().text_color(muted).child("Recap shares bounded excerpts through the selected chapter only. Reading Time stays on this device."))
+        .child(div().text_xs().text_color(muted).child("Recap uses the entry number in the reader’s Contents and shares excerpts only through that entry. Reading Time stays on this device."))
         .when(!session.status.is_empty(), |this| this.child(
             div().text_sm().text_color(muted).child(session.status.clone()),
         ))

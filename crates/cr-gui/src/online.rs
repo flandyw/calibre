@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cr_core::ai::{
-    reading_minutes, recap_messages, BookAction, BookContext, ChatReply, Message, Model,
+    reading_minutes, recap_reader_messages, BookAction, BookContext, ChatReply, Message, Model,
     OpenRouter, Role, Suggestion,
 };
 use cr_core::online_metadata::{Candidate, Catalog, Field, Query, Source};
@@ -50,7 +50,7 @@ impl Online {
             author: text_input("Author", window, cx),
             isbn: text_input("ISBN (optional)", window, cx),
             question: text_input("Ask a question about this book", window, cx),
-            chapter: text_input("Chapter #", window, cx),
+            chapter: text_input("Contents #", window, cx),
             language: text_input("Target language", window, cx),
             preset_name: text_input("Action name", window, cx),
             preset_prompt: text_input("Prompt template", window, cx),
@@ -603,7 +603,9 @@ impl CalibreApp {
                 && (language.is_empty() || session.current.comments.is_none())
         {
             session.status = match task {
-                BookTask::Recap => "Enter the number of the last chapter you've read.",
+                BookTask::Recap => {
+                    "Enter the position in Contents of the last chapter you've read."
+                }
                 BookTask::Translate => "Enter a target language for a book with a description.",
                 _ => "Enter a question first.",
             }
@@ -658,7 +660,7 @@ impl CalibreApp {
             window,
             cx,
             move |job| {
-                let needs_book = excerpt || matches!(task, BookTask::Recap | BookTask::ReadingTime);
+                let needs_book = excerpt || task == BookTask::ReadingTime;
                 let text = needs_book
                     .then(|| Library::open(&root)?.read_book(id, None))
                     .transpose()?;
@@ -675,12 +677,10 @@ impl CalibreApp {
                     BookTask::Recap => {
                         let chapter = chapter
                             .ok_or_else(|| Error::Other("Enter a chapter number.".into()))?;
-                        let text = text
-                            .as_ref()
-                            .ok_or_else(|| Error::Other("No readable book text.".into()))?;
+                        let book = Library::open(&root)?.open_book(id, None)?;
                         (
                             format!("Recap through chapter {chapter}"),
-                            recap_messages(&metadata, text, chapter)?,
+                            recap_reader_messages(&metadata, &book, chapter)?,
                         )
                     }
                     _ => {

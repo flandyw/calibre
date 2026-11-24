@@ -6,6 +6,7 @@ use serde_json::json;
 
 use super::{Message, OpenRouter, Role, EXCERPT_LIMIT};
 use crate::formats::html::html_to_text;
+use crate::formats::reading::Book;
 use crate::{text, BookSummary, BookText, BookUpdate, Error, Library, Metadata, Result};
 
 pub const CLEANUP_LIMIT: usize = 12;
@@ -115,6 +116,65 @@ pub enum BookAction<'a> {
     Characters,
     Discussion,
     Translate(&'a str),
+}
+
+pub fn recap_reader_messages(
+    metadata: &Metadata,
+    book: &Book,
+    chapter: usize,
+) -> Result<Vec<Message>> {
+    if chapter == 0 || chapter > book.toc.len() {
+        return Err(Error::Other(format!(
+            "Choose a contents entry from 1 to {}",
+            book.toc.len()
+        )));
+    }
+    if book
+        .toc
+        .windows(2)
+        .any(|pair| pair[0].target > pair[1].target)
+    {
+        return Err(Error::Other(
+            "The book's contents are not in reading order; a spoiler-limited recap is unavailable."
+                .into(),
+        ));
+    }
+    let chapters = book.toc[..chapter]
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let start = entry.target;
+            let end = book.toc.get(index + 1).map(|next| next.target);
+            let mut text = String::new();
+            let last_section =
+                end.map_or(book.sections.len(), |last| last.section.saturating_add(1));
+            for (section, content) in book
+                .sections
+                .iter()
+                .enumerate()
+                .take(last_section)
+                .skip(start.section)
+            {
+                let first_block = if section == start.section {
+                    start.block
+                } else {
+                    0
+                };
+                let last_block = end
+                    .filter(|last| last.section == section)
+                    .map_or(content.blocks.len(), |last| last.block);
+                for block in content.blocks.iter().take(last_block).skip(first_block) {
+                    text.push_str(&block.text);
+                    text.push('\n');
+                }
+            }
+            crate::Chapter {
+                title: entry.title.clone(),
+                text,
+            }
+        })
+        .collect();
+    recap_messages(metadata, &BookText { chapters }, chapter)
 }
 
 impl BookAction<'_> {
@@ -775,6 +835,28 @@ mod tests {
         assert_eq!(matches.iter().map(|book| book.id).collect::<Vec<_>>(), [2]);
         assert_eq!(draft.note, "No page data");
         mock.join().unwrap();
+    }
+
+    #[test]
+    fn reader_recap_stops_at_the_next_anchor_in_the_same_section() {
+        use crate::formats::document::{Document, Section, TocItem};
+
+        let metadata = Metadata::new("Book");
+        let reader = Book::from_document(Document {
+            metadata: metadata.clone(),
+            sections: vec![Section {
+                title: "Single XHTML file".into(),
+                html: r#"<h1 id="one">Opening</h1><p>Our hero meets a cat</p><h1 id="two">Twist</h1><p>The cat is really the villain</p>"#.into(),
+            }],
+            toc: vec![TocItem { title: "Opening".into(), level: 1, anchor: "one".into() },
+                TocItem { title: "Twist".into(), level: 1, anchor: "two".into() }],
+            ..Document::default()
+        });
+        assert_eq!(reader.toc[0].target.section, reader.toc[1].target.section);
+        let messages = recap_reader_messages(&metadata, &reader, 1).unwrap();
+        assert!(messages[1].content.contains("Our hero meets a cat"));
+        assert!(!messages[1].content.contains("villain"));
+        assert!(!messages[1].content.contains("Twist"));
     }
 
     #[test]
