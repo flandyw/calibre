@@ -1,6 +1,6 @@
 //! Persistent user preferences, stored as JSON in the platform config folder.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use cr_core::library::{BookSort, Collision, DuplicatePolicy, ExportOptions};
@@ -220,20 +220,19 @@ impl Settings {
         match Self::read_from(&path) {
             Ok(settings) => settings,
             Err(err) => {
-                eprintln!("calibre-rust: {err}");
+                eprintln!("calibre-rust: Could not load {}: {err}", path.display());
                 Self::default()
             }
         }
     }
 
-    fn read_from(path: &Path) -> Result<Self, String> {
+    fn read_from(path: &Path) -> io::Result<Self> {
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => return Err(format!("Could not read {}: {err}", path.display())),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err),
         };
-        let mut settings: Self = serde_json::from_reader(std::io::BufReader::new(file))
-            .map_err(|err| format!("Could not decode {}: {err}", path.display()))?;
+        let mut settings: Self = serde_json::from_reader(io::BufReader::new(file))?;
         settings.reader_font_size = settings
             .reader_font_size
             .clamp(MIN_READER_FONT_SIZE, MAX_READER_FONT_SIZE);
@@ -278,7 +277,14 @@ impl Settings {
                 .open(parent.join("settings.lock"))?;
             lock.lock()?;
             let latest = match Self::read_from(path) {
-                Err(_) if reset_preferences => Self::default(),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    Self::default()
+                }
                 settings => settings?,
             };
             let mut merged = serde_json::to_value(latest)?;
@@ -437,5 +443,25 @@ mod tests {
         assert_eq!(reset.theme, ThemePreference::System);
         assert!(reset.reveal_export);
         assert_eq!(reset.window, window);
+    }
+
+    #[core::prelude::v1::test]
+    fn preference_changes_recover_an_invalid_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let defaults = Settings::default();
+        let updated = Settings {
+            theme: ThemePreference::Dark,
+            ..defaults.clone()
+        };
+        for broken in [r#"{"theme":"sepia"}"#, r#"{"theme":"#] {
+            std::fs::write(&path, broken).unwrap();
+            assert!(Settings::read_from(&path).is_err());
+            updated.write_changes(&path, &defaults, false).unwrap();
+            assert_eq!(
+                Settings::read_from(&path).unwrap().theme,
+                ThemePreference::Dark
+            );
+        }
     }
 }
