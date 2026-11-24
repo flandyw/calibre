@@ -362,14 +362,22 @@ impl CalibreApp {
         let Some(preview) = &session.preview else {
             return;
         };
-        let (id, update) = (
-            session.id,
-            preview.candidate.update(
-                &session.current,
-                &preview.fields,
-                preview.cover_bytes.clone(),
-            ),
-        );
+        let id = session.id;
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        let update = match preview.candidate.update_for_book(
+            library,
+            id,
+            &preview.fields,
+            preview.cover_bytes.clone(),
+        ) {
+            Ok(update) => update,
+            Err(error) => {
+                self.announce(error.to_string(), Tone::Error, window, cx);
+                return;
+            }
+        };
         if self.apply_online_update(id, update, window, cx) {
             self.advance_online_metadata(window, cx);
         }

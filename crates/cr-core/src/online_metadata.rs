@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::metadata::parse_user_date;
 use crate::network;
-use crate::{BookUpdate, Error, Metadata, Result};
+use crate::{BookUpdate, Error, Library, Metadata, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -160,6 +160,16 @@ impl Candidate {
             cover: cover.filter(|_| has(Field::Cover)).map(Some),
             ..BookUpdate::default()
         }
+    }
+
+    pub fn update_for_book(
+        &self,
+        library: &Library,
+        id: i64,
+        fields: &[Field],
+        cover: Option<Vec<u8>>,
+    ) -> Result<BookUpdate> {
+        Ok(self.update(&library.get_metadata(id)?, fields, cover))
     }
 }
 
@@ -483,6 +493,40 @@ fn parse_online_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 mod tests {
     use super::*;
     use crate::network::test::serve;
+
+    #[test]
+    fn applying_an_isbn_uses_identifiers_changed_since_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = Library::create(dir.path()).unwrap();
+        let mut metadata = Metadata::new("Book");
+        metadata.identifiers.insert("asin".into(), "old".into());
+        let id = library.add_empty(metadata).unwrap().id;
+        let candidate = open_library_candidate(&json!({
+            "key":"/works/OL123W","title":"Book","isbn":["9780140328721"]
+        }))
+        .unwrap();
+        let snapshot = library.get_metadata(id).unwrap();
+        let mut latest = snapshot.identifiers;
+        latest.insert("asin".into(), "new".into());
+        latest.insert("doi".into(), "extra".into());
+        library
+            .update_book(
+                id,
+                &BookUpdate {
+                    identifiers: Some(latest),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let patch = candidate
+            .update_for_book(&library, id, &[Field::Isbn], None)
+            .unwrap();
+        library.update_book(id, &patch).unwrap();
+        let ids = library.get_metadata(id).unwrap().identifiers;
+        assert_eq!(ids["asin"], "new");
+        assert_eq!(ids["doi"], "extra");
+        assert_eq!(ids["isbn"], "9780140328721");
+    }
 
     #[test]
     fn open_library_search_and_preview_keep_edits_selective() {
