@@ -9,6 +9,7 @@ use crate::formats::html::html_to_text;
 use crate::{text, BookSummary, BookText, BookUpdate, Error, Library, Metadata, Result};
 
 pub const CLEANUP_LIMIT: usize = 12;
+const CLEANUP_AUTHOR_LIMIT: usize = 12;
 const CATALOG_LIMIT: usize = 180;
 const CATALOG_BYTES: usize = 32_000;
 
@@ -136,6 +137,15 @@ pub struct CatalogContext {
 
 impl CatalogContext {
     pub fn new(books: &[BookSummary], recent: &[i64], seed: Option<i64>) -> Self {
+        Self::with_author_limit(books, recent, seed, 4)
+    }
+
+    fn with_author_limit(
+        books: &[BookSummary],
+        recent: &[i64],
+        seed: Option<i64>,
+        author_limit: usize,
+    ) -> Self {
         let mut ordered = books.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|book| {
             (
@@ -155,7 +165,7 @@ impl CatalogContext {
             let row = json!({
                 "id": book.id,
                 "title": bounded(&book.title, 160),
-                "authors": book.authors.iter().take(4).map(|a| bounded(a, 70)).collect::<Vec<_>>(),
+                "authors": book.authors.iter().take(author_limit).map(|a| bounded(a, 70)).collect::<Vec<_>>(),
                 "tags": book.tags.iter().take(8).map(|tag| bounded(tag, 45)).collect::<Vec<_>>(),
                 "series": book.series.as_deref().map(|series| bounded(series, 90)),
                 "series_index": book.series_index,
@@ -384,7 +394,9 @@ impl CleanupDraft {
         let series = self.series.as_ref().filter(|_| has(CleanupField::Series));
         BookUpdate {
             title: self.title.clone().filter(|_| has(CleanupField::Title)),
-            authors: self.authors.clone().filter(|_| has(CleanupField::Authors)),
+            authors: self.authors.clone().filter(|authors| {
+                has(CleanupField::Authors) && authors.len() == current.authors.len()
+            }),
             series: series.map(|series| Some(series.clone())),
             series_index: series.map(|_| self.series_index.unwrap_or(1.0)),
             tags: has(CleanupField::Tags)
@@ -510,7 +522,7 @@ impl OpenRouter {
                 "Select 1–{CLEANUP_LIMIT} books for cleanup"
             )));
         }
-        let context = CatalogContext::new(books, &[], None);
+        let context = CatalogContext::with_author_limit(books, &[], None, CLEANUP_AUTHOR_LIMIT);
         let messages = [
             context.system("Conservatively clean metadata. Correct title casing and obvious author spelling/casing without changing author identities or order. Only infer a series and optional index from explicit title evidence. Suggest only a few plausible additions to genre tags. Return JSON {books:[{id,title,authors,series,series_index,tags,reason}]} with null or omitted fields when unchanged or uncertain. Never remove fields or invent metadata."),
             Message::new(Role::User, "Review the selected books for metadata cleanup."),
@@ -541,7 +553,10 @@ impl OpenRouter {
                     return None;
                 }
                 draft.title = draft.title.and_then(|s| text(s, 350));
-                draft.authors = draft.authors.and_then(|s| strings(s, 12));
+                draft.authors = draft
+                    .authors
+                    .and_then(|s| strings(s, CLEANUP_AUTHOR_LIMIT))
+                    .filter(|authors| authors.len() == original.authors.len());
                 draft.series = draft.series.and_then(|s| text(s, 140));
                 draft.series_index = draft.series_index.filter(|n| n.is_finite() && *n > 0.);
                 draft.tags = draft.tags.and_then(|s| strings(s, 8));
@@ -659,6 +674,27 @@ mod tests {
             .save(&mut library, "double feature", true)
             .is_err());
         mock.join().unwrap();
+    }
+
+    #[test]
+    fn cleanup_sends_collaborators_and_rejects_partial_author_lists() {
+        let (_dir, _, mut books) = catalog();
+        let book = books.iter_mut().find(|book| book.id == 1).unwrap();
+        book.authors = (1..=5).map(|i| format!("Writer {i}")).collect();
+        let (client, server) = mocked(
+            json!({"books":[{"id":1,"authors":["Writer 1","Writer 2","Writer 3","Writer 4"]}]}),
+            |body| {
+                assert!(body["messages"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Writer 5"));
+            },
+        );
+        assert!(client
+            .cleanup(std::slice::from_ref(book))
+            .unwrap()
+            .is_empty());
+        server.join().unwrap();
     }
 
     #[test]
