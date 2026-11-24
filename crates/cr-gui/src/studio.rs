@@ -218,23 +218,11 @@ impl CalibreApp {
                 } else {
                     Vec::new()
                 };
-                let relevance_query = if mode == Mode::Librarian && !history.is_empty() {
-                    let mut combined = history
-                        .iter()
-                        .map(|m| m.content.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    combined.push(' ');
-                    combined.push_str(&prompt);
-                    combined
-                } else {
-                    prompt.clone()
-                };
                 let catalog = CatalogContext::for_request(
                     &books,
                     &recent,
                     seed.filter(|_| mode == Mode::Next),
-                    &relevance_query,
+                    &prompt,
                     budget,
                 );
                 let (included, total) = (catalog.included(), catalog.total);
