@@ -456,72 +456,61 @@ impl CalibreApp {
     }
 }
 
-/// The text index can omit image-only pages or split text differently from the
-/// reader. Prefer a matching passage, then a uniquely named reading section.
+/// Locate the highlighted term in the reader. Use its surrounding text to
+/// distinguish repeated occurrences without relying on index chapter numbers.
 pub fn locate_text_hit(book: &Book, hit: &FtsHit) -> Option<Locator> {
-    let excerpt = hit.snippet.replace(['[', ']'], "");
-    let passage = excerpt
-        .split('…')
-        .max_by_key(|part| part.len())
-        .unwrap_or_default();
+    let (before, marked) = hit.snippet.split_once('[')?;
+    let (term, after) = marked.split_once(']')?;
+    let mut locations: Vec<_> = book
+        .search(term, 0)
+        .into_iter()
+        .map(|hit| hit.start)
+        .collect();
+    locations.dedup_by_key(|location| (location.section, location.block));
+    match locations.as_slice() {
+        [] => return None,
+        [location] => return Some(*location),
+        _ => {}
+    }
+
+    // SQLite also uses ellipses when it truncates a snippet. Keep the
+    // context immediately surrounding the match, even with literal ellipses.
+    let before = before.rsplit('…').next().unwrap_or_default();
+    let after = after.split('…').next().unwrap_or_default();
     let normalize = |text: &str| {
         text.split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase()
     };
-    let needle = normalize(passage);
-    if !needle.is_empty() {
-        let mut matches = book.sections.iter().enumerate().filter(|(_, section)| {
-            let text = section
-                .blocks
-                .iter()
-                .map(|block| block.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            normalize(&text).contains(&needle)
-        });
-        if let Some((section, contents)) = matches.next() {
-            if matches.next().is_none() {
-                let block = contents
-                    .blocks
-                    .iter()
-                    .position(|block| normalize(&block.text).contains(&needle))
-                    .unwrap_or(0);
-                return Some(Locator {
-                    section,
-                    block,
-                    offset: 0,
-                });
-            }
-        }
+    let context = normalize(&format!("{before}{term}{after}").replace(['[', ']'], ""));
+    if let Some(location) = only(locations.iter().copied().filter(|location| {
+        book.block(*location)
+            .is_some_and(|block| normalize(&block.text).contains(&context))
+    })) {
+        return Some(location);
     }
-    // An extraction chapter can span multiple reader sections, so the
-    // surrounding words may cross a section boundary.
-    if let Some((_, rest)) = hit.snippet.split_once('[') {
-        if let Some((term, _)) = rest.split_once(']') {
-            let mut matches = book.search(term, 2).into_iter();
-            if let Some(first) = matches.next() {
-                if matches.next().is_none() {
-                    return Some(first.start);
-                }
-            }
-        }
-    }
-    let title = normalize(&hit.chapter_title);
-    if title.is_empty() {
-        return None;
-    }
-    let mut matches = book
-        .sections
-        .iter()
-        .enumerate()
-        .filter(|(_, section)| normalize(&section.title) == title);
-    let (section, _) = matches.next()?;
-    matches.next().is_none().then_some(Locator {
-        section,
-        ..Default::default()
-    })
+    // The snippet can span multiple reader blocks. Only jump if the
+    // matching section has a single candidate block.
+    let (section, _) = only(book.sections.iter().enumerate().filter(|(_, section)| {
+        let text = section
+            .blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        normalize(&text).contains(&context)
+    }))?;
+    only(
+        locations
+            .into_iter()
+            .filter(|location| location.section == section),
+    )
+}
+
+fn only<T>(mut items: impl Iterator<Item = T>) -> Option<T> {
+    let first = items.next()?;
+    items.next().is_none().then_some(first)
 }
 
 fn write_catalog(
@@ -587,5 +576,31 @@ mod tests {
             locate_text_hit(&book, &spanning_sections).unwrap().section,
             2
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn text_hit_keeps_the_highlight_when_the_snippet_contains_an_ellipsis() {
+        let book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Introduction".into(),
+                    html: "<p>A long introductory paragraph precedes the search result.</p><p>There was an abandoned lighthouse.</p>".into(),
+                },
+                Section {
+                    title: "The bay".into(),
+                    html: "<p>The boats sailed away.</p><p>… The lighthouse shone.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        let hit = FtsHit {
+            book: 1,
+            title: "A story".into(),
+            chapter: 1,
+            chapter_title: "Introduction".into(),
+            snippet: "A long introductory paragraph precedes the search result. … The [lighthouse] shone.".into(),
+        };
+        let location = locate_text_hit(&book, &hit).unwrap();
+        assert_eq!((location.section, location.block), (1, 1));
     }
 }
