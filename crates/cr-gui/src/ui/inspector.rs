@@ -1,10 +1,13 @@
 //! The inspector: details of the selected book, or the metadata editor.
 
+use cr_core::formats::editing::EDITABLE_FORMATS;
 use cr_core::formats::html;
+use cr_core::library::{PICTURE_FORMATS, READABLE_FORMATS};
 use cr_core::text;
 use gpui_kit::assets::IconName as Lucide;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputState, Textarea};
+use gpui_kit::component::native_menu::NativeMenu;
 use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -242,25 +245,46 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     );
 
     let mut table = v_flex().gap_2().children(rows);
-    let mut formats: Vec<AnyElement> =
-        app.selected_formats
-            .iter()
-            .enumerate()
-            .map(|(index, format)| {
-                let format_name = format.clone();
-                chip(("format-chip", index), format.clone(), cx)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(cx.theme().secondary_hover))
-                    .tooltip(|window, cx| {
-                        gpui_kit::component::tooltip::Tooltip::new("Open in default app")
-                            .build(window, cx)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_format_externally(&format_name, cx)
-                    }))
-                    .into_any_element()
-            })
-            .collect();
+    let mut formats: Vec<AnyElement> = app
+        .selected_formats
+        .iter()
+        .enumerate()
+        .map(|(index, format)| {
+            let format = format.clone();
+            chip(("format-chip", index), format.clone(), cx)
+                .cursor_pointer()
+                .hover(|style| style.bg(cx.theme().secondary_hover))
+                .tooltip(|window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new("Format actions").build(window, cx)
+                })
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    let action = |command| Box::new(BookFormatAction(command, format.clone()));
+                    NativeMenu::new()
+                        .menu_with_disabled(
+                            "Read This Format",
+                            !READABLE_FORMATS.contains(&format.as_str())
+                                && !PICTURE_FORMATS.contains(&format.as_str()),
+                            action(FormatCommand::Read),
+                        )
+                        .menu("Open in Default App", action(FormatCommand::Open))
+                        .menu(reveal_label(), action(FormatCommand::Reveal))
+                        .menu("Copy File Path", action(FormatCommand::CopyPath))
+                        .separator()
+                        .menu_with_disabled(
+                            "Edit This Format…",
+                            !EDITABLE_FORMATS.contains(&format.as_str()),
+                            action(FormatCommand::Edit),
+                        )
+                        .menu_with_disabled(
+                            "Remove This Format…",
+                            !this.can_write() || this.job.is_some(),
+                            action(FormatCommand::Remove),
+                        )
+                        .show(event.position(), window, cx);
+                }))
+                .into_any_element()
+        })
+        .collect();
     if let Some(source) = ["EPUB", "KEPUB"]
         .into_iter()
         .find(|source| app.selected_formats.iter().any(|format| format == source))

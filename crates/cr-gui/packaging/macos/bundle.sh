@@ -57,12 +57,11 @@ fi
 
 # --- Binary -----------------------------------------------------------------
 echo "==> Building calibre-rust ($profile)"
-cargo_args=(build --manifest-path "$manifest" --bin calibre-rust)
+target_dir=${CARGO_TARGET_DIR:-"$crate/target"}
+cargo_args=(build --locked --manifest-path "$manifest" --bin calibre-rust --target-dir "$target_dir")
 [[ $profile == release ]] && cargo_args+=(--release)
 cargo "${cargo_args[@]}"
 
-target_dir="$(cargo metadata --manifest-path "$manifest" --format-version 1 --no-deps |
-    sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
 binary="$target_dir/$profile/calibre-rust"
 if [[ ! -x "$binary" ]]; then
     echo "expected a binary at $binary" >&2

@@ -1,8 +1,9 @@
 //! Persistent user preferences, stored as JSON in the platform config folder.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use cr_core::library::BookSort;
+use cr_core::library::{BookSort, Collision, DuplicatePolicy, ExportOptions};
 use serde::{Deserialize, Serialize};
 
 const MAX_RECENT_LIBRARIES: usize = 10;
@@ -27,6 +28,118 @@ pub enum ViewMode {
     Grid,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupLibrary {
+    #[default]
+    LastUsed,
+    Default,
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenExternalBook {
+    #[default]
+    Import,
+    Read,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportDuplicates {
+    #[default]
+    Merge,
+    KeepBoth,
+    Skip,
+}
+
+impl From<ImportDuplicates> for DuplicatePolicy {
+    fn from(value: ImportDuplicates) -> Self {
+        match value {
+            ImportDuplicates::Merge => Self::Merge,
+            ImportDuplicates::KeepBoth => Self::Add,
+            ImportDuplicates::Skip => Self::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportLayout {
+    #[default]
+    BookFolders,
+    AuthorFolders,
+    Flat,
+}
+
+impl ExportLayout {
+    pub fn template(self) -> &'static str {
+        match self {
+            Self::BookFolders => "{author_sort}/{title} ({id})/{title} - {author}",
+            Self::AuthorFolders => "{author_sort}/{title} - {author} ({id})",
+            Self::Flat => "{title} - {author} ({id})",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportCollision {
+    #[default]
+    Rename,
+    Skip,
+    Replace,
+}
+
+impl From<ExportCollision> for Collision {
+    fn from(value: ExportCollision) -> Self {
+        match value {
+            ExportCollision::Rename => Self::Rename,
+            ExportCollision::Skip => Self::Skip,
+            ExportCollision::Replace => Self::Overwrite,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReaderSpacing {
+    Compact,
+    #[default]
+    Normal,
+    Airy,
+}
+
+impl ReaderSpacing {
+    pub fn factor(self) -> f32 {
+        match self {
+            Self::Compact => 1.35,
+            Self::Normal => 1.65,
+            Self::Airy => 1.95,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReaderWidth {
+    Narrow,
+    #[default]
+    Standard,
+    Wide,
+}
+
+impl ReaderWidth {
+    pub fn ems(self) -> f32 {
+        match self {
+            Self::Narrow => 32.,
+            Self::Standard => 40.,
+            Self::Wide => 52.,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SavedBounds {
     pub x: f32,
@@ -49,6 +162,21 @@ pub struct Settings {
     pub descending: bool,
     pub reader_font_size: f32,
     pub window: Option<SavedBounds>,
+    pub startup_library: StartupLibrary,
+    pub restore_window: bool,
+    pub auto_detect_devices: bool,
+    pub import_duplicates: ImportDuplicates,
+    pub open_external_book: OpenExternalBook,
+    pub export_layout: ExportLayout,
+    pub export_collision: ExportCollision,
+    pub export_cover: bool,
+    pub export_metadata: bool,
+    pub reveal_export: bool,
+    pub reader_spacing: ReaderSpacing,
+    pub reader_width: ReaderWidth,
+    pub reader_contents: bool,
+    pub reader_resume: bool,
+    pub publisher_styles: bool,
 }
 
 impl Default for Settings {
@@ -64,6 +192,21 @@ impl Default for Settings {
             descending: false,
             reader_font_size: DEFAULT_READER_FONT_SIZE,
             window: None,
+            startup_library: StartupLibrary::LastUsed,
+            restore_window: true,
+            auto_detect_devices: true,
+            import_duplicates: ImportDuplicates::Merge,
+            open_external_book: OpenExternalBook::Import,
+            export_layout: ExportLayout::BookFolders,
+            export_collision: ExportCollision::Rename,
+            export_cover: false,
+            export_metadata: false,
+            reveal_export: true,
+            reader_spacing: ReaderSpacing::Normal,
+            reader_width: ReaderWidth::Standard,
+            reader_contents: true,
+            reader_resume: true,
+            publisher_styles: true,
         }
     }
 }
@@ -74,37 +217,59 @@ impl Settings {
         let Some(path) = settings_path() else {
             return Self::default();
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        match serde_json::from_str::<Settings>(&text) {
-            Ok(mut settings) => {
-                settings.reader_font_size = settings
-                    .reader_font_size
-                    .clamp(MIN_READER_FONT_SIZE, MAX_READER_FONT_SIZE);
-                settings.recent_libraries.truncate(MAX_RECENT_LIBRARIES);
-                settings
-            }
+        match Self::read_from(&path) {
+            Ok(settings) => settings,
             Err(err) => {
-                eprintln!(
-                    "calibre-rust: ignoring unreadable {}: {err}",
-                    path.display()
-                );
+                eprintln!("calibre-rust: {err}");
                 Self::default()
             }
         }
     }
 
+    fn read_from(path: &Path) -> Result<Self, String> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(format!("Could not read {}: {err}", path.display())),
+        };
+        let mut settings: Self = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|err| format!("Could not decode {}: {err}", path.display()))?;
+        settings.reader_font_size = settings
+            .reader_font_size
+            .clamp(MIN_READER_FONT_SIZE, MAX_READER_FONT_SIZE);
+        settings.recent_libraries.truncate(MAX_RECENT_LIBRARIES);
+        Ok(settings)
+    }
+
     pub fn save(&self) -> Result<(), String> {
         let path = settings_path().ok_or("No configuration folder is available.")?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+        self.write_to(&path)
+    }
+
+    fn write_to(&self, path: &Path) -> Result<(), String> {
+        let parent = path
+            .parent()
+            .ok_or("The settings path has no parent folder.")?;
+        let write = || -> Result<(), Box<dyn std::error::Error>> {
+            std::fs::create_dir_all(parent)?;
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            serde_json::to_writer_pretty(&mut file, self)?;
+            file.write_all(b"\n")?;
+            file.as_file().sync_all()?;
+            file.persist(path)?;
+            Ok(())
+        };
+        write().map_err(|err| format!("Could not save {}: {err}", path.display()))
+    }
+
+    pub fn export_options(&self) -> ExportOptions {
+        ExportOptions {
+            template: self.export_layout.template().into(),
+            collision: self.export_collision.into(),
+            cover: self.export_cover,
+            opf: self.export_metadata,
+            ..Default::default()
         }
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|err| format!("Could not encode settings: {err}"))?;
-        std::fs::write(&path, text)
-            .map_err(|err| format!("Could not save {}: {err}", path.display()))
     }
 
     pub fn sort(&self) -> BookSort {
@@ -126,21 +291,82 @@ impl Settings {
 }
 
 /// The per-user configuration folder for calibre-rust.
-fn config_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+pub fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = absolute_env_path("CALIBRE_RUST_CONFIG_DIR") {
+        return Some(dir);
+    }
+    let home = absolute_env_path("HOME");
     if cfg!(target_os = "macos") {
         return home.map(|home| home.join("Library/Application Support/calibre-rust"));
     }
     if cfg!(target_os = "windows") {
-        return std::env::var_os("APPDATA").map(|dir| PathBuf::from(dir).join("calibre-rust"));
+        return absolute_env_path("APPDATA").map(|dir| dir.join("calibre-rust"));
     }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
+    absolute_env_path("XDG_CONFIG_HOME")
         .or_else(|| home.map(|home| home.join(".config")))
         .map(|dir| dir.join("calibre-rust"))
 }
 
+fn absolute_env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+}
+
 fn settings_path() -> Option<PathBuf> {
     config_dir().map(|dir| dir.join("settings.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn existing_settings_keep_values_and_get_new_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"dark","view":"grid","reader_font_size":75}"#,
+        )
+        .unwrap();
+        let settings = Settings::read_from(&path).unwrap();
+        assert_eq!(settings.theme, ThemePreference::Dark);
+        assert_eq!(settings.view, ViewMode::Grid);
+        assert_eq!(settings.reader_font_size, MAX_READER_FONT_SIZE);
+        assert_eq!(settings.startup_library, StartupLibrary::LastUsed);
+        assert_eq!(settings.import_duplicates, ImportDuplicates::Merge);
+        assert!(settings.publisher_styles);
+    }
+
+    #[core::prelude::v1::test]
+    fn settings_replace_previous_file_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile/settings.json");
+        Settings::default().write_to(&path).unwrap();
+        let settings = Settings {
+            export_cover: true,
+            export_layout: ExportLayout::Flat,
+            export_collision: ExportCollision::Skip,
+            import_duplicates: ImportDuplicates::Skip,
+            open_external_book: OpenExternalBook::Read,
+            reveal_export: false,
+            reader_width: ReaderWidth::Wide,
+            ..Default::default()
+        };
+        settings.write_to(&path).unwrap();
+        let loaded = Settings::read_from(&path).unwrap();
+        let export = loaded.export_options();
+        assert!(export.cover);
+        assert_eq!(export.template, "{title} - {author} ({id})");
+        assert_eq!(export.collision, Collision::Skip);
+        assert_eq!(loaded.import_duplicates, ImportDuplicates::Skip);
+        assert_eq!(loaded.open_external_book, OpenExternalBook::Read);
+        assert!(!loaded.reveal_export);
+        assert_eq!(loaded.reader_width, ReaderWidth::Wide);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 }

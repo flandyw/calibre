@@ -47,10 +47,14 @@ pub fn tools_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement 
         ToolPane::BulkEdit => bulk_pane(app, cx),
         ToolPane::Convert => convert_pane(app, cx),
         ToolPane::Search => search_pane(app, cx),
+        ToolPane::FullText => super::library_tools::full_text_pane(app, cx),
         ToolPane::Devices => devices_pane(app, cx),
         ToolPane::Server => server_pane(app, cx),
         ToolPane::Trash => trash_pane(app, cx),
         ToolPane::Maintenance => maintenance_pane(app, cx),
+        ToolPane::Transfer => super::library_tools::transfer_pane(app, cx),
+        ToolPane::Catalog => super::library_tools::catalog_pane(app, cx),
+        ToolPane::CustomColumns => super::custom_columns::pane(app, cx),
     };
 
     h_flex()

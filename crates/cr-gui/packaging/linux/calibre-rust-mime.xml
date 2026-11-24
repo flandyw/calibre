@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-kobo-epub+zip">
+    <comment>Kobo EPUB ebook</comment>
+    <sub-class-of type="application/epub+zip"/>
+    <glob pattern="*.kepub"/>
+    <glob pattern="*.kepub.epub"/>
+  </mime-type>
+  <mime-type type="application/x-calibre-htmlz">
+    <comment>HTML ebook archive</comment>
+    <sub-class-of type="application/zip"/>
+    <glob pattern="*.htmlz"/>
+  </mime-type>
+  <mime-type type="application/vnd.amazon.mobi8-ebook">
+    <glob pattern="*.kf8"/>
+  </mime-type>
+  <mime-type type="application/x-mobipocket-ebook">
+    <glob pattern="*.azw"/>
+  </mime-type>
+</mime-info>

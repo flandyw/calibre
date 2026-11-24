@@ -295,17 +295,20 @@ default (`--no-replace` to keep it separate). This is the beginning of the
   corner handles, or use the 2:3, 1:1 and 3:4 presets;
 - multi-selection (Ctrl/Cmd-click, Shift-click, select all) with batch
   remove, export and send;
-- adding a file whose title and authors match an existing book attaches it
-  to that book as another format;
+- choose whether imports with matching titles and authors merge, keep both
+  records, or skip the duplicate;
+- attach formats to an existing book, or use the Formats row to read, edit,
+  reveal, or remove individual formats;
 - export the selected books, or the current filtered library, to a folder
-  picker using the same path template as `cr export`;
+  picker, with configurable folder layout, collision handling, and sidecars;
 - a basic EPUB source editor: unpack, edit XHTML/CSS/OPF files, save changes
   and repack into the library, with a save/discard prompt when closing;
 - a chapter-by-chapter reader for EPUB, Kindle books, FB2, TXT and HTML;
 - EPUB-to-AZW3 and Kindle-to-EPUB conversion from the selected book's Formats
   row, with a save dialog;
 - device discovery and one-click send;
-- light/dark theme switching;
+- a Preferences screen for appearance, startup, imports, export sidecars,
+  and reader typography and reading behavior;
 - a Tools screen (the wrench button, or the Tools menu):
   - **Edit Metadata in Bulk** — set authors, publisher, series (with
     numbering), rating and languages, add/remove tags, and search and
@@ -314,6 +317,14 @@ default (`--no-replace` to keep it separate). This is the beginning of the
     HTMLZ or TXT with a device profile; the new file is added to each book;
   - **Search Tools** — build a search term by term, and save, show or
     delete saved searches and virtual libraries;
+  - **Full-text Search** — build a per-library index, search within books,
+    and open matching chapters in the reader;
+  - **Transfer Books** — copy or move selected books to another library
+    with duplicate handling and a transfer report;
+  - **Export Catalog** — save all books or a search as CSV, EPUB, HTML,
+    JSON, XML, or BibTeX;
+  - **Custom Columns** — add and remove calibre-compatible columns and
+    edit values for the selected book;
   - **Devices** — what is on the connected reader and how it matches the
     library, its reading progress and highlights, delete books from it, and
     send the selection;
@@ -359,9 +370,29 @@ cd crates/cr-gui
 cargo run
 ```
 
-The window reopens the last library you used, or `~/Calibre Library` if it
-exists. Use File → Open Library (⇧⌘O) or New Library (⇧⌘N) for others, or
-drop a library folder onto the window. Press ⌘/ for every keyboard shortcut.
+By default the window reopens your last library, falling back to
+`~/Calibre Library` if it exists. Open another library from the File menu
+or drop its folder onto the window. Open Preferences with Ctrl+, on Linux
+or Command+, on macOS. Set `CALIBRE_RUST_CONFIG_DIR` to use a separate
+settings directory.
+
+Pass an ebook or library path to the desktop executable, or use
+`calibre-rust --read PATH` to read an ebook directly. Run
+`calibre-rust --help` for the other launch options. The Import and export
+preferences let you choose what happens when the operating system opens
+a single ebook.
+
+### Linux desktop installation
+
+```bash
+crates/cr-gui/packaging/linux/install.sh
+crates/cr-gui/packaging/linux/install.sh --uninstall
+```
+
+Installation builds the desktop binary and registers menu entries, icons,
+and ebook associations for the current user. Pass `--binary PATH` to use an
+existing build. The launcher also offers shortcuts to open books, choose
+a library, import books, and open Preferences.
 
 ### macOS app bundle
 

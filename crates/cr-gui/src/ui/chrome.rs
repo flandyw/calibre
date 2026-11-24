@@ -22,6 +22,21 @@ pub fn title_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         Screen::Epub => epub_bar(app, cx),
         Screen::Crop => crop_bar(),
         Screen::Tools => tools_bar(app, cx),
+        Screen::Preferences => h_flex()
+            .gap_2()
+            .child(tool_button(
+                "close-preferences",
+                IconName::ChevronLeft,
+                "Back",
+                ClosePreferences,
+            ))
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Preferences"),
+            )
+            .into_any_element(),
     };
     TitleBar::new()
         .child(
@@ -30,7 +45,19 @@ pub fn title_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .pr_2()
                 .gap_1()
                 .items_center()
-                .child(content),
+                .child(div().flex_1().min_w_0().child(content))
+                .when(
+                    matches!(app.screen, Screen::Library | Screen::Reader | Screen::Tools)
+                        && !app.editing,
+                    |this| {
+                        this.child(tool_button(
+                            "open-preferences",
+                            Lucide::Settings,
+                            "Preferences",
+                            OpenPreferences,
+                        ))
+                    },
+                ),
         )
         .into_any_element()
 }
@@ -246,8 +273,12 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .ghost()
                 .small()
                 .icon(IconName::ChevronLeft)
-                .label("Library")
-                .tooltip_with_action("Back to library", &Cancel, None)
+                .label(if app.reader_return == Screen::Tools {
+                    "Tools"
+                } else {
+                    "Library"
+                })
+                .tooltip_with_action("Close reader", &Cancel, None)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx)),
         )
         .child(tool_button(
@@ -288,18 +319,20 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             "Find in book",
             FindInBook,
         ))
-        .child(tool_button(
-            "reader-bookmark",
-            Lucide::Bookmark,
-            "Bookmark this place",
-            ToggleBookmark,
-        ))
-        .child(tool_button(
-            "reader-highlight",
-            Lucide::Highlighter,
-            "Highlight the selected paragraph",
-            ToggleHighlight,
-        ))
+        .when(app.reader_book_id.is_some(), |this| {
+            this.child(tool_button(
+                "reader-bookmark",
+                Lucide::Bookmark,
+                "Bookmark this place",
+                ToggleBookmark,
+            ))
+            .child(tool_button(
+                "reader-highlight",
+                Lucide::Highlighter,
+                "Highlight the selected paragraph",
+                ToggleHighlight,
+            ))
+        })
         .child(div().w(px(8.)))
         .child(
             tool_button(
@@ -804,6 +837,7 @@ pub fn shortcuts_overlay(window: &mut Window, cx: &mut Context<CalibreApp>) -> A
             row("Last book", &SelectLast, list_ctx, window),
             row("Back / cancel", &Cancel, app_ctx, window),
             row("Show shortcuts", &ShowShortcuts, app_ctx, window),
+            row("Preferences", &OpenPreferences, app_ctx, window),
         ],
         cx,
     );
