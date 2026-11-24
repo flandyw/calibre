@@ -455,9 +455,11 @@ fn open_library_candidate(value: &Value) -> Option<Candidate> {
         publisher: strings(&value["publisher"], 1).pop(),
         published: value["publish_date"]
             .as_array()
-            .and_then(|dates| dates.first())
-            .and_then(string)
-            .or_else(|| string(&value["publish_date"]))
+            .into_iter()
+            .flatten()
+            .filter_map(string)
+            .chain(string(&value["publish_date"]))
+            .find(|date| parse_online_date(date).is_some())
             .or_else(|| {
                 value["first_publish_year"]
                     .as_u64()
@@ -548,11 +550,56 @@ fn strings(value: &Value, max: usize) -> Vec<String> {
 }
 
 fn parse_online_date(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    match value.len() {
+    let standard = match value.len() {
         4 => parse_user_date(&format!("{value}-01-01")),
         7 => parse_user_date(&format!("{value}-01")),
         _ => parse_user_date(value),
+    };
+    standard.or_else(|| {
+        ["%B %e, %Y", "%b %e, %Y", "%e %B %Y", "%e %b %Y"]
+            .into_iter()
+            .find_map(|pattern| chrono::NaiveDate::parse_from_str(value, pattern).ok())
+            .or_else(|| {
+                ["%e %B %Y", "%e %b %Y"].into_iter().find_map(|pattern| {
+                    chrono::NaiveDate::parse_from_str(&format!("1 {value}"), pattern).ok()
+                })
+            })
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|date| date.and_utc())
+    })
+}
+
+#[cfg(test)]
+fn proposed_date(candidate: &Candidate) -> Option<String> {
+    candidate
+        .update(&Metadata::new("Book"), &[Field::Date], None)
+        .pubdate
+        .flatten()
+        .map(|date| date.date_naive().to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn open_library_month_names_and_year_fallback_produce_applicable_dates() {
+    for (date, expected) in [
+        ("October 1, 1988", "1988-10-01"),
+        ("Oct 1988", "1988-10-01"),
+        ("unknown", "1891-01-01"),
+    ] {
+        let candidate = open_library_candidate(&json!({
+            "key": "/works/OL1W", "title":"Book", "publish_date":[date], "first_publish_year":1891
+        }))
+        .unwrap();
+        assert_eq!(proposed_date(&candidate).as_deref(), Some(expected));
     }
+    let edition = open_library_edition(
+        &json!({
+            "key": "/books/OL1M", "title":"Book", "publish_date":"1 October 1988"
+        }),
+        "9780140328721".into(),
+    )
+    .unwrap();
+    assert_eq!(proposed_date(&edition).as_deref(), Some("1988-10-01"));
 }
 
 #[cfg(test)]
