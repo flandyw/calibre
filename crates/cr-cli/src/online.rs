@@ -8,6 +8,12 @@ use cr_core::online_metadata::{Catalog, Field, Query, Source};
 use cr_core::{BookUpdate, Library};
 use serde_json::json;
 
+pub(crate) fn terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|&c| c == '\n' || !c.is_control())
+        .collect()
+}
+
 #[derive(Debug, Args)]
 pub struct AiArgs {
     /// OpenRouter model ID
@@ -62,7 +68,11 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&models)?);
             } else {
                 for model in models {
-                    println!("{}\t{}", model.id, model.name);
+                    println!(
+                        "{}\t{}",
+                        terminal_text(&model.id),
+                        terminal_text(&model.name)
+                    );
                 }
             }
         }
@@ -89,7 +99,7 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
                 &[context.system_message(), Message::new(Role::User, question)],
                 |text| {
                     if !json_output {
-                        print!("{text}");
+                        print!("{}", terminal_text(text));
                         io::stdout().flush()?;
                     }
                     Ok(())
@@ -137,8 +147,8 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
             } else {
                 println!(
                     "Description: {}\nTags: {}",
-                    suggestion.description,
-                    suggestion.tags.join(", ")
+                    terminal_text(&suggestion.description),
+                    terminal_text(&suggestion.tags.join(", "))
                 );
                 if applied {
                     println!("Applied selected fields to #{id}.");
@@ -155,6 +165,19 @@ fn context(library: &Library, id: i64, excerpt: bool) -> Result<BookContext> {
     let metadata = library.get_metadata(id)?;
     let text = excerpt.then(|| library.read_book(id, None)).transpose()?;
     Ok(BookContext::new(&metadata, text.as_ref()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_text;
+
+    #[test]
+    fn terminal_text_drops_controls_but_keeps_unicode_and_newlines() {
+        assert_eq!(
+            terminal_text("Hi\u{001B}[31m\u{009D}江\r\u{0007}\nHello"),
+            "Hi[31m江\nHello"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

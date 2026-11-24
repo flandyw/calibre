@@ -9,6 +9,8 @@ use cr_core::ai::{
 use cr_core::{Library, ListOptions};
 use serde_json::json;
 
+use crate::online::terminal_text;
+
 #[derive(Debug, Args)]
 pub struct LibraryArgs {
     #[command(subcommand)]
@@ -55,7 +57,11 @@ pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: boo
         LibraryCommand::Search { request, run } => {
             let draft = client.draft_search(&library, &request.join(" "))?;
             if !machine {
-                println!("Query: {}\n{}", draft.query, draft.note);
+                println!(
+                    "Query: {}\n{}",
+                    terminal_text(&draft.query),
+                    terminal_text(&draft.note)
+                );
             }
             let matches = if run && !draft.query.is_empty() {
                 Some(library.list_books(&ListOptions {
@@ -74,7 +80,7 @@ pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: boo
                 );
             } else {
                 for book in matches.into_iter().flatten() {
-                    println!("#{}\t{}", book.id, book.title);
+                    println!("#{}\t{}", book.id, terminal_text(&book.title));
                 }
             }
         }
@@ -108,12 +114,10 @@ pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: boo
                 .iter()
                 .map(|shelf| json!({"shelf": shelf, "query": shelf.query()}))
                 .collect::<Vec<_>>();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &json!({"included":catalog.included(), "total":catalog.total, "shelves":rows})
-                )?
-            );
+            print_json(
+                &json!({"included":catalog.included(), "total":catalog.total, "shelves":rows}),
+                machine,
+            )?;
         }
         LibraryCommand::Cleanup { mut ids } => {
             ids.sort_unstable();
@@ -134,7 +138,7 @@ pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: boo
                 }).collect::<Vec<_>>();
                 Some(json!({"id":draft.id,"title":book.title,"reason":draft.reason,"fields":fields}))
             }).collect::<Vec<_>>();
-            println!("{}", serde_json::to_string_pretty(&rows)?);
+            print_json(&json!(rows), machine)?;
         }
     }
     Ok(())
@@ -153,10 +157,15 @@ fn print_answer(catalog: &CatalogContext, answer: LibraryAnswer, machine: bool) 
             "Catalog: {} of {} books\n{}",
             catalog.included(),
             catalog.total,
-            answer.answer
+            terminal_text(&answer.answer)
         );
         for book in answer.books {
-            println!("#{} {} — {}", book.id, book.title, book.reason);
+            println!(
+                "#{} {} — {}",
+                book.id,
+                terminal_text(&book.title),
+                terminal_text(&book.reason)
+            );
         }
     }
     Ok(())
@@ -232,8 +241,14 @@ pub fn book(args: BookArgs, client: &OpenRouter, path: &Path, machine: bool) -> 
     if machine {
         println!("{}", serde_json::to_string_pretty(&reply)?);
     } else {
-        println!("{}", reply.text);
+        println!("{}", terminal_text(&reply.text));
     }
+    Ok(())
+}
+
+fn print_json(value: &serde_json::Value, machine: bool) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)?;
+    println!("{}", if machine { text } else { terminal_text(&text) });
     Ok(())
 }
 
