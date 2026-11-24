@@ -2384,7 +2384,8 @@ impl CalibreApp {
             }
         };
         self.reader_file = library.format_path(id, chosen).ok().flatten();
-        let location = text_hit.and_then(|hit| crate::library_tools::locate_text_hit(&book, hit));
+        let location =
+            text_hit.and_then(|hit| crate::library_tools::locate_text_hit(&book, hit, chosen));
         // Reading state uses locators in the preferred format's layout.
         if !preferred
             .as_ref()
