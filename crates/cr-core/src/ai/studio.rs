@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{Message, OpenRouter, Role, EXCERPT_LIMIT};
 use crate::formats::html::html_to_text;
-use crate::formats::reading::Book;
+use crate::formats::reading::{BlockKind, Book};
 use crate::{text, BookSummary, BookText, BookUpdate, Error, Library, Metadata, Result};
 
 pub const CLEANUP_LIMIT: usize = 12;
@@ -159,7 +159,7 @@ pub fn recap_reader_messages(
                 .into(),
         ));
     }
-    let chapters = book.toc[..chapter]
+    let chapters: Vec<_> = book.toc[..chapter]
         .iter()
         .enumerate()
         .map(|(index, entry)| {
@@ -188,6 +188,9 @@ pub fn recap_reader_messages(
                     .filter(|last| last.section == section)
                     .map_or(content.blocks.len(), |last| last.block);
                 for block in content.blocks.iter().take(last_block).skip(first_block) {
+                    if matches!(block.kind, BlockKind::Image(_) | BlockKind::Rule) {
+                        continue;
+                    }
                     text.push_str(&block.text);
                     text.push('\n');
                 }
@@ -198,6 +201,15 @@ pub fn recap_reader_messages(
             }
         })
         .collect();
+    if !chapters
+        .iter()
+        .any(|chapter| !chapter.text.trim().is_empty())
+    {
+        return Err(Error::Other(
+            "There is no readable text through this contents entry. Recaps do not read images."
+                .into(),
+        ));
+    }
     recap_messages(metadata, &BookText { chapters }, chapter)
 }
 
@@ -878,6 +890,30 @@ mod tests {
             estimate(format!("{}{}", "word ".repeat(230), "字".repeat(500))),
             2
         );
+    }
+
+    #[test]
+    fn reader_recap_needs_text_not_just_image_labels() {
+        use crate::formats::document::{Document, Image, Section};
+
+        let metadata = Metadata::new("Comic");
+        let reader = Book::from_document(Document {
+            sections: vec![Section {
+                title: "Page 1".into(),
+                html: r#"<img src="images/page.png" alt="Page 1"/>"#.into(),
+            }],
+            images: vec![Image {
+                name: "page.png".into(),
+                data: vec![],
+            }],
+            ..Document::default()
+        });
+        assert!(matches!(
+            reader.sections[0].blocks[0].kind,
+            BlockKind::Image(_)
+        ));
+        let error = recap_reader_messages(&metadata, &reader, 1).unwrap_err();
+        assert!(error.to_string().contains("no readable text"));
     }
 
     #[test]
