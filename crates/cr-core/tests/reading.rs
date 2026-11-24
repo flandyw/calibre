@@ -195,6 +195,35 @@ fn positions_and_annotations_live_beside_the_library() {
 }
 
 #[test]
+fn recent_reads_merge_both_readers_by_timestamp() {
+    let temp = tempdir().unwrap();
+    let mut library = Library::create(temp.path()).unwrap();
+    let first = library
+        .add_empty(cr_core::Metadata::new("Local"))
+        .unwrap()
+        .id;
+    let second = library
+        .add_empty(cr_core::Metadata::new("Calibre"))
+        .unwrap()
+        .id;
+    let book = book(temp.path());
+    library
+        .set_reading_position(first, &book, Locator::default())
+        .unwrap();
+    let local = rusqlite::Connection::open(temp.path().join("cr-reading.db")).unwrap();
+    local
+        .execute("UPDATE positions SET updated=100", [])
+        .unwrap();
+    let calibre = rusqlite::Connection::open(temp.path().join("metadata.db")).unwrap();
+    for (id, epoch) in [(first, 80), (second, 200)] {
+        calibre.execute("INSERT INTO last_read_positions (book,format,user,device,cfi,epoch) VALUES (?1,'EPUB','u','d','',?2)", [id, epoch]).unwrap();
+    }
+    assert_eq!(library.recent_read_ids(1).unwrap(), [second]);
+    assert_eq!(library.recent_read_ids(2).unwrap(), [second, first]);
+    assert!(library.recent_read_ids(0).unwrap().is_empty());
+}
+
+#[test]
 fn calibre_highlights_and_positions_are_read() {
     let temp = tempdir().unwrap();
     let root = temp.path().join("library");

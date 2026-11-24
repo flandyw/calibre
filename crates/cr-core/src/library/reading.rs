@@ -4,6 +4,8 @@
 //! changes a book or calibre's data. calibre's own viewer annotations are
 //! read from `metadata.db` and can be copied in, but are never written.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -105,31 +107,45 @@ const ANNOTATION_COLUMNS: &str =
 
 impl Library {
     pub fn recent_read_ids(&self, limit: usize) -> Result<Vec<i64>> {
-        let mut ids = Vec::new();
         let limit = limit.min(100);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut recent = HashMap::new();
         if self.has_reading_state() {
             let conn = self.reading_connection()?;
             let mut stmt =
-                conn.prepare("SELECT book FROM positions ORDER BY updated DESC LIMIT ?1")?;
-            ids = stmt
-                .query_map([limit as i64], |row| row.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-        }
-        if ids.len() < limit {
-            let mut stmt = self.conn.prepare(
-                "SELECT p.book FROM last_read_positions p JOIN books b ON b.id=p.book GROUP BY p.book ORDER BY MAX(p.epoch) DESC LIMIT ?1",
-            )?;
-            for id in stmt.query_map([limit as i64], |row| row.get(0))? {
-                let id = id?;
-                if !ids.contains(&id) {
-                    ids.push(id);
-                    if ids.len() == limit {
+                conn.prepare("SELECT book, updated FROM positions ORDER BY updated DESC, book")?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+            let mut exists = self
+                .conn
+                .prepare_cached("SELECT 1 FROM books WHERE id=?1")?;
+            for row in rows {
+                let (id, updated) = row?;
+                if exists.exists([id])? {
+                    recent.insert(id, updated as f64);
+                    if recent.len() == limit {
                         break;
                     }
                 }
             }
         }
-        Ok(ids)
+        let mut stmt = self.conn.prepare(
+            "SELECT p.book, MAX(p.epoch) AS updated FROM last_read_positions p JOIN books b ON b.id=p.book GROUP BY p.book ORDER BY updated DESC, p.book LIMIT ?1",
+        )?;
+        for row in stmt.query_map([limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })? {
+            let (id, updated) = row?;
+            recent
+                .entry(id)
+                .and_modify(|old| *old = old.max(updated))
+                .or_insert(updated);
+        }
+        let mut recent: Vec<_> = recent.into_iter().collect();
+        recent.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(recent.into_iter().take(limit).map(|(id, _)| id).collect())
     }
 
     fn reading_connection(&self) -> Result<Connection> {
