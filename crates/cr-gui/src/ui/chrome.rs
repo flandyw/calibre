@@ -319,6 +319,15 @@ fn reader_bar(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             "Find in book",
             FindInBook,
         ))
+        .when(app.reader_library_format.is_some(), |this| {
+            this.child(
+                Button::new("reader-ask-ai")
+                    .ghost()
+                    .small()
+                    .label("Ask AI…")
+                    .on_click(cx.listener(|app, _, window, cx| app.open_ai(window, cx))),
+            )
+        })
         .when(app.reader_book_id.is_some(), |this| {
             this.child(tool_button(
                 "reader-bookmark",

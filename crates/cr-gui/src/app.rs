@@ -238,6 +238,7 @@ pub struct CalibreApp {
     pub selected_path: Option<String>,
     pub book: Option<Rc<Book>>,
     pub reader_book_id: Option<i64>,
+    pub(crate) reader_library_format: Option<(i64, String)>,
     pub reader_return: Screen,
     reader_file: Option<PathBuf>,
     pub section_index: usize,
@@ -461,6 +462,7 @@ impl CalibreApp {
             selected_path: None,
             book: None,
             reader_book_id: None,
+            reader_library_format: None,
             reader_return: Screen::Library,
             reader_file: None,
             section_index: 0,
@@ -2413,6 +2415,7 @@ impl CalibreApp {
             }
         };
         self.reader_file = library.format_path(id, chosen).ok().flatten();
+        self.reader_library_format = Some((id, chosen.to_owned()));
         let location = text_hit.and_then(|hit| crate::library_tools::locate_text_hit(&book, hit));
         // Reading state uses locators in the preferred format's layout.
         if !preferred
@@ -2667,6 +2670,7 @@ impl CalibreApp {
     fn clear_reader(&mut self) {
         self.book = None;
         self.reader_book_id = None;
+        self.reader_library_format = None;
         self.reader_file = None;
         self.reader_images.clear();
         self.reader_fonts.clear();

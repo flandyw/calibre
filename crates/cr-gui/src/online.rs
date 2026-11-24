@@ -96,6 +96,7 @@ pub struct Preview {
 pub struct AiSession {
     pub id: i64,
     pub current: Metadata,
+    pub reader_format: Option<String>,
     pub excerpt: bool,
     pub history: Vec<Message>,
     pub suggestion: Option<Suggestion>,
@@ -420,15 +421,31 @@ impl CalibreApp {
     }
 
     pub fn open_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.screen != Screen::Library
-            || self.editing
-            || self.job.is_some()
-            || window.has_active_dialog(cx)
-        {
+        if self.editing || self.job.is_some() || window.has_active_dialog(cx) {
             return;
         }
-        let (Some(id), Some(current)) = (self.selected, self.metadata.clone()) else {
-            return;
+        let (id, current, reader_format) = match self.screen {
+            Screen::Library => {
+                let (Some(id), Some(current)) = (self.selected, self.metadata.clone()) else {
+                    return;
+                };
+                (id, current, None)
+            }
+            Screen::Reader => {
+                let Some((id, format)) = &self.reader_library_format else {
+                    return;
+                };
+                let Some(library) = &self.library else { return };
+                let current = match library.get_metadata(*id) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        self.announce(error.to_string(), Tone::Error, window, cx);
+                        return;
+                    }
+                };
+                (*id, current, Some(format.clone()))
+            }
+            _ => return,
         };
         set_input(&self.online.question, String::new(), window, cx);
         set_input(&self.online.chapter, String::new(), window, cx);
@@ -436,6 +453,7 @@ impl CalibreApp {
         self.online.ai = Some(AiSession {
             id,
             current,
+            reader_format,
             excerpt: false,
             history: Vec::new(),
             suggestion: None,
@@ -620,6 +638,7 @@ impl CalibreApp {
             );
         let root = library.root().to_path_buf();
         let (id, metadata) = (session.id, session.current.clone());
+        let reader_format = session.reader_format.clone();
         let history = session.history.clone();
         session.status = if task == BookTask::ReadingTime {
             "Counting words locally…"
@@ -662,7 +681,7 @@ impl CalibreApp {
             move |job| {
                 let needs_book = excerpt || task == BookTask::ReadingTime;
                 let text = needs_book
-                    .then(|| Library::open(&root)?.read_book(id, None))
+                    .then(|| Library::open(&root)?.read_book(id, reader_format.as_deref()))
                     .transpose()?;
                 job.check()?;
                 let context = BookContext::new(&metadata, text.as_ref().filter(|_| excerpt));
@@ -677,7 +696,7 @@ impl CalibreApp {
                     BookTask::Recap => {
                         let chapter = chapter
                             .ok_or_else(|| Error::Other("Enter a chapter number.".into()))?;
-                        let book = Library::open(&root)?.open_book(id, None)?;
+                        let book = Library::open(&root)?.open_book(id, reader_format.as_deref())?;
                         (
                             format!("Recap through chapter {chapter}"),
                             recap_reader_messages(&metadata, &book, chapter)?,

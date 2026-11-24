@@ -342,10 +342,16 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     };
     let busy = app.job.is_some();
     let muted = cx.theme().muted_foreground;
-    let header = format!(
-        "{} · {}",
-        session.current.title, app.settings.openrouter_model
-    );
+    let header = match &session.reader_format {
+        Some(format) => format!(
+            "{} · {format} · {}",
+            session.current.title, app.settings.openrouter_model
+        ),
+        None => format!(
+            "{} · {}",
+            session.current.title, app.settings.openrouter_model
+        ),
+    };
     let messages = session
         .history
         .iter()
