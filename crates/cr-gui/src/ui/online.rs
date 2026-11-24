@@ -870,9 +870,9 @@ pub fn ai_dialog(
     let mut cards = [suggestion, translation, local];
     let mut turns: Vec<AnyElement> = Vec::new();
     for index in 0..=session.history.len() {
-        for (slot, card) in cards.iter_mut().enumerate() {
+        for slot in session.card_order() {
             if session.card_at[slot].min(session.history.len()) == index {
-                turns.extend(card.take());
+                turns.extend(cards[slot].take());
             }
         }
         let Some(message) = session.history.get(index) else {

@@ -131,6 +131,8 @@ pub struct AiSession {
     /// How many chat messages precede each result card, so the conversation
     /// reads in the order things happened: suggestion, translation, action.
     pub card_at: [usize; 3],
+    /// When each card was last produced, to order cards at the same place.
+    pub card_seq: [u32; 3],
     pub scroll: ScrollHandle,
 }
 
@@ -196,6 +198,19 @@ impl AiSession {
         self.last_copyable = Some((AiCopySource::Chat, answer.clone()));
         self.history.push(Message::new(Role::User, question));
         self.history.push(Message::new(Role::Assistant, answer));
+    }
+
+    /// Puts a result card after everything shown so far.
+    pub fn place_card(&mut self, slot: usize) {
+        self.card_at[slot] = self.history.len();
+        self.card_seq[slot] = self.card_seq.iter().max().copied().unwrap_or(0) + 1;
+    }
+
+    /// The card slots in the order their cards were produced.
+    pub fn card_order(&self) -> [usize; 3] {
+        let mut order = [0, 1, 2];
+        order.sort_by_key(|slot| self.card_seq[*slot]);
+        order
     }
 
     pub fn clear_chat(&mut self) {
@@ -724,6 +739,7 @@ impl CalibreApp {
             local_result: String::new(),
             last_copyable: None,
             card_at: [0; 3],
+            card_seq: [0; 3],
             scroll: ScrollHandle::new(),
         });
         let weak = cx.entity().downgrade();
@@ -1255,7 +1271,7 @@ impl CalibreApp {
                 session.scroll.scroll_to_bottom();
                 match result {
                     Ok(AiReply::Suggestion(suggestion)) => {
-                        session.card_at[0] = session.history.len();
+                        session.place_card(0);
                         session.suggestion = Some(suggestion);
                     }
                     Ok(AiReply::Answer(prompt, answer, usage)) => {
@@ -1264,7 +1280,7 @@ impl CalibreApp {
                             let text = answer.text.trim().to_string();
                             session.last_copyable = (!text.is_empty())
                                 .then_some((AiCopySource::Translation, text.clone()));
-                            session.card_at[1] = session.history.len();
+                            session.place_card(1);
                             session.translation = Some((
                                 translate_lang.clone(),
                                 text,
@@ -1273,7 +1289,7 @@ impl CalibreApp {
                             return;
                         }
                         if task != BookTask::Chat {
-                            session.card_at[2] = session.history.len();
+                            session.place_card(2);
                             session.local_title = prompt;
                             session.local_result = answer.text;
                             session.last_copyable =
@@ -1284,7 +1300,7 @@ impl CalibreApp {
                         set_input(&app.online.question, String::new(), window, cx);
                     }
                     Ok(AiReply::Local(answer)) => {
-                        session.card_at[2] = session.history.len();
+                        session.place_card(2);
                         session.local_title = "Reading time".into();
                         session.local_result = answer;
                         session.last_copyable =
@@ -1410,6 +1426,7 @@ mod tests {
             local_result: String::new(),
             last_copyable: None,
             card_at: [0; 3],
+            card_seq: [0; 3],
             scroll: ScrollHandle::new(),
         }
     }
@@ -1430,6 +1447,19 @@ mod tests {
             &session.last_copyable,
             Some((AiCopySource::Chat, text)) if text == "a6"
         ));
+    }
+
+    #[core::prelude::v1::test]
+    fn cards_at_the_same_place_keep_the_order_they_were_produced() {
+        let mut session = session();
+        // A translation, then a suggestion, with no chat in between.
+        session.place_card(1);
+        session.place_card(0);
+        assert_eq!(session.card_at, [0; 3]);
+        assert_eq!(session.card_order(), [2, 1, 0]);
+        // Asking for the translation again moves it below the suggestion.
+        session.place_card(1);
+        assert_eq!(session.card_order(), [2, 0, 1]);
     }
 
     #[core::prelude::v1::test]
