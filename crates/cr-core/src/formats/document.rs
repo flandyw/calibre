@@ -268,6 +268,8 @@ fn map_tag(name: &str, split: Split) -> Option<&'static str> {
 struct Xhtml<'a> {
     split: Split,
     sections: Vec<Section>,
+    fb2_section_depth: usize,
+    fb2_chapter_starts: Vec<usize>,
     out: String,
     stack: Vec<&'static str>,
     /// The current section has text outside headings.
@@ -394,6 +396,24 @@ impl Xhtml<'_> {
     }
 
     fn tag(&mut self, tag: &str, name: &str) {
+        // FB2 indexes top-level sections together with their descendants.
+        // Record those boundaries while still rendering each nested section.
+        if self.split == Split::Fb2 {
+            if name == "section" && tag.starts_with('/') {
+                self.fb2_section_depth = self.fb2_section_depth.saturating_sub(1);
+            } else if !tag.starts_with('/') && matches!(name, "body" | "section") {
+                self.finish_section();
+                if name == "body" || self.fb2_section_depth == 0 {
+                    let start = self.sections.len();
+                    if self.fb2_chapter_starts.last() != Some(&start) {
+                        self.fb2_chapter_starts.push(start);
+                    }
+                }
+                if name == "section" && !tag.ends_with('/') {
+                    self.fb2_section_depth += 1;
+                }
+            }
+        }
         if let Some(closing) = tag.strip_prefix('/') {
             let _ = closing;
             let Some(mapped) = map_tag(name, self.split) else {
@@ -409,12 +429,7 @@ impl Xhtml<'_> {
             .filter(|id| !id.is_empty() && !id.contains(char::is_whitespace))
             .map(|id| (self.rename_id)(&id))
             .filter(|id| self.ids.insert(id.clone()));
-        let starts_section = match self.split {
-            Split::None | Split::Fb2Whole => false,
-            Split::Headings => matches!(name, "h1" | "h2") && self.has_text,
-            Split::Fb2 => name == "section" || name == "body",
-        };
-        if starts_section {
+        if self.split == Split::Headings && matches!(name, "h1" | "h2") && self.has_text {
             self.finish_section();
         }
         let Some(mapped) = map_tag(name, self.split) else {
@@ -510,7 +525,7 @@ fn external_link(href: &str) -> Option<String> {
     .then(|| href.to_string())
 }
 
-/// Convert markup to sections. Returns the stylesheet found in it.
+/// Convert markup to sections, keeping the stylesheet and FB2 chapter starts.
 fn sections_from_markup(
     markup: &str,
     split: Split,
@@ -518,10 +533,12 @@ fn sections_from_markup(
     rename_id: &dyn Fn(&str) -> String,
     image: &mut dyn FnMut(&str) -> Option<String>,
     link: &dyn Fn(&str) -> Option<String>,
-) -> (Vec<Section>, String) {
+) -> (Vec<Section>, String, Vec<usize>) {
     let mut xhtml = Xhtml {
         split,
         sections: Vec::new(),
+        fb2_section_depth: 0,
+        fb2_chapter_starts: Vec::new(),
         out: String::new(),
         stack: Vec::new(),
         has_text: false,
@@ -534,7 +551,7 @@ fn sections_from_markup(
     xhtml.run(markup);
     xhtml.finish_section();
     *ids = xhtml.ids;
-    (xhtml.sections, xhtml.css)
+    (xhtml.sections, xhtml.css, xhtml.fb2_chapter_starts)
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +567,11 @@ pub(super) struct ReadOptions {
 
 /// Read a book into the document model. Kindle books are read through
 /// their EPUB form by the caller.
-pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Document> {
+pub(super) fn read(
+    path: &Path,
+    format: &str,
+    options: ReadOptions,
+) -> Result<(Document, Option<Vec<usize>>)> {
     let mut metadata = super::import(path)?.metadata;
     let cover = metadata.cover.take();
     let mut document = Document {
@@ -563,10 +584,17 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
     } else {
         Split::None
     };
+    // By default each section starts a new chapter for text extraction.
+    let mut chapter_starts = None;
     match format {
         "EPUB" | "KEPUB" => read_epub(path, &mut document)?,
-        "HTML" => read_html(path, headings, &mut document)?,
-        "FB2" => read_fb2(path, options.split_chapters, &mut document)?,
+        "HTML" => {
+            read_html(path, headings, &mut document)?;
+            chapter_starts = Some(vec![0]);
+        }
+        "FB2" => {
+            chapter_starts = Some(read_fb2(path, options.split_chapters, &mut document)?);
+        }
         "DOCX" => read_docx(path, options.split_chapters, &mut document)?,
         "TXT" => {
             let content = txt::decode_bytes(&std::fs::read(path)?);
@@ -597,7 +625,7 @@ pub(super) fn read(path: &Path, format: &str, options: ReadOptions) -> Result<Do
             path.display()
         )));
     }
-    Ok(document)
+    Ok((document, chapter_starts))
 }
 
 /// Paragraphs of plain text: separated by blank lines, or one per line when
@@ -746,7 +774,7 @@ fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
                 .then(|| std::fs::read(file).ok())?
         })
     };
-    let (sections, css) = sections_from_markup(
+    let (sections, css, _) = sections_from_markup(
         &markup,
         split,
         &mut HashSet::new(),
@@ -761,7 +789,7 @@ fn read_html(path: &Path, split: Split, document: &mut Document) -> Result<()> {
     Ok(())
 }
 
-fn read_fb2(path: &Path, split: bool, document: &mut Document) -> Result<()> {
+fn read_fb2(path: &Path, split: bool, document: &mut Document) -> Result<Vec<usize>> {
     let data = std::fs::read(path)?;
     let root = xml::parse(&data)?;
     let binaries: HashMap<&str, &Node> = root
@@ -781,7 +809,7 @@ fn read_fb2(path: &Path, split: bool, document: &mut Document) -> Result<()> {
         })
     };
     let markup = decode_markup(&data);
-    let (sections, _) = sections_from_markup(
+    let (sections, _, chapter_starts) = sections_from_markup(
         &markup,
         if split { Split::Fb2 } else { Split::Fb2Whole },
         &mut HashSet::new(),
@@ -791,7 +819,7 @@ fn read_fb2(path: &Path, split: bool, document: &mut Document) -> Result<()> {
     );
     document.sections = sections;
     document.images = images.list;
-    Ok(())
+    Ok(chapter_starts)
 }
 
 const FONT_TYPES: [(&str, &str); 4] = [
@@ -1036,7 +1064,7 @@ fn read_epub(path: &Path, document: &mut Document) -> Result<()> {
             })
         };
         let rename = |id: &str| unique(id, number);
-        let (sections, css) =
+        let (sections, css, _) =
             sections_from_markup(markup, Split::None, &mut ids, &rename, &mut image, &link);
         document.css.push_str(&css);
         for mut section in sections {

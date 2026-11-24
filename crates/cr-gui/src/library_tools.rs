@@ -458,7 +458,7 @@ impl CalibreApp {
 
 /// Match indexed text against the reader's block layout. An indexed chapter
 /// and a reader section can have different boundaries.
-pub fn locate_text_hit(book: &Book, hit: &FtsHit, format: &str) -> Option<Locator> {
+pub fn locate_text_hit(book: &Book, hit: &FtsHit) -> Option<Locator> {
     let passage = hit.passage.as_ref()?;
     if passage.in_title {
         let title = normalize_text(&hit.chapter_title);
@@ -506,11 +506,14 @@ pub fn locate_text_hit(book: &Book, hit: &FtsHit, format: &str) -> Option<Locato
         suffix.insert(0, ' ');
     }
 
-    // Treat each block break as a space, just as the index does for
-    // whitespace in its chapter text. Retain the starts for navigation.
+    // Join blocks within an indexed chapter, retaining their start positions.
+    // A newline keeps phrases and their context from spanning chapters.
     let mut text = String::new();
     let mut starts = Vec::new();
     for (section, contents) in book.sections.iter().enumerate() {
+        if book.starts_text_chapter(section) && !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
         for (block, contents) in contents.blocks.iter().enumerate() {
             let line = normalize_text(&contents.text);
             if line.is_empty() {
@@ -528,11 +531,6 @@ pub fn locate_text_hit(book: &Book, hit: &FtsHit, format: &str) -> Option<Locato
                 },
             ));
             text.push_str(&line);
-        }
-        // A standalone HTML file is indexed as one chapter even if
-        // headings split it in the reader. Keep boundaries for other formats.
-        if format != "HTML" && !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
         }
     }
 
@@ -628,23 +626,35 @@ mod tests {
                 in_title: false,
             }),
         };
-        assert_eq!(locate_text_hit(&book, &hit, "EPUB").unwrap().section, 2);
-        let spanning_sections = FtsHit {
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 2);
+    }
+
+    #[core::prelude::v1::test]
+    fn html_phrase_can_span_a_section_heading() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("The bay.html");
+        std::fs::write(
+            &path,
+            "<p>The train came at dawn.</p><h2>A lighthouse</h2><p>stood in the bay.</p>",
+        )
+        .unwrap();
+        let book = Book::open(&path).unwrap();
+        assert_eq!(book.sections.len(), 2);
+        let hit = FtsHit {
+            book: 1,
+            title: "The bay".into(),
             chapter: 1,
-            chapter_title: "Chapter 2".into(),
-            snippet: "The train came at dawn. A [lighthouse] stood in the bay.".into(),
+            chapter_title: "The bay".into(),
+            snippet: "The train came at [dawn. A lighthouse] stood in the bay.".into(),
             passage: Some(FtsPassage {
-                before: "The train came at dawn. A ".into(),
-                ..hit.passage.clone().unwrap()
+                before: "The train came at ".into(),
+                matched: "dawn. A lighthouse".into(),
+                after: " stood in the bay.".into(),
+                in_title: false,
             }),
-            ..hit
         };
-        assert_eq!(
-            locate_text_hit(&book, &spanning_sections, "HTML")
-                .unwrap()
-                .section,
-            2
-        );
+        let target = locate_text_hit(&book, &hit).unwrap();
+        assert_eq!(book.block(target).unwrap().text, "The train came at dawn.");
     }
 
     #[core::prelude::v1::test]
@@ -675,7 +685,7 @@ mod tests {
                 in_title: false,
             }),
         };
-        let location = locate_text_hit(&book, &hit, "HTML").unwrap();
+        let location = locate_text_hit(&book, &hit).unwrap();
         assert_eq!((location.section, location.block), (1, 1));
     }
 
@@ -709,7 +719,7 @@ A silver lantern glowed.
         let title = &library.fts_search("title:lantern", 1).unwrap()[0];
         assert!(title.passage.as_ref().unwrap().in_title);
         assert_eq!(
-            locate_text_hit(&book, title, "TXT"),
+            locate_text_hit(&book, title),
             Some(Locator {
                 section: 1,
                 ..Default::default()
@@ -719,7 +729,7 @@ A silver lantern glowed.
         let word = &library.fts_search("text:windows", 1).unwrap()[0];
         assert!(word.snippet.contains("[Editor’s note]"));
         assert_eq!(word.passage.as_ref().unwrap().matched, "windows");
-        let target = locate_text_hit(&book, word, "TXT").unwrap();
+        let target = locate_text_hit(&book, word).unwrap();
         assert_eq!(
             book.block(target).unwrap().text,
             "The wind rattled the windows."
@@ -727,14 +737,14 @@ A silver lantern glowed.
 
         let phrase = &library.fts_search(r#""silver moon""#, 1).unwrap()[0];
         assert_eq!(phrase.passage.as_ref().unwrap().matched, "silver moon");
-        let target = locate_text_hit(&book, phrase, "TXT").unwrap();
+        let target = locate_text_hit(&book, phrase).unwrap();
         assert_eq!(
             book.block(target).unwrap().text,
             "The sailor watched the silver"
         );
 
         let repeated = &library.fts_search("silver AND moon", 1).unwrap()[0];
-        let target = locate_text_hit(&book, repeated, "TXT").unwrap();
+        let target = locate_text_hit(&book, repeated).unwrap();
         assert_eq!(
             book.block(target).unwrap().text,
             "The sailor watched the silver"
@@ -774,7 +784,7 @@ A silver lantern glowed.
                 in_title: true,
             }),
         };
-        assert_eq!(locate_text_hit(&book, &hit, "EPUB").unwrap().section, 1);
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 1);
     }
 
     #[core::prelude::v1::test]
@@ -809,9 +819,40 @@ A silver lantern glowed.
                 in_title: false,
             }),
         };
-        assert_eq!(locate_text_hit(&book, &hit, "EPUB").unwrap().section, 2);
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 2);
         book.sections.truncate(2);
-        assert!(locate_text_hit(&book, &hit, "EPUB").is_none());
-        assert_eq!(locate_text_hit(&book, &hit, "HTML").unwrap().section, 0);
+        assert!(locate_text_hit(&book, &hit).is_none());
+    }
+
+    #[core::prelude::v1::test]
+    fn indexed_fb2_phrase_can_span_nested_sections_within_one_chapter() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut library = Library::create(&directory.path().join("Library")).unwrap();
+        let path = directory.path().join("The crossing.fb2");
+        std::fs::write(
+            &path,
+            r#"<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0">
+                <body>
+                    <section><title><p>Arrival</p></title><p>The sailor watched the silver</p></section>
+                    <section><p>moon rise.</p></section>
+                    <section><title><p>Arrival</p></title><p>The sailor watched the silver</p>
+                        <section><p>moon rise.</p></section>
+                    </section>
+                </body>
+            </FictionBook>"#,
+        )
+        .unwrap();
+        let id = library.add_book(&path).unwrap().id;
+        let book = library.open_book(id, None).unwrap();
+        library.fts_index(&JobContext::detached()).unwrap();
+        let hits = library.fts_search(r#"text:"silver moon""#, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].chapter, 3);
+        let target = locate_text_hit(&book, &hits[0]).unwrap();
+        assert_eq!(target.section, book.sections.len() - 2);
+        assert_eq!(
+            book.block(target).unwrap().text,
+            "The sailor watched the silver"
+        );
     }
 }

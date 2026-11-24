@@ -126,6 +126,9 @@ pub struct Book {
     pub images: Vec<Image>,
     pub fonts: Vec<BookFont>,
     anchors: HashMap<String, Locator>,
+    /// Section indices that start new text extraction chapters. By default
+    /// each section is its own chapter.
+    text_chapter_starts: Option<Vec<usize>>,
     /// Text length before each section, and the total as the last item.
     lengths: Vec<usize>,
 }
@@ -694,7 +697,18 @@ impl Book {
 
     /// Open a book file of any format that can be converted.
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self::from_document(super::read_document(path, true)?))
+        let (document, chapter_starts) =
+            super::conversion::read_document_with_chapter_starts(path, true)?;
+        let mut book = Self::from_document(document);
+        book.text_chapter_starts = chapter_starts;
+        Ok(book)
+    }
+
+    /// Whether text extraction separates this section from the preceding one.
+    pub fn starts_text_chapter(&self, section: usize) -> bool {
+        self.text_chapter_starts
+            .as_ref()
+            .is_none_or(|starts| starts.binary_search(&section).is_ok())
     }
 
     pub fn block(&self, locator: Locator) -> Option<&Block> {
