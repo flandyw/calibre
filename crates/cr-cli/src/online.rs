@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
-use cr_core::ai::{BookContext, Message, OpenRouter, Role, DEFAULT_MODEL};
+use cr_core::ai::{
+    apple, AiClient, AiConfig, BookContext, Message, Provider as AiProvider, Role,
+    DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_URL, DEFAULT_MODEL,
+};
 use cr_core::online_metadata::{Catalog, Field, Query, Source};
 use cr_core::{BookUpdate, Library};
 use serde_json::json;
@@ -14,33 +17,63 @@ pub(crate) fn terminal_text(text: &str) -> String {
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAiProvider {
+    Auto,
+    AppleIntelligence,
+    Openrouter,
+    LocalServer,
+}
+
+impl From<CliAiProvider> for AiProvider {
+    fn from(value: CliAiProvider) -> Self {
+        match value {
+            CliAiProvider::Auto => Self::Auto,
+            CliAiProvider::AppleIntelligence => Self::AppleIntelligence,
+            CliAiProvider::Openrouter => Self::OpenRouter,
+            CliAiProvider::LocalServer => Self::LocalServer,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct AiArgs {
+    /// AI provider to use (auto prefers Apple Intelligence on Mac when available)
+    #[arg(long, global = true, value_enum, env = "CR_AI_PROVIDER", default_value = "auto")]
+    provider: CliAiProvider,
     /// OpenRouter model ID
     #[arg(long, global = true, env = "OPENROUTER_MODEL", default_value = DEFAULT_MODEL)]
     model: String,
+    /// Local OpenAI-compatible server URL (Ollama, LM Studio, etc.)
+    #[arg(long, global = true, env = "CR_AI_LOCAL_URL", default_value = DEFAULT_LOCAL_URL)]
+    local_url: String,
+    /// Local server model ID
+    #[arg(long, global = true, env = "CR_AI_LOCAL_MODEL", default_value = DEFAULT_LOCAL_MODEL)]
+    local_model: String,
     #[command(subcommand)]
     command: AiCommand,
 }
 
 #[derive(Debug, Subcommand)]
 enum AiCommand {
-    /// List available OpenRouter models
+    /// Show active AI provider, privacy mode, and Apple Intelligence availability
+    Status,
+    /// List available models from the active provider
     Models,
-    /// Verify OPENROUTER_API_KEY without sending book data
+    /// Verify the active AI provider without sending book data
     Test,
     /// Ask a question using a book's metadata
     Ask {
         id: i64,
         question: Vec<String>,
-        /// Also send up to 12,000 characters from the book's opening
+        /// Also send an excerpt from the book's opening
         #[arg(long)]
         excerpt: bool,
     },
     /// Preview a generated book description and tags
     Suggest {
         id: i64,
-        /// Also send up to 12,000 characters from the book's opening
+        /// Also send an excerpt from the book's opening
         #[arg(long)]
         excerpt: bool,
         /// Apply these generated fields without another confirmation
@@ -60,8 +93,41 @@ enum AiField {
 }
 
 pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
-    let client = OpenRouter::new(None, &args.model);
+    let config = AiConfig {
+        provider: args.provider.into(),
+        openrouter_key: None,
+        openrouter_model: args.model.clone(),
+        local_url: args.local_url.clone(),
+        local_key: std::env::var("CR_AI_LOCAL_API_KEY").ok(),
+        local_model: args.local_model.clone(),
+    };
+    let client = AiClient::new(config);
     match args.command {
+        AiCommand::Status => {
+            let apple_status = apple::availability();
+            let resolved = client.resolved_provider();
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "active_provider": resolved.label(),
+                        "active_model": client.active_model(),
+                        "on_device": client.is_on_device(),
+                        "privacy": client.privacy_note(),
+                        "apple_intelligence": {
+                            "available": apple_status.is_available(),
+                            "summary": apple_status.summary(),
+                        },
+                        "local_url": args.local_url,
+                        "local_model": args.local_model,
+                    }))?
+                );
+            } else {
+                println!("Active provider: {}", client.active_label());
+                println!("Privacy: {}", client.privacy_note());
+                println!("Apple Intelligence: {}", apple_status.summary());
+            }
+        }
         AiCommand::Models => {
             let models = client.models()?;
             if json_output {
@@ -77,11 +143,14 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
             }
         }
         AiCommand::Test => {
-            client.test_connection()?;
+            let summary = client.test_connection()?;
             if json_output {
-                println!("{}", json!({"connected": true}));
+                println!(
+                    "{}",
+                    json!({"connected": true, "provider": client.provider_name(), "summary": summary})
+                );
             } else {
-                println!("OpenRouter API key verified.");
+                println!("{summary}");
             }
         }
         AiCommand::Ask {
@@ -94,7 +163,7 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
                 bail!("enter a question");
             }
             let library = Library::open(path)?;
-            let context = context(&library, id, excerpt)?;
+            let context = context(&library, id, excerpt, client.context_budget().excerpt_chars)?;
             let answer = client.chat_stream(
                 &[context.system_message(), Message::new(Role::User, question)],
                 |text| {
@@ -108,7 +177,7 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
             if json_output {
                 println!(
                     "{}",
-                    json!({"id": id, "answer": answer.text, "model": answer.model, "usage": answer.usage})
+                    json!({"id": id, "answer": answer.text, "model": answer.model, "usage": answer.usage, "provider": client.provider_name()})
                 );
             } else {
                 println!();
@@ -122,7 +191,8 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
         }
         AiCommand::Suggest { id, excerpt, apply } => {
             let mut library = Library::open(path)?;
-            let suggestion = client.suggest(&context(&library, id, excerpt)?)?;
+            let suggestion =
+                client.suggest(&context(&library, id, excerpt, client.context_budget().excerpt_chars)?)?;
             let mut update = BookUpdate::default();
             for field in apply {
                 match field {
@@ -142,7 +212,7 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
             if json_output {
                 println!(
                     "{}",
-                    json!({"id": id, "suggestion": suggestion, "applied": applied})
+                    json!({"id": id, "suggestion": suggestion, "applied": applied, "provider": client.provider_name()})
                 );
             } else {
                 println!(
@@ -161,10 +231,10 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
     Ok(())
 }
 
-fn context(library: &Library, id: i64, excerpt: bool) -> Result<BookContext> {
+fn context(library: &Library, id: i64, excerpt: bool, limit: usize) -> Result<BookContext> {
     let metadata = library.get_metadata(id)?;
     let text = excerpt.then(|| library.read_book(id, None)).transpose()?;
-    Ok(BookContext::new(&metadata, text.as_ref()))
+    Ok(BookContext::new_with_budget(&metadata, text.as_ref(), limit))
 }
 
 #[cfg(test)]
