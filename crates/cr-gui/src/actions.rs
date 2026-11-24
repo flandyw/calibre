@@ -118,6 +118,7 @@ pub enum FormatCommand {
     Open,
     Reveal,
     CopyPath,
+    SaveCopy,
     Remove,
 }
 

@@ -298,7 +298,7 @@ default (`--no-replace` to keep it separate). This is the beginning of the
 - choose whether imports with matching titles and authors merge, keep both
   records, or skip the duplicate;
 - attach formats to an existing book, or use the Formats row to read, edit,
-  reveal, or remove individual formats;
+  reveal, save a copy, or remove individual formats;
 - export the selected books, or the current filtered library, to a folder
   picker, with configurable folder layout, collision handling, and sidecars;
 - a basic EPUB source editor: unpack, edit XHTML/CSS/OPF files, save changes

@@ -269,6 +269,11 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         .menu("Open in Default App", action(FormatCommand::Open))
                         .menu(reveal_label(), action(FormatCommand::Reveal))
                         .menu("Copy File Path", action(FormatCommand::CopyPath))
+                        .menu_with_disabled(
+                            "Save a Copy…",
+                            this.job.is_some(),
+                            action(FormatCommand::SaveCopy),
+                        )
                         .separator()
                         .menu_with_disabled(
                             "Edit This Format…",

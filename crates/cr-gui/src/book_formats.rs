@@ -1,12 +1,12 @@
 //! File-level actions scoped to a single format of the selected book.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cr_core::{jobs, library::Library};
 use gpui_kit::*;
 
 use crate::actions::{BookFormatAction, FormatCommand};
-use crate::app::{display_name, CalibreApp, Screen, Tone};
+use crate::app::{default_library_path, display_name, CalibreApp, Screen, Tone};
 use crate::files;
 
 impl CalibreApp {
@@ -25,7 +25,10 @@ impl CalibreApp {
             FormatCommand::Read => self.read_library_book(id, Some(format), None, window, cx),
             FormatCommand::Edit => self.begin_edit_format(Some(format), window, cx),
             FormatCommand::Remove => self.prompt_remove_format(id, format.clone(), window, cx),
-            FormatCommand::Open | FormatCommand::Reveal | FormatCommand::CopyPath => {
+            FormatCommand::Open
+            | FormatCommand::Reveal
+            | FormatCommand::CopyPath
+            | FormatCommand::SaveCopy => {
                 let path = self
                     .library
                     .as_ref()
@@ -43,6 +46,7 @@ impl CalibreApp {
                 match command {
                     FormatCommand::Open => cx.open_with_system(&path),
                     FormatCommand::Reveal => cx.reveal_path(&path),
+                    FormatCommand::SaveCopy => self.prompt_save_format_copy(path, window, cx),
                     FormatCommand::CopyPath => {
                         cx.write_to_clipboard(ClipboardItem::new_string(
                             path.display().to_string(),
@@ -54,6 +58,78 @@ impl CalibreApp {
                 }
             }
         }
+    }
+
+    fn prompt_save_format_copy(
+        &mut self,
+        source: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.job.is_some() {
+            return;
+        }
+        let default = default_library_path();
+        let home = default.parent().unwrap_or_else(|| Path::new("."));
+        let receiver = cx.prompt_for_new_path(home, Some(&display_name(&source)));
+        cx.spawn_in(window, async move |app, cx| {
+            let Ok(Ok(Some(mut destination))) = receiver.await else {
+                return;
+            };
+            let replace = destination.extension().is_some();
+            if !replace {
+                if let Some(extension) = source.extension() {
+                    destination.set_extension(extension);
+                }
+            }
+            let _ = app.update_in(cx, |app, window, cx| {
+                app.run_job(
+                    "Saving format copy",
+                    window,
+                    cx,
+                    move |context| {
+                        if source.canonicalize()?
+                            == destination
+                                .canonicalize()
+                                .unwrap_or_else(|_| destination.clone())
+                        {
+                            return Err(cr_core::Error::Other(
+                                "Choose a different location for the copy.".into(),
+                            ));
+                        }
+                        let mut input = std::fs::File::open(source)?;
+                        files::write_atomic(&destination, replace, context, |output| {
+                            std::io::copy(&mut input, output)?;
+                            Ok(())
+                        })?;
+                        Ok(destination)
+                    },
+                    |app, result, window, cx| match result {
+                        Ok(destination) => {
+                            app.announce(
+                                format!("Saved {}.", display_name(&destination)),
+                                Tone::Success,
+                                window,
+                                cx,
+                            );
+                            if app.settings.reveal_export {
+                                cx.reveal_path(&destination);
+                            }
+                        }
+                        Err(cr_core::Error::Cancelled) => {
+                            app.announce("Saving a copy cancelled.", Tone::Info, window, cx);
+                        }
+                        Err(err) => app.announce(
+                            format!("Could not save the copy: {err}"),
+                            Tone::Error,
+                            window,
+                            cx,
+                        ),
+                    },
+                );
+            });
+        })
+        .detach();
     }
 
     pub fn prompt_attach_formats(&mut self, window: &mut Window, cx: &mut Context<Self>) {
