@@ -163,7 +163,11 @@ pub fn recap_reader_messages(
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let start = entry.target;
+            let start = if index == 0 {
+                Default::default()
+            } else {
+                entry.target
+            };
             let end = book.toc.get(index + 1).map(|next| next.target);
             let mut text = String::new();
             let last_section =
@@ -874,6 +878,30 @@ mod tests {
             estimate(format!("{}{}", "word ".repeat(230), "字".repeat(500))),
             2
         );
+    }
+
+    #[test]
+    fn reader_recap_includes_unlisted_text_before_the_first_contents_anchor() {
+        use crate::formats::document::{Document, Section, TocItem};
+
+        let metadata = Metadata::new("Book");
+        let reader = Book::from_document(Document {
+            sections: vec![
+                Section { title: "Prologue".into(), html: "<p>An unlisted prologue</p>".into() },
+                Section { title: "Main text".into(), html: r#"<p>Before the anchor</p><h1 id="one">Opening</h1><p>The opening</p><h1 id="two">Twist</h1><p>A later spoiler</p>"#.into() },
+            ],
+            toc: vec![
+                TocItem { title: "Opening".into(), level: 1, anchor: "one".into() },
+                TocItem { title: "Twist".into(), level: 1, anchor: "two".into() },
+            ],
+            ..Document::default()
+        });
+        let messages = recap_reader_messages(&metadata, &reader, 1).unwrap();
+        let excerpts = &messages[1].content;
+        assert!(excerpts.contains("An unlisted prologue"));
+        assert!(excerpts.contains("Before the anchor"));
+        assert!(excerpts.contains("The opening"));
+        assert!(!excerpts.contains("A later spoiler"));
     }
 
     #[test]
