@@ -171,10 +171,11 @@ pub fn launch(args: impl IntoIterator<Item = OsString>) -> Result<Launch, String
 }
 
 fn launch_path(arg: OsString) -> Result<PathBuf, String> {
-    match arg.to_str() {
-        Some(arg) => path_from_url(arg).ok_or_else(|| format!("Expected a local path: {arg}")),
-        None => Ok(PathBuf::from(arg)),
-    }
+    let path = match arg.to_str() {
+        Some(arg) => path_from_url(arg).ok_or_else(|| format!("Expected a local path: {arg}"))?,
+        None => PathBuf::from(arg),
+    };
+    std::path::absolute(&path).map_err(|err| format!("Could not resolve {}: {err}", path.display()))
 }
 
 pub fn write_atomic(
@@ -237,13 +238,18 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn launch_accepts_filenames_after_separator_and_exclusive_actions() {
+        let cwd = std::env::current_dir().unwrap();
         assert_eq!(
             launch(["--", "--preferences", "some book.epub"].map(OsString::from)).unwrap(),
-            Launch::Paths(vec!["--preferences".into(), "some book.epub".into()])
+            Launch::Paths(vec![cwd.join("--preferences"), cwd.join("some book.epub")])
         );
         assert_eq!(
             launch(["--read", "some book.epub"].map(OsString::from)).unwrap(),
-            Launch::Read("some book.epub".into())
+            Launch::Read(cwd.join("some book.epub"))
+        );
+        assert_eq!(
+            launch(["./My Library/metadata.db"].map(OsString::from)).unwrap(),
+            Launch::Paths(vec![cwd.join("My Library").join("metadata.db")])
         );
         assert!(launch(["--read"].map(OsString::from)).is_err());
         assert!(launch(["--preferences", "book.epub"].map(OsString::from)).is_err());
