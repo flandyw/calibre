@@ -180,8 +180,10 @@ fn launch_path(arg: OsString) -> Result<PathBuf, String> {
 pub fn write_atomic(
     output: &Path,
     replace: bool,
+    context: &cr_core::jobs::JobContext,
     write: impl FnOnce(&mut File) -> cr_core::Result<()>,
 ) -> cr_core::Result<()> {
+    context.check()?;
     let parent = output
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -189,6 +191,7 @@ pub fn write_atomic(
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     write(file.as_file_mut())?;
     file.as_file().sync_all()?;
+    context.check()?;
     if replace {
         file.persist(output)
     } else {
@@ -268,17 +271,47 @@ mod tests {
     fn failed_write_preserves_an_existing_export() {
         use std::io::Write as _;
 
+        let context = cr_core::jobs::JobContext::detached();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("book.epub");
         std::fs::write(&path, b"existing book").unwrap();
-        let result = write_atomic(&path, true, |file| {
+        let result = write_atomic(&path, true, &context, |file| {
             file.write_all(b"partial copy")?;
             Err(cr_core::Error::Other("interrupted".into()))
         });
         assert!(result.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"existing book");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-        assert!(write_atomic(&path, false, |file| Ok(file.write_all(b"new")?)).is_err());
+        assert!(write_atomic(&path, false, &context, |file| Ok(file.write_all(b"new")?)).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"existing book");
+    }
+
+    #[core::prelude::v1::test]
+    fn cancelling_during_a_write_leaves_the_destination_untouched() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("catalog.csv");
+        std::fs::write(&destination, b"original").unwrap();
+        let target = destination.clone();
+        let (written, staged) = std::sync::mpsc::channel();
+        let (resume, proceed) = std::sync::mpsc::channel();
+        let job = cr_core::jobs::spawn("Export test", move |context| {
+            write_atomic(&target, true, context, |file| {
+                file.write_all(b"new catalog")?;
+                written.send(()).unwrap();
+                proceed.recv().unwrap();
+                Ok(())
+            })
+        })
+        .unwrap();
+        staged
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        job.cancel();
+        resume.send(()).unwrap();
+        assert!(matches!(job.join(), Err(cr_core::Error::Cancelled)));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

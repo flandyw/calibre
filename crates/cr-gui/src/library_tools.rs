@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use cr_core::formats::reading::{Book, Locator};
+use cr_core::jobs::JobContext;
 use cr_core::library::{AddOutcome, CatalogFormat, FtsHit, FtsReport, Library};
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
@@ -131,8 +132,15 @@ impl CalibreApp {
                     "Exporting library catalog",
                     window,
                     cx,
-                    move |_| {
-                        write_catalog(&Library::open(&root)?, &query, extension, &output, replace)?;
+                    move |context| {
+                        write_catalog(
+                            &Library::open(&root)?,
+                            &query,
+                            extension,
+                            &output,
+                            replace,
+                            context,
+                        )?;
                         Ok(output)
                     },
                     |app, result, window, cx| match result {
@@ -144,6 +152,9 @@ impl CalibreApp {
                                 cx,
                             );
                             app.library_tools.catalog_output = Some(output);
+                        }
+                        Err(cr_core::Error::Cancelled) => {
+                            app.announce("Catalog export cancelled.", Tone::Info, window, cx);
                         }
                         Err(err) => app.announce(
                             format!("Could not export the catalog: {err}"),
@@ -519,8 +530,9 @@ fn write_catalog(
     extension: &str,
     output: &Path,
     replace: bool,
+    context: &JobContext,
 ) -> cr_core::Result<()> {
-    crate::files::write_atomic(output, replace, |file| {
+    crate::files::write_atomic(output, replace, context, |file| {
         if extension == "epub" {
             library.catalog_epub(query, file)?;
         } else {
