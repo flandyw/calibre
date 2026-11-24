@@ -774,6 +774,18 @@ impl CalibreApp {
             window,
             cx,
         );
+        set_input(
+            &self.online.local_url,
+            self.settings.ai_local_url.clone(),
+            window,
+            cx,
+        );
+        set_input(
+            &self.online.local_model,
+            self.settings.ai_local_model.clone(),
+            window,
+            cx,
+        );
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -815,7 +827,20 @@ impl CalibreApp {
                         window,
                         cx,
                     );
+                    set_input(
+                        &this.online.local_url,
+                        this.settings.ai_local_url.clone(),
+                        window,
+                        cx,
+                    );
+                    set_input(
+                        &this.online.local_model,
+                        this.settings.ai_local_model.clone(),
+                        window,
+                        cx,
+                    );
                     set_input(&this.online.key, String::new(), window, cx);
+                    set_input(&this.online.local_key, String::new(), window, cx);
                     this.apply_theme(window, cx);
                     this.reload();
                     this.save_settings(true);

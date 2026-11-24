@@ -3,9 +3,9 @@ use std::path::Path;
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use cr_core::ai::{
-    reading_minutes, recap_reader_messages, BookAction, BookContext, CatalogContext, CleanupField,
-    LibraryAnswer, Message, OpenRouter, Role, CLEANUP_LIMIT, READING_CJK_CHARS_PER_MINUTE,
-    READING_WORDS_PER_MINUTE,
+    reading_minutes, recap_reader_messages_with_budget, AiClient, BookAction, BookContext,
+    CatalogContext, CleanupField, LibraryAnswer, Message, Role, CLEANUP_LIMIT,
+    READING_CJK_CHARS_PER_MINUTE, READING_WORDS_PER_MINUTE,
 };
 use cr_core::{Library, ListOptions};
 use serde_json::json;
@@ -52,7 +52,7 @@ enum LibraryCommand {
     },
 }
 
-pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: bool) -> Result<()> {
+pub fn library(args: LibraryArgs, client: &AiClient, path: &Path, machine: bool) -> Result<()> {
     let library = Library::open(path)?;
     match args.command {
         LibraryCommand::Search { request, run } => {
@@ -87,9 +87,15 @@ pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: boo
         }
         LibraryCommand::Ask { question } => {
             let books = library.list_books(&ListOptions::default())?;
-            let catalog = CatalogContext::new(&books, &[], None);
-            let answer =
-                client.librarian(&catalog, &[Message::new(Role::User, question.join(" "))])?;
+            let query = question.join(" ");
+            let catalog = CatalogContext::for_request(
+                &books,
+                &[],
+                None,
+                &query,
+                client.context_budget(),
+            );
+            let answer = client.librarian(&catalog, &[Message::new(Role::User, query)])?;
             print_answer(&catalog, answer, machine)?;
         }
         LibraryCommand::Next { book, preference } => {
@@ -97,20 +103,30 @@ pub fn library(args: LibraryArgs, client: &OpenRouter, path: &Path, machine: boo
                 library.get_summary(id)?;
             }
             let books = library.list_books(&ListOptions::default())?;
-            let catalog = CatalogContext::new(&books, &library.recent_read_ids(12)?, book);
-            print_answer(
-                &catalog,
-                client.recommend(&catalog, &preference.join(" "))?,
-                machine,
-            )?;
+            let pref = preference.join(" ");
+            let catalog = CatalogContext::for_request(
+                &books,
+                &library.recent_read_ids(12)?,
+                book,
+                &pref,
+                client.context_budget(),
+            );
+            print_answer(&catalog, client.recommend(&catalog, &pref)?, machine)?;
         }
         LibraryCommand::Shelves { filter, idea } => {
             let books = library.list_books(&ListOptions {
                 query: filter,
                 ..Default::default()
             })?;
-            let catalog = CatalogContext::new(&books, &[], None);
-            let shelves = client.shelves(&catalog, &idea.join(" "))?;
+            let idea_text = idea.join(" ");
+            let catalog = CatalogContext::for_request(
+                &books,
+                &[],
+                None,
+                &idea_text,
+                client.context_budget(),
+            );
+            let shelves = client.shelves(&catalog, &idea_text)?;
             let rows = shelves
                 .iter()
                 .map(|shelf| json!({"shelf": shelf, "query": shelf.query()}))
@@ -208,8 +224,9 @@ enum BookCommand {
     ReadingTime { id: i64 },
 }
 
-pub fn book(args: BookArgs, client: &OpenRouter, path: &Path, machine: bool) -> Result<()> {
+pub fn book(args: BookArgs, client: &AiClient, path: &Path, machine: bool) -> Result<()> {
     let library = Library::open(path)?;
+    let limit = client.context_budget().excerpt_chars;
     let messages = match args.command {
         BookCommand::ReadingTime { id } => {
             let minutes = reading_minutes(&library.read_book(id, None)?);
@@ -223,19 +240,20 @@ pub fn book(args: BookArgs, client: &OpenRouter, path: &Path, machine: bool) -> 
             }
             return Ok(());
         }
-        BookCommand::Recap { id, through } => recap_reader_messages(
+        BookCommand::Recap { id, through } => recap_reader_messages_with_budget(
             &library.get_metadata(id)?,
             &library.open_book(id, None)?,
             through,
+            limit,
         )?,
         BookCommand::Characters { id, excerpt } => {
-            action_messages(&library, id, BookAction::Characters, excerpt)?
+            action_messages(&library, id, BookAction::Characters, excerpt, limit)?
         }
         BookCommand::Discussion { id, excerpt } => {
-            action_messages(&library, id, BookAction::Discussion, excerpt)?
+            action_messages(&library, id, BookAction::Discussion, excerpt, limit)?
         }
         BookCommand::Translate { id, language } => {
-            action_messages(&library, id, BookAction::Translate(&language), false)?
+            action_messages(&library, id, BookAction::Translate(&language), false, limit)?
         }
     };
     let reply = client.chat_stream(&messages, |_| Ok(()))?;
@@ -258,6 +276,7 @@ fn action_messages(
     id: i64,
     action: BookAction<'_>,
     excerpt: bool,
+    limit: usize,
 ) -> Result<Vec<Message>> {
     let metadata = library.get_metadata(id)?;
     if let BookAction::Translate(language) = action {
@@ -266,7 +285,7 @@ fn action_messages(
         }
     }
     let text = excerpt.then(|| library.read_book(id, None)).transpose()?;
-    let context = BookContext::new(&metadata, text.as_ref());
+    let context = BookContext::new_with_budget(&metadata, text.as_ref(), limit);
     Ok(vec![
         context.system_message(),
         Message::new(Role::User, action.prompt()),

@@ -4,7 +4,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Message, OpenRouter, Role, EXCERPT_LIMIT};
+use super::{extract_json_object, AiClient, ContextBudget, Message, Role, EXCERPT_LIMIT};
 use crate::formats::html::html_to_text;
 use crate::formats::reading::{BlockKind, Book};
 use crate::{text, BookSummary, BookText, BookUpdate, Error, Library, Metadata, Result};
@@ -97,6 +97,15 @@ impl PromptPreset {
 }
 
 pub fn recap_messages(book: &Metadata, text: &BookText, chapter: usize) -> Result<Vec<Message>> {
+    recap_messages_with_budget(book, text, chapter, EXCERPT_LIMIT)
+}
+
+pub fn recap_messages_with_budget(
+    book: &Metadata,
+    text: &BookText,
+    chapter: usize,
+    limit: usize,
+) -> Result<Vec<Message>> {
     if chapter == 0 || chapter > text.chapters.len() {
         return Err(Error::Other(format!(
             "Choose a chapter from 1 to {}",
@@ -112,7 +121,7 @@ pub fn recap_messages(book: &Metadata, text: &BookText, chapter: usize) -> Resul
             sample * (chapter - 1) / (samples - 1)
         };
         let item = &text.chapters[index];
-        let budget = EXCERPT_LIMIT / samples;
+        let budget = limit / samples;
         let mut passage: String = item.text.chars().take(budget / 2).collect();
         let tail: Vec<_> = item.text.chars().rev().take(budget / 2).collect();
         if item.text.chars().take(budget + 1).count() > budget {
@@ -136,12 +145,23 @@ pub enum BookAction<'a> {
     Characters,
     Discussion,
     Translate(&'a str),
+    ExplainPassage,
+    SummarizeChapter,
 }
 
 pub fn recap_reader_messages(
     metadata: &Metadata,
     book: &Book,
     chapter: usize,
+) -> Result<Vec<Message>> {
+    recap_reader_messages_with_budget(metadata, book, chapter, EXCERPT_LIMIT)
+}
+
+pub fn recap_reader_messages_with_budget(
+    metadata: &Metadata,
+    book: &Book,
+    chapter: usize,
+    limit: usize,
 ) -> Result<Vec<Message>> {
     if chapter == 0 || chapter > book.toc.len() {
         return Err(Error::Other(format!(
@@ -210,7 +230,36 @@ pub fn recap_reader_messages(
                 .into(),
         ));
     }
-    recap_messages(metadata, &BookText { chapters }, chapter)
+    recap_messages_with_budget(metadata, &BookText { chapters }, chapter, limit)
+}
+
+/// Plain text of the reader's contents entry `index` (0-based), bounded to `limit` characters.
+pub fn reader_chapter_text(book: &Book, index: usize, limit: usize) -> Option<(String, String)> {
+    let entry = book.toc.get(index)?;
+    let start = entry.target;
+    let end = book.toc.get(index + 1).map(|next| next.target);
+    let mut text = String::new();
+    'outer: for (section, content) in book.sections.iter().enumerate().skip(start.section) {
+        if end.is_some_and(|end| section > end.section) {
+            break;
+        }
+        let first = if section == start.section { start.block } else { 0 };
+        let last = end
+            .filter(|end| end.section == section)
+            .map_or(content.blocks.len(), |end| end.block);
+        for block in content.blocks.iter().take(last).skip(first) {
+            if matches!(block.kind, BlockKind::Image(_) | BlockKind::Rule) {
+                continue;
+            }
+            text.push_str(&block.text);
+            text.push('\n');
+            if text.len() >= limit * 4 {
+                break 'outer;
+            }
+        }
+    }
+    let text: String = text.trim().chars().take(limit).collect();
+    (!text.is_empty()).then(|| (entry.title.clone(), text))
 }
 
 impl BookAction<'_> {
@@ -219,6 +268,18 @@ impl BookAction<'_> {
             Self::Characters => "Make a spoiler-light character guide. List only characters supported by the provided context; describe their roles without revealing twists or outcomes.".into(),
             Self::Discussion => "Write six thoughtful book-club questions. Mix themes, craft, and interpretation. Avoid spoilers and state when the available context is limited.".into(),
             Self::Translate(language) => format!("Translate the existing description into {}. Preserve meaning and leave names intact. Return only the translation in plain text, without markdown.", bounded(language, 60)),
+            Self::ExplainPassage => "Explain the selected passage for a reader who is partway through the book: clarify meaning, references, unusual words and why it matters in the current chapter. Use only the provided context and do not reveal later events.".into(),
+            Self::SummarizeChapter => "Summarize the current chapter in a few short bullet points: key events, characters involved and open questions. Use only the chapter excerpt and do not reveal later events.".into(),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Characters => "Character guide".into(),
+            Self::Discussion => "Discussion questions".into(),
+            Self::Translate(language) => format!("Description in {}", bounded(language, 60)),
+            Self::ExplainPassage => "Passage explained".into(),
+            Self::SummarizeChapter => "Chapter summary".into(),
         }
     }
 }
@@ -236,16 +297,60 @@ impl CatalogContext {
         Self::with_author_limit(books, recent, seed, 4)
     }
 
+    /// Builds a catalog sized for the active provider, preferring books that
+    /// share words with `query` so small on-device context windows stay relevant.
+    pub fn for_request(
+        books: &[BookSummary],
+        recent: &[i64],
+        seed: Option<i64>,
+        query: &str,
+        budget: ContextBudget,
+    ) -> Self {
+        Self::build(books, recent, seed, 4, query, budget.catalog_books, budget.catalog_bytes)
+    }
+
     fn with_author_limit(
         books: &[BookSummary],
         recent: &[i64],
         seed: Option<i64>,
         author_limit: usize,
     ) -> Self {
+        Self::build(books, recent, seed, author_limit, "", CATALOG_LIMIT, CATALOG_BYTES)
+    }
+
+    fn build(
+        books: &[BookSummary],
+        recent: &[i64],
+        seed: Option<i64>,
+        author_limit: usize,
+        query: &str,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Self {
+        let terms: Vec<String> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.chars().count() > 2)
+            .map(str::to_lowercase)
+            .collect();
+        let relevance = |book: &BookSummary| {
+            if terms.is_empty() {
+                return 0;
+            }
+            let haystack = format!(
+                "{} {} {} {}",
+                book.title,
+                book.authors.join(" "),
+                book.tags.join(" "),
+                book.series.as_deref().unwrap_or_default()
+            )
+            .to_lowercase();
+            terms.iter().filter(|term| haystack.contains(term.as_str())).count()
+        };
         let mut ordered = books.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|book| {
             (
                 seed != Some(book.id),
+                std::cmp::Reverse(relevance(book)),
                 recent
                     .iter()
                     .position(|id| *id == book.id)
@@ -257,7 +362,7 @@ impl CatalogContext {
         let mut rows = Vec::new();
         let mut titles = BTreeMap::new();
         let mut bytes = 2;
-        for book in ordered.into_iter().take(CATALOG_LIMIT) {
+        for book in ordered.into_iter().take(limit) {
             let row = json!({
                 "id": book.id,
                 "title": bounded(&book.title, 160),
@@ -268,7 +373,7 @@ impl CatalogContext {
                 "stars": book.rating.map(|r| f32::from(r) / 2.0),
             })
             .to_string();
-            if bytes + row.len() + 1 > CATALOG_BYTES {
+            if bytes + row.len() + 1 > max_bytes {
                 break;
             }
             bytes += row.len() + 1;
@@ -510,13 +615,22 @@ impl CleanupDraft {
     }
 }
 
-impl OpenRouter {
+impl AiClient {
     fn structured<T: DeserializeOwned>(&self, messages: &[Message], max_tokens: u32) -> Result<T> {
-        let content = self.completion(messages, true, max_tokens)?;
-        serde_json::from_str(&content).map_err(|_| {
-            Error::Other(
-                "OpenRouter: the model returned an invalid result; try another model".into(),
-            )
+        let mut messages = messages.to_vec();
+        if self.resolved_provider() == super::ResolvedProvider::AppleIntelligence {
+            if let Some(system) = messages.iter_mut().find(|m| matches!(m.role, Role::System)) {
+                system
+                    .content
+                    .push_str("\nRespond with only one valid JSON object and no other text.");
+            }
+        }
+        let content = self.completion(&messages, true, max_tokens)?;
+        serde_json::from_str(extract_json_object(&content)).map_err(|_| {
+            Error::Other(format!(
+                "{}: the model returned an invalid result; try again or switch provider",
+                self.provider_name()
+            ))
         })
     }
 
@@ -569,9 +683,10 @@ impl OpenRouter {
         result.query = result.query.trim().to_owned();
         result.note = bounded(&result.note, 1500);
         if result.query.len() > 1500 || result.query.chars().any(char::is_control) {
-            return Err(Error::Other(
-                "OpenRouter returned an invalid search query".into(),
-            ));
+            return Err(Error::Other(format!(
+                "{} returned an invalid search query",
+                self.provider_name()
+            )));
         }
         Ok(result)
     }
@@ -696,7 +811,7 @@ mod tests {
     fn mocked(
         content: Value,
         check: impl FnOnce(Value) + Send + 'static,
-    ) -> (OpenRouter, std::thread::JoinHandle<()>) {
+    ) -> (AiClient, std::thread::JoinHandle<()>) {
         let output = json!({"choices": [{"message":{"content":content.to_string()}}]});
         let (base, job) = serve("200 OK", output.to_string(), move |_, body| {
             let body: Value = serde_json::from_str(body).unwrap();
@@ -704,10 +819,10 @@ mod tests {
             check(body);
         });
         (
-            OpenRouter {
+            AiClient::from_openrouter(super::super::OpenRouter {
                 base,
-                ..OpenRouter::new(Some("test-only"), "example/model")
-            },
+                ..super::super::OpenRouter::new(Some("test-only"), "example/model")
+            }),
             job,
         )
     }
@@ -993,5 +1108,29 @@ mod tests {
             preset.render(&meta),
             "Read Book {authors} by Writer {unknown}"
         );
+    }
+
+    #[test]
+    fn catalog_for_request_prioritizes_query_matches_within_small_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut library = Library::create(dir.path()).unwrap();
+        for i in 1..=10 {
+            library
+                .add_empty(Metadata::new(format!("Unrelated Novel {i}")))
+                .unwrap();
+        }
+        let mut stoic = Metadata::new("Meditations");
+        stoic.tags.push("Stoicism".into());
+        let stoic_id = library.add_empty(stoic).unwrap();
+        let books = library.list_books(&ListOptions::default()).unwrap();
+
+        let small = ContextBudget {
+            excerpt_chars: 2000,
+            catalog_bytes: 2000,
+            catalog_books: 3,
+        };
+        let context = CatalogContext::for_request(&books, &[], None, "stoicism philosophy", small);
+        assert_eq!(context.included(), 3);
+        assert!(context.books.contains_key(&stoic_id.id));
     }
 }

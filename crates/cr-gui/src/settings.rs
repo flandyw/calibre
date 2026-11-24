@@ -178,7 +178,10 @@ pub struct Settings {
     pub reader_contents: bool,
     pub reader_resume: bool,
     pub publisher_styles: bool,
+    pub ai_provider: cr_core::ai::Provider,
     pub openrouter_model: String,
+    pub ai_local_url: String,
+    pub ai_local_model: String,
     pub ai_presets: Vec<cr_core::ai::PromptPreset>,
 }
 
@@ -210,7 +213,10 @@ impl Default for Settings {
             reader_contents: true,
             reader_resume: true,
             publisher_styles: true,
+            ai_provider: cr_core::ai::Provider::Auto,
             openrouter_model: cr_core::ai::DEFAULT_MODEL.into(),
+            ai_local_url: cr_core::ai::DEFAULT_LOCAL_URL.into(),
+            ai_local_model: cr_core::ai::DEFAULT_LOCAL_MODEL.into(),
             ai_presets: Vec::new(),
         }
     }

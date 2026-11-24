@@ -1,5 +1,7 @@
-//! Opt-in OpenRouter chat and book metadata suggestions.
+//! Multi-provider AI assistant: on-device Apple Intelligence (macOS 26+),
+//! local OpenAI-compatible servers (Ollama / LM Studio), and OpenRouter.
 
+use std::fmt;
 use std::io::{BufRead, BufReader, Read};
 
 use serde::{Deserialize, Serialize};
@@ -9,12 +11,349 @@ use crate::network;
 use crate::{BookText, Error, Metadata, Result};
 
 pub const DEFAULT_MODEL: &str = "openrouter/auto";
+pub const DEFAULT_LOCAL_URL: &str = "http://localhost:11434/v1";
+pub const DEFAULT_LOCAL_MODEL: &str = "llama3.2";
 const SERVICE: &str = "OpenRouter";
+const LOCAL_SERVICE: &str = "Local AI";
 const API: &str = "https://openrouter.ai/api/v1";
-const EXCERPT_LIMIT: usize = 12_000;
+pub const EXCERPT_LIMIT: usize = 12_000;
 
+pub mod apple;
 mod studio;
+pub use apple::AppleAvailability;
 pub use studio::*;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    /// Use Apple Intelligence on macOS when available and no OpenRouter key is configured;
+    /// otherwise use OpenRouter.
+    #[default]
+    Auto,
+    /// Apple's on-device FoundationModels framework (macOS 26+ on Apple Silicon).
+    AppleIntelligence,
+    /// OpenRouter cloud API.
+    OpenRouter,
+    /// Local OpenAI-compatible server (Ollama, LM Studio, llama.cpp, etc.).
+    LocalServer,
+}
+
+impl Provider {
+    pub const ALL: [Self; 4] = [
+        Self::Auto,
+        Self::AppleIntelligence,
+        Self::OpenRouter,
+        Self::LocalServer,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::AppleIntelligence => "Apple Intelligence",
+            Self::OpenRouter => "OpenRouter",
+            Self::LocalServer => "Local Server",
+        }
+    }
+}
+
+impl fmt::Display for Provider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedProvider {
+    AppleIntelligence,
+    OpenRouter,
+    LocalServer,
+}
+
+impl ResolvedProvider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AppleIntelligence => "Apple Intelligence",
+            Self::OpenRouter => "OpenRouter",
+            Self::LocalServer => "Local Server",
+        }
+    }
+
+    pub fn is_on_device(self) -> bool {
+        matches!(self, Self::AppleIntelligence | Self::LocalServer)
+    }
+
+    pub fn privacy_note(self) -> &'static str {
+        match self {
+            Self::AppleIntelligence => {
+                "Runs privately on this Mac with Apple Intelligence. Your books never leave this device."
+            }
+            Self::LocalServer => {
+                "Runs against your local AI server. Book context stays on your machine."
+            }
+            Self::OpenRouter => {
+                "Shares selected book context with OpenRouter and the chosen model provider. Responses can be inaccurate."
+            }
+        }
+    }
+
+    pub fn context_budget(self) -> ContextBudget {
+        match self {
+            Self::AppleIntelligence => ContextBudget {
+                excerpt_chars: 5_500,
+                catalog_bytes: 7_500,
+                catalog_books: 32,
+            },
+            Self::LocalServer => ContextBudget {
+                excerpt_chars: 8_000,
+                catalog_bytes: 16_000,
+                catalog_books: 80,
+            },
+            Self::OpenRouter => ContextBudget {
+                excerpt_chars: EXCERPT_LIMIT,
+                catalog_bytes: 32_000,
+                catalog_books: 180,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub excerpt_chars: usize,
+    pub catalog_bytes: usize,
+    pub catalog_books: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AiConfig {
+    pub provider: Provider,
+    pub openrouter_key: Option<String>,
+    pub openrouter_model: String,
+    pub local_url: String,
+    pub local_model: String,
+    pub local_key: Option<String>,
+}
+
+impl Default for AiConfig {
+    fn default() -> Self {
+        Self {
+            provider: Provider::Auto,
+            openrouter_key: None,
+            openrouter_model: DEFAULT_MODEL.into(),
+            local_url: DEFAULT_LOCAL_URL.into(),
+            local_model: DEFAULT_LOCAL_MODEL.into(),
+            local_key: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AiClient {
+    resolved: ResolvedProvider,
+    http: OpenRouter,
+}
+
+impl AiClient {
+    pub fn new(config: AiConfig) -> Self {
+        let apple_ready = apple::availability().is_available();
+        let has_openrouter_key = config
+            .openrouter_key
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|k| !k.is_empty())
+            || std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .is_some_and(|k| !k.trim().is_empty());
+
+        let resolved = match config.provider {
+            Provider::Auto => {
+                if apple_ready && !has_openrouter_key {
+                    ResolvedProvider::AppleIntelligence
+                } else if has_openrouter_key {
+                    ResolvedProvider::OpenRouter
+                } else if apple_ready {
+                    ResolvedProvider::AppleIntelligence
+                } else {
+                    ResolvedProvider::OpenRouter
+                }
+            }
+            Provider::AppleIntelligence => ResolvedProvider::AppleIntelligence,
+            Provider::OpenRouter => ResolvedProvider::OpenRouter,
+            Provider::LocalServer => ResolvedProvider::LocalServer,
+        };
+
+        let http = match resolved {
+            ResolvedProvider::LocalServer => {
+                OpenRouter::local(&config.local_url, config.local_key.as_deref(), &config.local_model)
+            }
+            _ => OpenRouter::new(config.openrouter_key.as_deref(), &config.openrouter_model),
+        };
+
+        Self { resolved, http }
+    }
+
+    pub fn from_openrouter(client: OpenRouter) -> Self {
+        Self {
+            resolved: if client.require_auth {
+                ResolvedProvider::OpenRouter
+            } else {
+                ResolvedProvider::LocalServer
+            },
+            http: client,
+        }
+    }
+
+    pub fn resolved_provider(&self) -> ResolvedProvider {
+        self.resolved
+    }
+
+    pub fn is_on_device(&self) -> bool {
+        self.resolved.is_on_device()
+    }
+
+    pub fn provider_name(&self) -> &'static str {
+        self.resolved.label()
+    }
+
+    pub fn privacy_note(&self) -> &'static str {
+        self.resolved.privacy_note()
+    }
+
+    pub fn context_budget(&self) -> ContextBudget {
+        self.resolved.context_budget()
+    }
+
+    pub fn active_label(&self) -> String {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => "Apple Intelligence · On-Device".into(),
+            ResolvedProvider::LocalServer => format!("Local · {}", self.http.model),
+            ResolvedProvider::OpenRouter => format!("OpenRouter · {}", self.http.model),
+        }
+    }
+
+    pub fn active_model(&self) -> &str {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => "apple/on-device",
+            _ => &self.http.model,
+        }
+    }
+
+    pub fn test_connection(&self) -> Result<String> {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => {
+                let avail = apple::availability();
+                if avail.is_available() {
+                    Ok(avail.summary())
+                } else {
+                    Err(Error::Other(avail.summary()))
+                }
+            }
+            ResolvedProvider::LocalServer => {
+                let models = self.http.models()?;
+                Ok(format!(
+                    "Connected · {} model{} available on local server",
+                    models.len(),
+                    if models.len() == 1 { "" } else { "s" }
+                ))
+            }
+            ResolvedProvider::OpenRouter => {
+                self.http.test_connection()?;
+                Ok("Connected · OpenRouter API key verified".into())
+            }
+        }
+    }
+
+    pub fn models(&self) -> Result<Vec<Model>> {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => Ok(vec![Model {
+                id: "apple/on-device".into(),
+                name: "Apple Intelligence (On-Device)".into(),
+                context_length: Some(4096),
+                pricing: None,
+            }]),
+            _ => self.http.models(),
+        }
+    }
+
+    pub fn chat(&self, messages: &[Message]) -> Result<String> {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => apple::complete(messages),
+            _ => self.http.chat(messages),
+        }
+    }
+
+    pub fn chat_stream(
+        &self,
+        messages: &[Message],
+        delta: impl FnMut(&str) -> Result<()>,
+    ) -> Result<ChatReply> {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => apple::chat_stream(messages, delta),
+            _ => self.http.chat_stream(messages, delta),
+        }
+    }
+
+    pub(crate) fn completion(
+        &self,
+        messages: &[Message],
+        structured: bool,
+        max_tokens: u32,
+    ) -> Result<String> {
+        match self.resolved {
+            ResolvedProvider::AppleIntelligence => apple::complete(messages),
+            _ => self.http.completion(messages, structured, max_tokens),
+        }
+    }
+
+    pub fn suggest(&self, context: &BookContext) -> Result<Suggestion> {
+        let messages = [
+            context.system_message(),
+            Message::new(Role::User, "Suggest a short book description and up to 12 useful library tags. Return ONLY a valid JSON object with a plain text description string and a tags array of strings. Do not invent details; use an empty description if there is insufficient information."),
+        ];
+        let response = self.completion(&messages, true, 1200)?;
+        let mut suggestion: Suggestion =
+            serde_json::from_str(extract_json_object(&response)).map_err(|_| {
+                Error::Other(format!(
+                    "{}: the model returned invalid suggestions; try another model",
+                    self.provider_name()
+                ))
+            })?;
+        suggestion.description = suggestion.description.trim().chars().take(4000).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        suggestion.tags = suggestion
+            .tags
+            .into_iter()
+            .map(|tag| tag.trim().chars().take(80).collect::<String>())
+            .filter(|tag| !tag.is_empty() && seen.insert(tag.to_lowercase()))
+            .take(12)
+            .collect();
+        if suggestion.description.is_empty() && suggestion.tags.is_empty() {
+            return Err(Error::Other(format!(
+                "{}: the model did not suggest any changes",
+                self.provider_name()
+            )));
+        }
+        Ok(suggestion)
+    }
+}
+
+/// Extracts a JSON object from a model response that may be wrapped in markdown
+/// fences (e.g. ```json ... ```) or surrounded by brief prose.
+pub fn extract_json_object(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return trimmed;
+    }
+    if let Some(start) = trimmed.find('{') {
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                return &trimmed[start..=end];
+            }
+        }
+    }
+    trimmed
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Model {
@@ -109,6 +448,8 @@ pub struct OpenRouter {
     base: String,
     key: Option<String>,
     model: String,
+    service: &'static str,
+    pub(crate) require_auth: bool,
 }
 
 impl OpenRouter {
@@ -130,44 +471,100 @@ impl OpenRouter {
                 model.trim()
             }
             .into(),
+            service: SERVICE,
+            require_auth: true,
         }
     }
 
-    fn authorization(&self) -> Result<String> {
-        let key = self.key.as_deref().ok_or_else(|| {
-            Error::Other("OpenRouter: set an API key in Preferences or OPENROUTER_API_KEY".into())
-        })?;
-        if !key.bytes().all(|c| c.is_ascii_graphic()) {
-            return Err(Error::Other("OpenRouter: invalid API key".into()));
+    pub fn local(base_url: &str, key: Option<&str>, model: &str) -> Self {
+        let base = base_url.trim().trim_end_matches('/');
+        let base = if base.is_empty() {
+            DEFAULT_LOCAL_URL
+        } else {
+            base
+        };
+        let key = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .map(str::to_owned);
+        Self {
+            agent: network::agent(0),
+            base: base.into(),
+            key,
+            model: if model.trim().is_empty() {
+                DEFAULT_LOCAL_MODEL
+            } else {
+                model.trim()
+            }
+            .into(),
+            service: LOCAL_SERVICE,
+            require_auth: false,
         }
-        Ok(format!("Bearer {key}"))
+    }
+
+    fn authorization(&self) -> Result<Option<String>> {
+        match self.key.as_deref() {
+            Some(key) => {
+                if !key.bytes().all(|c| c.is_ascii_graphic()) {
+                    return Err(Error::Other(format!("{}: invalid API key", self.service)));
+                }
+                Ok(Some(format!("Bearer {key}")))
+            }
+            None if self.require_auth => Err(Error::Other(
+                "OpenRouter: set an API key in Preferences or OPENROUTER_API_KEY".into(),
+            )),
+            None => Ok(None),
+        }
     }
 
     pub fn test_connection(&self) -> Result<()> {
-        let response: Value = network::json(
-            SERVICE,
-            self.agent
-                .get(format!("{}/key", self.base))
-                .header("Authorization", self.authorization()?)
-                .call(),
-        )?;
+        let auth = self.authorization()?;
+        let mut req = self.agent.get(format!("{}/key", self.base));
+        if let Some(auth) = auth {
+            req = req.header("Authorization", auth);
+        }
+        let response: Value = network::json(self.service, req.call())?;
         if !response["data"].is_object() {
-            return Err(Error::Other("OpenRouter: invalid key response".into()));
+            return Err(Error::Other(format!(
+                "{}: invalid key response",
+                self.service
+            )));
         }
         Ok(())
     }
 
     pub fn models(&self) -> Result<Vec<Model>> {
         #[derive(Deserialize)]
-        struct Models {
-            data: Vec<Model>,
+        struct RawModel {
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+            context_length: Option<u64>,
+            pricing: Option<Pricing>,
         }
-        let mut result: Models = network::json(
-            SERVICE,
-            self.agent.get(format!("{}/models", self.base)).call(),
-        )?;
-        result.data.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(result.data)
+        #[derive(Deserialize)]
+        struct Models {
+            data: Vec<RawModel>,
+        }
+        let mut req = self.agent.get(format!("{}/models", self.base));
+        if !self.require_auth {
+            if let Some(auth) = self.authorization()? {
+                req = req.header("Authorization", auth);
+            }
+        }
+        let result: Models = network::json(self.service, req.call())?;
+        let mut models: Vec<Model> = result
+            .data
+            .into_iter()
+            .map(|m| Model {
+                name: m.name.unwrap_or_else(|| m.id.clone()),
+                id: m.id,
+                context_length: m.context_length,
+                pricing: m.pricing,
+            })
+            .collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(models)
     }
 
     pub fn chat(&self, messages: &[Message]) -> Result<String> {
@@ -190,15 +587,15 @@ impl OpenRouter {
             "max_tokens": max_tokens,
             "stream": stream
         });
-        if stream {
+        if stream && self.require_auth {
             payload["stream_options"] = json!({"include_usage": true});
         }
         if structured {
             payload["response_format"] = json!({"type": "json_object"});
         }
-        self.agent
+        let mut req = self
+            .agent
             .post(format!("{}/chat/completions", self.base))
-            .header("Authorization", self.authorization()?)
             .header("Content-Type", "application/json")
             .header(
                 "Accept",
@@ -207,32 +604,36 @@ impl OpenRouter {
                 } else {
                     "application/json"
                 },
-            )
-            .send(payload.to_string())
-            .map_err(|error| network::response_error(SERVICE, error))
+            );
+        if let Some(auth) = self.authorization()? {
+            req = req.header("Authorization", auth);
+        }
+        req.send(payload.to_string())
+            .map_err(|error| network::response_error(self.service, error))
     }
 
-    fn completion(
+    pub(crate) fn completion(
         &self,
         messages: &[Message],
         structured: bool,
         max_tokens: u32,
     ) -> Result<String> {
         let response: Value = network::json(
-            SERVICE,
+            self.service,
             Ok(self.request(messages, structured, false, max_tokens)?),
         )?;
         if response["choices"][0]["finish_reason"].as_str() == Some("length") {
-            return Err(Error::Other(
-                "OpenRouter: the model's response was truncated".into(),
-            ));
+            return Err(Error::Other(format!(
+                "{}: the model's response was truncated",
+                self.service
+            )));
         }
         response["choices"][0]["message"]["content"]
             .as_str()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
-            .ok_or_else(|| Error::Other("OpenRouter: the model did not return text".into()))
+            .ok_or_else(|| Error::Other(format!("{}: the model did not return text", self.service)))
     }
 
     pub fn chat_stream(
@@ -252,12 +653,13 @@ impl OpenRouter {
             line.clear();
             if reader
                 .read_line(&mut line)
-                .map_err(|_| Error::Other("OpenRouter: stream interrupted".into()))?
+                .map_err(|_| Error::Other(format!("{}: stream interrupted", self.service)))?
                 == 0
             {
-                return Err(Error::Other(
-                    "OpenRouter: stream ended before completion".into(),
-                ));
+                return Err(Error::Other(format!(
+                    "{}: stream ended before completion",
+                    self.service
+                )));
             }
             let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
                 continue;
@@ -266,11 +668,12 @@ impl OpenRouter {
                 break;
             }
             let event: Value = serde_json::from_str(data)
-                .map_err(|_| Error::Other("OpenRouter: invalid streaming response".into()))?;
+                .map_err(|_| Error::Other(format!("{}: invalid streaming response", self.service)))?;
             if !event["error"].is_null() {
-                return Err(Error::Other(
-                    "OpenRouter: the model stopped before completing its response".into(),
-                ));
+                return Err(Error::Other(format!(
+                    "{}: the model stopped before completing its response",
+                    self.service
+                )));
             }
             if let Some(model) = event["model"].as_str() {
                 reply.model = Some(model.to_owned());
@@ -283,15 +686,17 @@ impl OpenRouter {
                 reply.text.push_str(text);
             }
             if event["choices"][0]["finish_reason"].as_str() == Some("length") {
-                return Err(Error::Other(
-                    "OpenRouter: the model's response was truncated".into(),
-                ));
+                return Err(Error::Other(format!(
+                    "{}: the model's response was truncated",
+                    self.service
+                )));
             }
         }
         if reply.text.trim().is_empty() {
-            return Err(Error::Other(
-                "OpenRouter: the model did not return text".into(),
-            ));
+            return Err(Error::Other(format!(
+                "{}: the model did not return text",
+                self.service
+            )));
         }
         Ok(reply)
     }
@@ -302,11 +707,13 @@ impl OpenRouter {
             Message::new(Role::User, "Suggest a short book description and up to 12 useful library tags. Return a JSON object with a plain text description string and a tags array of strings. Do not invent details; use an empty description if there is insufficient information."),
         ];
         let response = self.completion(&messages, true, 1200)?;
-        let mut suggestion: Suggestion = serde_json::from_str(&response).map_err(|_| {
-            Error::Other(
-                "OpenRouter: the model returned invalid suggestions; try another model".into(),
-            )
-        })?;
+        let mut suggestion: Suggestion =
+            serde_json::from_str(extract_json_object(&response)).map_err(|_| {
+                Error::Other(format!(
+                    "{}: the model returned invalid suggestions; try another model",
+                    self.service
+                ))
+            })?;
         suggestion.description = suggestion.description.trim().chars().take(4000).collect();
         let mut seen = std::collections::BTreeSet::new();
         suggestion.tags = suggestion
@@ -317,9 +724,10 @@ impl OpenRouter {
             .take(12)
             .collect();
         if suggestion.description.is_empty() && suggestion.tags.is_empty() {
-            return Err(Error::Other(
-                "OpenRouter: the model did not suggest any changes".into(),
-            ));
+            return Err(Error::Other(format!(
+                "{}: the model did not suggest any changes",
+                self.service
+            )));
         }
         Ok(suggestion)
     }
@@ -329,11 +737,19 @@ pub struct BookContext(Value);
 
 impl BookContext {
     pub fn new(metadata: &Metadata, text: Option<&BookText>) -> Self {
+        Self::new_with_budget(metadata, text, EXCERPT_LIMIT)
+    }
+
+    pub fn new_with_budget(
+        metadata: &Metadata,
+        text: Option<&BookText>,
+        max_excerpt: usize,
+    ) -> Self {
         let excerpt = text.map(|book| {
             book.chapters
                 .iter()
                 .flat_map(|chapter| chapter.text.trim().chars().chain("\n\n".chars()))
-                .take(EXCERPT_LIMIT)
+                .take(max_excerpt)
                 .collect::<String>()
         });
         let description = metadata
@@ -341,7 +757,7 @@ impl BookContext {
             .as_deref()
             .unwrap_or_default()
             .chars()
-            .take(4000)
+            .take(4000.min(max_excerpt))
             .collect::<String>();
         Self(json!({
             "title": metadata.title,
@@ -350,6 +766,41 @@ impl BookContext {
             "tags": metadata.tags,
             "description": description,
             "excerpt": excerpt
+        }))
+    }
+
+    pub fn for_reader(
+        metadata: &Metadata,
+        chapter_title: Option<&str>,
+        chapter_text: Option<&str>,
+        selected_passage: Option<&str>,
+        max_excerpt: usize,
+    ) -> Self {
+        let passage = selected_passage
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(1500.min(max_excerpt / 2)).collect::<String>());
+        let chapter_budget = max_excerpt.saturating_sub(passage.as_ref().map_or(0, String::len));
+        let excerpt = chapter_text
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.chars().take(chapter_budget).collect::<String>());
+        let description = metadata
+            .comments
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .take(2000.min(max_excerpt / 2))
+            .collect::<String>();
+        Self(json!({
+            "title": metadata.title,
+            "authors": metadata.authors,
+            "series": metadata.series,
+            "tags": metadata.tags,
+            "description": description,
+            "current_chapter": chapter_title,
+            "chapter_excerpt": excerpt,
+            "selected_passage": passage
         }))
     }
 
@@ -508,6 +959,46 @@ mod tests {
             error,
             "OpenRouter: access denied; check credentials and permissions"
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn extract_json_object_handles_fences_and_prose() {
+        assert_eq!(extract_json_object(r#"{"a":1}"#), r#"{"a":1}"#);
+        assert_eq!(
+            extract_json_object("Here is the JSON:\n```json\n{\"a\": 1}\n```\nDone."),
+            r#"{"a": 1}"#
+        );
+    }
+
+    #[test]
+    fn local_server_works_without_api_key_and_smaller_budget() {
+        let reply = json!({
+            "choices": [{"message": {"content": "```json\n{\"description\":\"Local blurb\",\"tags\":[\"Local\"]}\n```"}}]
+        });
+        let (base, server) = serve("200 OK", reply.to_string(), |headers, body| {
+            assert!(!headers.to_ascii_lowercase().contains("authorization:"));
+            let payload: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(payload["model"], "llama3.2");
+        });
+        let client = AiClient::from_openrouter(OpenRouter::local(&base, None, "llama3.2"));
+        assert!(client.is_on_device());
+        assert_eq!(client.resolved_provider(), ResolvedProvider::LocalServer);
+        assert!(
+            ResolvedProvider::AppleIntelligence.context_budget().catalog_books
+                < ResolvedProvider::OpenRouter.context_budget().catalog_books
+        );
+        let context = BookContext::for_reader(
+            &Metadata::new("Local Book"),
+            Some("Chapter 2"),
+            Some("Chapter body"),
+            Some("Selected sentence"),
+            client.context_budget().excerpt_chars,
+        );
+        assert!(context.system_message().content.contains("Selected sentence"));
+        let suggestion = client.suggest(&context).unwrap();
+        assert_eq!(suggestion.description, "Local blurb");
+        assert_eq!(suggestion.tags, ["Local"]);
         server.join().unwrap();
     }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cr_core::ai::Role;
+use cr_core::ai::{apple, Provider, ResolvedProvider, Role};
 use cr_core::formats::html::html_to_text;
 use cr_core::online_metadata::{Candidate, Field, Source};
 use cr_core::Metadata;
@@ -28,57 +28,189 @@ pub fn metadata_preferences(app: &CalibreApp, cx: &App) -> AnyElement {
 pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     let muted = cx.theme().muted_foreground;
     let busy = app.job.is_some();
+    let client = app.ai_client(cx);
+    let selected = app.settings.ai_provider;
+    let resolved = client.resolved_provider();
+    let apple_status = apple::availability();
+    let active_pill = if client.is_on_device() {
+        format!("On-device · {}", client.active_label())
+    } else {
+        format!("Cloud · {}", client.active_label())
+    };
+    let provider_buttons = Provider::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(index, provider)| {
+            let button = Button::new(("ai-provider", index))
+                .small()
+                .label(provider.label())
+                .disabled(busy)
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.set_ai_provider(provider, window, cx);
+                }));
+            if selected == provider {
+                button.primary()
+            } else {
+                button.outline()
+            }
+        })
+        .collect::<Vec<_>>();
     let model = app.online.model.read(cx).value().to_string();
     let filter = model.to_ascii_lowercase();
+    let local_mode = selected == Provider::LocalServer;
     let model_rows = app
         .online
         .models
         .iter()
         .enumerate()
         .filter(|(_, model)| {
-            model.id.to_ascii_lowercase().contains(&filter)
+            local_mode
+                || model.id.to_ascii_lowercase().contains(&filter)
                 || model.name.to_ascii_lowercase().contains(&filter)
                 || filter == app.settings.openrouter_model.to_ascii_lowercase()
         })
         .map(|(index, model)| {
             let id = model.id.clone();
-            Button::new(("openrouter-model", index))
+            Button::new(("ai-model-row", index))
                 .ghost()
                 .small()
                 .label(format!("{} · {}", model.name, id))
                 .on_click(cx.listener(move |app, _, window, cx| {
-                    app.save_openrouter_model(id.clone(), window, cx);
+                    if local_mode {
+                        app.save_local_model(id.clone(), window, cx);
+                    } else {
+                        app.save_openrouter_model(id.clone(), window, cx);
+                    }
                 }))
         })
         .collect::<Vec<_>>();
+    let show_openrouter = matches!(selected, Provider::OpenRouter | Provider::Auto);
+    let show_local = selected == Provider::LocalServer;
+    let can_browse_models = resolved != ResolvedProvider::AppleIntelligence;
     v_flex()
         .gap_3()
-        .child(div().text_sm().text_color(muted).child(
-            "Use your own OpenRouter account. A key typed here lasts until you close the app; set OPENROUTER_API_KEY to use it across launches.",
-        ))
-        .child(field("API key", Input::new(&app.online.key).w_full()
-            .content_type(InputContentType::Password)))
-        .child(field("Model ID or catalog filter", Input::new(&app.online.model).w_full()))
-        .child(div().text_sm().text_color(muted).child(
-            format!("Active model: {}", app.settings.openrouter_model),
-        ))
-        .child(h_flex().flex_wrap().gap_2()
-            .child(Button::new("save-openrouter-model").outline().small().label("Use Model ID")
-                .on_click(cx.listener(|app, _, window, cx| {
-                    let value = app.online.model.read(cx).value().to_string();
-                    app.save_openrouter_model(value, window, cx);
-                })))
-            .child(Button::new("test-openrouter").outline().small().label("Test Connection")
-                .disabled(busy).on_click(cx.listener(|app, _, window, cx| app.test_openrouter(window, cx))))
-            .child(Button::new("list-openrouter-models").outline().small().label("Browse Models")
-                .disabled(busy).on_click(cx.listener(|app, _, window, cx| app.load_openrouter_models(window, cx)))))
+        .child(
+            v_flex()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(cx.theme().muted)
+                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(active_pill))
+                .child(div().text_xs().text_color(muted).child(client.privacy_note()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(format!("Apple Intelligence: {}", apple_status.summary())),
+                ),
+        )
+        .child(
+            v_flex()
+                .gap_1()
+                .child(div().text_sm().child("Provider"))
+                .child(h_flex().flex_wrap().gap_2().children(provider_buttons)),
+        )
+        .when(selected == Provider::Auto, |this| {
+            this.child(div().text_xs().text_color(muted).child(
+                "Auto uses Apple Intelligence on-device on macOS 26+ when available, and falls back to OpenRouter otherwise.",
+            ))
+        })
+        .when(show_openrouter, |this| {
+            this.child(div().text_sm().text_color(muted).child(
+                "OpenRouter API key lasts until you close the app; set OPENROUTER_API_KEY to reuse it across launches.",
+            ))
+            .child(field(
+                "OpenRouter API key",
+                Input::new(&app.online.key)
+                    .w_full()
+                    .content_type(InputContentType::Password),
+            ))
+            .child(field(
+                "OpenRouter model ID or catalog filter",
+                Input::new(&app.online.model).w_full(),
+            ))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child(format!("Saved OpenRouter model: {}", app.settings.openrouter_model)),
+            )
+        })
+        .when(show_local, |this| {
+            this.child(div().text_sm().text_color(muted).child(
+                "Connect to any OpenAI-compatible local server (Ollama at http://localhost:11434/v1, LM Studio at http://localhost:1234/v1). Book data stays on your machine.",
+            ))
+            .child(field("Server base URL", Input::new(&app.online.local_url).w_full()))
+            .child(field("Model ID", Input::new(&app.online.local_model).w_full()))
+            .child(field(
+                "Optional API key",
+                Input::new(&app.online.local_key)
+                    .w_full()
+                    .content_type(InputContentType::Password),
+            ))
+        })
+        .child(
+            h_flex()
+                .flex_wrap()
+                .gap_2()
+                .when(show_openrouter, |row| {
+                    row.child(
+                        Button::new("save-openrouter-model")
+                            .outline()
+                            .small()
+                            .label("Use Model ID")
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                let value = app.online.model.read(cx).value().to_string();
+                                app.save_openrouter_model(value, window, cx);
+                            })),
+                    )
+                })
+                .when(show_local, |row| {
+                    row.child(
+                        Button::new("save-local-ai")
+                            .outline()
+                            .small()
+                            .label("Save Local Server")
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.save_local_ai(window, cx);
+                            })),
+                    )
+                })
+                .child(
+                    Button::new("test-ai-provider")
+                        .outline()
+                        .small()
+                        .label("Test Provider")
+                        .disabled(busy)
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            app.test_ai_connection(window, cx);
+                        })),
+                )
+                .when(can_browse_models, |row| {
+                    row.child(
+                        Button::new("list-ai-models")
+                            .outline()
+                            .small()
+                            .label("Browse Models")
+                            .disabled(busy)
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.load_ai_models(window, cx);
+                            })),
+                    )
+                }),
+        )
         .when_some(app.online.connection.clone(), |this, status| {
             this.child(div().text_sm().text_color(muted).child(status))
         })
-        .when(!model_rows.is_empty(), |tree| tree.child(
-            div().id("openrouter-models").max_h(px(176.)).overflow_y_scroll()
-                .child(v_flex().items_start().children(model_rows)),
-        ))
+        .when(!model_rows.is_empty(), |tree| {
+            tree.child(
+                div()
+                    .id("ai-models")
+                    .max_h(px(176.))
+                    .overflow_y_scroll()
+                    .child(v_flex().items_start().children(model_rows)),
+            )
+        })
         .child(preset_editor(app, cx))
         .into_any_element()
 }
@@ -342,23 +474,32 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     };
     let busy = app.job.is_some();
     let muted = cx.theme().muted_foreground;
-    let header = match &session.reader_format {
-        Some(format) => format!(
-            "{} · {format} · {}",
-            session.current.title, app.settings.openrouter_model
-        ),
-        None => format!(
-            "{} · {}",
-            session.current.title, app.settings.openrouter_model
-        ),
+    let client = app.ai_client(cx);
+    let provider_name = client.provider_name();
+    let privacy_badge = if client.is_on_device() {
+        format!("On-device · {}", client.active_label())
+    } else {
+        format!("Cloud · {}", client.active_label())
     };
+    let header = match &session.reader_format {
+        Some(format) => format!("{} · {format}", session.current.title),
+        None => session.current.title.clone(),
+    };
+    let has_reader_context =
+        session.reader_chapter_text.is_some() || session.reader_passage.is_some();
+    let has_copyable = session.translation.is_some()
+        || !session.local_result.trim().is_empty()
+        || session
+            .history
+            .iter()
+            .any(|m| matches!(m.role, Role::Assistant));
     let messages = session
         .history
         .iter()
         .enumerate()
         .map(|(index, message)| {
             let role = match message.role {
-                Role::Assistant => "OpenRouter",
+                Role::Assistant => provider_name,
                 _ => "You",
             };
             v_flex()
@@ -415,72 +556,346 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .on_click(cx.listener(|app, _, window, cx| app.apply_ai_metadata(window, cx))),
             )
     });
-    v_flex().w_full().gap_3()
-        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(header))
-        .child(div().text_sm().text_color(muted).child(
-            "Your question, recent chat and book metadata go to OpenRouter and the chosen model provider. Responses can be wrong and may incur charges.",
-        ))
-        .child(Checkbox::new("ai-share-excerpt")
-            .label("Also share the opening excerpt (up to 12,000 characters)")
-            .checked(session.excerpt).disabled(busy)
-            .on_click(cx.listener(|app, checked: &bool, _, cx| {
-                if let Some(session) = app.online.ai.as_mut() {
-                    if session.excerpt != *checked {
-                        session.excerpt = *checked;
-                        session.history.clear();
-                    }
-                    cx.notify();
+    let translation = session.translation.as_ref().map(|(language, translated)| {
+        v_flex()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .bg(cx.theme().muted)
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(format!("Translated description ({language})")),
+            )
+            .child(div().text_sm().child(translated.clone()))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("apply-ai-translation")
+                            .primary()
+                            .small()
+                            .label("Apply to Description")
+                            .disabled(busy || !app.can_write())
+                            .on_click(cx.listener(|app, _, window, cx| {
+                                app.apply_ai_translation(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("dismiss-ai-translation")
+                            .ghost()
+                            .small()
+                            .label("Dismiss")
+                            .disabled(busy)
+                            .on_click(cx.listener(|app, _, _, cx| {
+                                if let Some(session) = app.online.ai.as_mut() {
+                                    session.translation = None;
+                                    cx.notify();
+                                }
+                            })),
+                    ),
+            )
+    });
+    let preset_chips = app
+        .settings
+        .ai_presets
+        .iter()
+        .enumerate()
+        .map(|(index, preset)| {
+            Button::new(("ai-dialog-preset", index))
+                .ghost()
+                .small()
+                .label(preset.name.clone())
+                .disabled(busy)
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.run_ai_preset_in_dialog(index, window, cx);
+                }))
+        })
+        .collect::<Vec<_>>();
+    let excerpt_limit = client.context_budget().excerpt_chars;
+    let recap_label = if let Some(num) = session.reader_chapter_num {
+        format!("Recap to Here (#{num})")
+    } else {
+        "Recap Through Chapter".into()
+    };
+    v_flex()
+        .w_full()
+        .gap_3()
+        .child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).truncate().child(header))
+                .child(
+                    div()
+                        .text_xs()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(cx.theme().muted)
+                        .text_color(muted)
+                        .child(privacy_badge),
+                ),
+        )
+        .child(div().text_xs().text_color(muted).child(client.privacy_note()))
+        .when(has_reader_context, |this| {
+            let chapter_line = session
+                .reader_chapter_title
+                .as_deref()
+                .map(|t| format!("Current chapter: {t}"))
+                .unwrap_or_else(|| "Current reader section attached".into());
+            let passage_preview = session.reader_passage.as_deref().map(|p| {
+                let snippet: String = p.chars().take(120).collect();
+                if p.chars().count() > 120 {
+                    format!("Selected passage: “{snippet}…”")
+                } else {
+                    format!("Selected passage: “{snippet}”")
                 }
-            })))
-        .child(h_flex().gap_2().child(Input::new(&app.online.question).flex_1().disabled(busy))
-            .child(Button::new("ai-send").primary().small().label("Send").disabled(busy)
-                .on_click(cx.listener(|app, _, window, cx| app.run_ai(false, window, cx)))))
-        .child(h_flex().gap_2().flex_wrap()
-            .child(Button::new("ai-suggest").outline().small().label("Suggest Description & Tags")
-                .disabled(busy).on_click(cx.listener(|app, _, window, cx| app.run_ai(true, window, cx))))
-            .child(Button::new("ai-configure").ghost().small().label("OpenRouter Preferences")
-                .disabled(busy).on_click(cx.listener(|app, _, window, cx| {
-                    app.online.ai = None;
-                    window.close_dialog(cx);
-                    app.open_preferences(window, cx);
-                })))
-            .when(!session.history.is_empty(), |this| this.child(
-                Button::new("clear-chat").ghost().small().label("Clear Chat").disabled(busy)
-                    .on_click(cx.listener(|app, _, _, cx| {
+            });
+            this.child(
+                v_flex()
+                    .gap_2()
+                    .p_2()
+                    .rounded_md()
+                    .bg(cx.theme().muted)
+                    .child(div().text_xs().font_weight(FontWeight::SEMIBOLD).child(chapter_line))
+                    .when_some(passage_preview, |box_el, preview| {
+                        box_el.child(div().text_xs().text_color(muted).child(preview))
+                    })
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .when(session.reader_passage.is_some(), |row| {
+                                row.child(
+                                    Button::new("ai-explain-passage")
+                                        .primary()
+                                        .small()
+                                        .label("Explain Passage")
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            app.run_book_task(BookTask::ExplainPassage, window, cx);
+                                        })),
+                                )
+                            })
+                            .when(session.reader_chapter_text.is_some(), |row| {
+                                row.child(
+                                    Button::new("ai-summarize-chapter")
+                                        .outline()
+                                        .small()
+                                        .label("Summarize Chapter")
+                                        .disabled(busy)
+                                        .on_click(cx.listener(|app, _, window, cx| {
+                                            app.run_book_task(
+                                                BookTask::SummarizeChapter,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            }),
+                    ),
+            )
+        })
+        .when(!has_reader_context, |this| {
+            this.child(
+                Checkbox::new("ai-share-excerpt")
+                    .label(format!(
+                        "Also share opening excerpt (up to {excerpt_limit} characters)"
+                    ))
+                    .checked(session.excerpt)
+                    .disabled(busy)
+                    .on_click(cx.listener(|app, checked: &bool, _, cx| {
                         if let Some(session) = app.online.ai.as_mut() {
-                            session.history.clear();
+                            if session.excerpt != *checked {
+                                session.excerpt = *checked;
+                                session.history.clear();
+                            }
                             cx.notify();
                         }
                     })),
-            )))
-        .child(h_flex().gap_2().flex_wrap()
-            .children([
-                ("ai-characters", "Characters", BookTask::Characters),
-                ("ai-discuss", "Discussion Questions", BookTask::Discussion),
-                ("ai-time", "Reading Time", BookTask::ReadingTime),
-            ].into_iter().map(|(id, label, task)|
-                Button::new(id).outline().small().label(label).disabled(busy)
-                    .on_click(cx.listener(move |app, _, window, cx| app.run_book_task(task, window, cx)))).collect::<Vec<_>>()))
-        .child(h_flex().gap_2().flex_wrap()
-            .child(Input::new(&app.online.chapter).w(px(105.)).disabled(busy))
-            .child(Button::new("ai-recap").outline().small().label("Recap Through Chapter").disabled(busy)
-                .on_click(cx.listener(|app, _, window, cx| app.run_book_task(BookTask::Recap, window, cx))))
-            .child(Input::new(&app.online.language).w(px(140.)).disabled(busy))
-            .child(Button::new("ai-translate").outline().small().label("Translate Description").disabled(busy)
-                .on_click(cx.listener(|app, _, window, cx| app.run_book_task(BookTask::Translate, window, cx)))))
-        .child(div().text_xs().text_color(muted).child("Recap uses the entry number in the reader’s Contents and shares excerpts only through that entry. Reading Time stays on this device."))
-        .when(!session.status.is_empty(), |this| this.child(
-            div().text_sm().text_color(muted).child(session.status.clone()),
-        ))
-        .when(!session.usage.is_empty(), |this| this.child(div().text_xs().text_color(muted).child(session.usage.clone())))
-        .when(suggestion.is_some() || !messages.is_empty() || !session.streaming.is_empty() || !session.local_result.is_empty(), |this| this.child(
-            div().id("ai-response").max_h(px(310.)).overflow_y_scroll().child(
-                v_flex().gap_2().when_some(suggestion, |this, suggestion| this.child(suggestion))
-                    .children(messages)
-                    .when(!session.streaming.is_empty(), |this| this.child(div().text_sm().p_2().child(session.streaming.clone())))
-                    .when(!session.local_result.is_empty(), |this| this.child(div().text_sm().p_2().child(session.local_result.clone()))),
-            ),
-        ))
+            )
+        })
+        .child(
+            h_flex()
+                .gap_2()
+                .child(Input::new(&app.online.question).flex_1().disabled(busy))
+                .child(
+                    Button::new("ai-send")
+                        .primary()
+                        .small()
+                        .label("Send")
+                        .disabled(busy)
+                        .on_click(cx.listener(|app, _, window, cx| app.run_ai(false, window, cx))),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    Button::new("ai-suggest")
+                        .outline()
+                        .small()
+                        .label("Suggest Description & Tags")
+                        .disabled(busy)
+                        .on_click(cx.listener(|app, _, window, cx| app.run_ai(true, window, cx))),
+                )
+                .children(
+                    [
+                        ("ai-characters", "Characters", BookTask::Characters),
+                        ("ai-discuss", "Discussion Questions", BookTask::Discussion),
+                        ("ai-time", "Reading Time", BookTask::ReadingTime),
+                    ]
+                    .into_iter()
+                    .map(|(id, label, task)| {
+                        Button::new(id)
+                            .outline()
+                            .small()
+                            .label(label)
+                            .disabled(busy)
+                            .on_click(cx.listener(move |app, _, window, cx| {
+                                app.run_book_task(task, window, cx)
+                            }))
+                    })
+                    .collect::<Vec<_>>(),
+                ),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .child(Input::new(&app.online.chapter).w(px(95.)).disabled(busy))
+                .child(
+                    Button::new("ai-recap")
+                        .outline()
+                        .small()
+                        .label(recap_label)
+                        .disabled(busy)
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            app.run_book_task(BookTask::Recap, window, cx)
+                        })),
+                )
+                .child(Input::new(&app.online.language).w(px(160.)).disabled(busy))
+                .child(
+                    Button::new("ai-translate")
+                        .outline()
+                        .small()
+                        .label("Translate Description")
+                        .disabled(busy)
+                        .on_click(cx.listener(|app, _, window, cx| {
+                            app.run_book_task(BookTask::Translate, window, cx)
+                        })),
+                ),
+        )
+        .when(!preset_chips.is_empty(), |this| {
+            this.child(
+                h_flex()
+                    .gap_1()
+                    .flex_wrap()
+                    .items_center()
+                    .child(div().text_xs().text_color(muted).child("Presets:"))
+                    .children(preset_chips),
+            )
+        })
+        .child(
+            h_flex()
+                .justify_between()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("Recap stops at the chosen Contents entry. Reading Time is computed locally."),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .when(has_copyable, |row| {
+                            row.child(
+                                Button::new("copy-ai-result")
+                                    .ghost()
+                                    .small()
+                                    .label("Copy Response")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|app, _, window, cx| {
+                                        app.copy_ai_result(window, cx);
+                                    })),
+                            )
+                        })
+                        .when(!session.history.is_empty(), |row| {
+                            row.child(
+                                Button::new("clear-chat")
+                                    .ghost()
+                                    .small()
+                                    .label("Clear Chat")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|app, _, _, cx| {
+                                        if let Some(session) = app.online.ai.as_mut() {
+                                            session.history.clear();
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("ai-configure")
+                                .ghost()
+                                .small()
+                                .label("AI Preferences")
+                                .disabled(busy)
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.online.ai = None;
+                                    window.close_dialog(cx);
+                                    app.open_preferences(window, cx);
+                                })),
+                        ),
+                ),
+        )
+        .when(!session.status.is_empty(), |this| {
+            this.child(div().text_sm().text_color(muted).child(session.status.clone()))
+        })
+        .when(!session.usage.is_empty(), |this| {
+            this.child(div().text_xs().text_color(muted).child(session.usage.clone()))
+        })
+        .when(
+            suggestion.is_some()
+                || translation.is_some()
+                || !messages.is_empty()
+                || !session.streaming.is_empty()
+                || !session.local_result.is_empty(),
+            |this| {
+                this.child(
+                    div()
+                        .id("ai-response")
+                        .max_h(px(310.))
+                        .overflow_y_scroll()
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .when_some(suggestion, |this, suggestion| this.child(suggestion))
+                                .when_some(translation, |this, translation| this.child(translation))
+                                .children(messages)
+                                .when(!session.streaming.is_empty(), |this| {
+                                    this.child(div().text_sm().p_2().child(session.streaming.clone()))
+                                })
+                                .when(!session.local_result.is_empty(), |this| {
+                                    this.child(
+                                        div()
+                                            .text_sm()
+                                            .p_2()
+                                            .rounded_md()
+                                            .bg(cx.theme().muted)
+                                            .child(session.local_result.clone()),
+                                    )
+                                }),
+                        ),
+                )
+            },
+        )
         .into_any_element()
 }
 
