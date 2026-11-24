@@ -12,6 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::CalibreApp;
+use crate::online::BookTask;
 
 pub fn metadata_preferences(app: &CalibreApp, cx: &App) -> AnyElement {
     v_flex()
@@ -78,7 +79,42 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
             div().id("openrouter-models").max_h(px(176.)).overflow_y_scroll()
                 .child(v_flex().items_start().children(model_rows)),
         ))
+        .child(preset_editor(app, cx))
         .into_any_element()
+}
+
+fn preset_editor(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> Div {
+    let rows = app
+        .settings
+        .ai_presets
+        .iter()
+        .enumerate()
+        .map(|(index, preset)| {
+            Button::new(("ai-edit-preset", index))
+                .outline()
+                .small()
+                .label(preset.name.clone())
+                .on_click(cx.listener(move |app, _, window, cx| {
+                    app.edit_ai_preset(Some(index), window, cx)
+                }))
+        })
+        .collect::<Vec<_>>();
+    v_flex().gap_2().border_t_1().pt_3()
+        .child(div().font_weight(FontWeight::SEMIBOLD).child("Book action presets"))
+        .child(div().text_sm().text_color(cx.theme().muted_foreground)
+            .child("Create reusable prompts for the book context menu. Variables: {title}, {authors}, {description}, {series}, {tags}, {publisher}, {language}."))
+        .child(h_flex().gap_2().flex_wrap().children(rows))
+        .child(field("Action name", Input::new(&app.online.preset_name).w_full()))
+        .child(field("Prompt template", Input::new(&app.online.preset_prompt).w_full()))
+        .child(h_flex().gap_2()
+            .child(Button::new("ai-save-preset").primary().small()
+                .label(if app.online.preset_edit.is_some() { "Save Changes" } else { "Add Preset" })
+                .on_click(cx.listener(|app, _, window, cx| app.save_ai_preset(window, cx))))
+            .when(app.online.preset_edit.is_some(), |row| row
+                .child(Button::new("ai-cancel-preset").ghost().small().label("Cancel Edit")
+                    .on_click(cx.listener(|app, _, window, cx| app.edit_ai_preset(None, window, cx))))
+                .child(Button::new("ai-delete-preset").ghost().small().label("Delete Preset")
+                    .on_click(cx.listener(|app, _, window, cx| app.delete_ai_preset(window, cx))))))
 }
 
 pub fn metadata_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
@@ -411,13 +447,32 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         }
                     })),
             )))
+        .child(h_flex().gap_2().flex_wrap()
+            .children([
+                ("ai-characters", "Characters", BookTask::Characters),
+                ("ai-discuss", "Discussion Questions", BookTask::Discussion),
+                ("ai-time", "Reading Time", BookTask::ReadingTime),
+            ].into_iter().map(|(id, label, task)|
+                Button::new(id).outline().small().label(label).disabled(busy)
+                    .on_click(cx.listener(move |app, _, window, cx| app.run_book_task(task, window, cx)))).collect::<Vec<_>>()))
+        .child(h_flex().gap_2().flex_wrap()
+            .child(Input::new(&app.online.chapter).w(px(105.)).disabled(busy))
+            .child(Button::new("ai-recap").outline().small().label("Recap Through Chapter").disabled(busy)
+                .on_click(cx.listener(|app, _, window, cx| app.run_book_task(BookTask::Recap, window, cx))))
+            .child(Input::new(&app.online.language).w(px(140.)).disabled(busy))
+            .child(Button::new("ai-translate").outline().small().label("Translate Description").disabled(busy)
+                .on_click(cx.listener(|app, _, window, cx| app.run_book_task(BookTask::Translate, window, cx)))))
+        .child(div().text_xs().text_color(muted).child("Recap shares bounded excerpts through the selected chapter only. Reading Time stays on this device."))
         .when(!session.status.is_empty(), |this| this.child(
             div().text_sm().text_color(muted).child(session.status.clone()),
         ))
-        .when(suggestion.is_some() || !messages.is_empty(), |this| this.child(
+        .when(!session.usage.is_empty(), |this| this.child(div().text_xs().text_color(muted).child(session.usage.clone())))
+        .when(suggestion.is_some() || !messages.is_empty() || !session.streaming.is_empty() || !session.local_result.is_empty(), |this| this.child(
             div().id("ai-response").max_h(px(310.)).overflow_y_scroll().child(
                 v_flex().gap_2().when_some(suggestion, |this, suggestion| this.child(suggestion))
-                    .children(messages),
+                    .children(messages)
+                    .when(!session.streaming.is_empty(), |this| this.child(div().text_sm().p_2().child(session.streaming.clone())))
+                    .when(!session.local_result.is_empty(), |this| this.child(div().text_sm().p_2().child(session.local_result.clone()))),
             ),
         ))
         .into_any_element()

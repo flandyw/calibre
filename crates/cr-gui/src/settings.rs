@@ -179,6 +179,7 @@ pub struct Settings {
     pub reader_resume: bool,
     pub publisher_styles: bool,
     pub openrouter_model: String,
+    pub ai_presets: Vec<cr_core::ai::PromptPreset>,
 }
 
 impl Default for Settings {
@@ -210,6 +211,7 @@ impl Default for Settings {
             reader_resume: true,
             publisher_styles: true,
             openrouter_model: cr_core::ai::DEFAULT_MODEL.into(),
+            ai_presets: Vec::new(),
         }
     }
 }

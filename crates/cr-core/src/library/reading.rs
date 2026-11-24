@@ -104,6 +104,34 @@ const ANNOTATION_COLUMNS: &str =
     "id, book, kind, section, block, start, end, text, note, chapter, created";
 
 impl Library {
+    pub fn recent_read_ids(&self, limit: usize) -> Result<Vec<i64>> {
+        let mut ids = Vec::new();
+        let limit = limit.min(100);
+        if self.has_reading_state() {
+            let conn = self.reading_connection()?;
+            let mut stmt =
+                conn.prepare("SELECT book FROM positions ORDER BY updated DESC LIMIT ?1")?;
+            ids = stmt
+                .query_map([limit as i64], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+        if ids.len() < limit {
+            let mut stmt = self.conn.prepare(
+                "SELECT p.book FROM last_read_positions p JOIN books b ON b.id=p.book GROUP BY p.book ORDER BY MAX(p.epoch) DESC LIMIT ?1",
+            )?;
+            for id in stmt.query_map([limit as i64], |row| row.get(0))? {
+                let id = id?;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                    if ids.len() == limit {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     fn reading_connection(&self) -> Result<Connection> {
         let conn = Connection::open(self.root.join(READING_FILE))?;
         conn.execute_batch(

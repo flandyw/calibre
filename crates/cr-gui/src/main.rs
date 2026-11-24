@@ -7,6 +7,7 @@ mod files;
 mod library_tools;
 mod online;
 mod settings;
+mod studio;
 mod tools;
 mod ui;
 

@@ -61,6 +61,18 @@ fn online_commands_require_explicit_input_and_apply_target() {
 }
 
 #[test]
+fn ai_studio_requires_search_text_and_recap_chapter() {
+    for (args, expected) in [
+        (vec!["ai", "library", "search"], "<REQUEST>"),
+        (vec!["ai", "book", "recap", "1"], "--through"),
+    ] {
+        let output = cr().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+
+#[test]
 fn cli_workflow() {
     let temp = tempdir().unwrap();
     let library = temp.path().join("library");

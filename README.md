@@ -100,7 +100,9 @@ rewrites `metadata.opf`, exactly as calibre expects.
 ### Online metadata and OpenRouter
 
 The desktop **Download Metadata…** action searches Open Library or Google
-Books by title, author, or ISBN, without an API key. Choose a result to compare
+Books by title, author, or ISBN. For Google Books quota or rate limits, set
+`GOOGLE_BOOKS_API_KEY`, enter a session key in **Preferences → Online
+metadata**, or pass `--google-books-api-key` on the CLI. Choose a result to compare
 its metadata and cover against the current book. Check only the fields you
 want to keep. For a multi-selection, the dialog reviews each book in turn;
 skip any book or end the review at any point.
@@ -109,10 +111,22 @@ Set an OpenRouter API key in desktop **Preferences → AI · OpenRouter** for
 the current app session, or provide `OPENROUTER_API_KEY` in the environment.
 Preferences can verify the key, browse the live model catalog, and save the
 model ID. The **Ask AI…** action chats about the selected book and can suggest
-a description and tags for selective application. Book text is not sent
-unless you opt in to sharing an opening excerpt. Requests send metadata,
-prompts, and recent chat context to OpenRouter and the chosen model provider;
-check its data policy and pricing before use. AI suggestions can be inaccurate.
+a description and tags for selective application. Replies stream as they
+arrive, with token counts and estimated cost when available. Ask for characters,
+discussion questions, a translated description, or a recap through a chapter
+you choose. Recap sends bounded excerpts only through that chapter; ordinary
+chat sends no book text unless you enable the opening excerpt. Reading Time
+counts words locally. Preferences lets you add named prompt presets such as
+`Suggest discussion starters for {title} by {authors}` to the book context menu.
+
+**AI Studio** can answer library questions with clickable book references,
+suggest what to read next, draft editable calibre searches, and preview smart
+shelves and bulk metadata cleanup. Shelves can be saved as saved searches or
+virtual libraries; cleanup writes only checked fields. Catalog requests send
+a bounded sample of applicable library metadata, not book files. Natural
+search only uses supported library fields; page count and read status require
+suitable custom columns. Requests go to OpenRouter and the chosen provider,
+so check its data policy and pricing. AI output can be inaccurate.
 
 ```sh
 cr fetch-metadata --title 'Frankenstein' --author 'Mary Shelley'
@@ -123,6 +137,14 @@ cr ai models
 cr ai test
 cr ai ask 42 'What themes does this book explore?'
 cr ai suggest 42 --model openrouter/auto --excerpt           # preview
+cr ai library ask 'Which books pair well for a book club?'
+cr ai library search 'science fiction rated at least 4 stars'  # preview
+cr ai library search --run 'science fiction rated at least 4 stars'
+cr ai library next --book 42 'something with a different tone'
+cr ai library shelves 'plan a weekend double feature'
+cr ai library cleanup 42 43                                 # preview
+cr ai book recap 42 --through 3
+cr ai book reading-time 42
 ```
 
 The CLI uses `OPENROUTER_API_KEY` and accepts `OPENROUTER_MODEL` or

@@ -3637,6 +3637,18 @@ impl CalibreApp {
                 this.close_preferences(window, cx)
             }))
             .on_action(cx.listener(|this, _: &AskAi, window, cx| this.open_ai(window, cx)))
+            .on_action(cx.listener(|this, _: &AiStudio, window, cx| {
+                this.open_studio(crate::studio::Mode::Librarian, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AiReadNext, window, cx| {
+                this.open_studio(crate::studio::Mode::Next, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AiCleanup, window, cx| {
+                this.open_studio(crate::studio::Mode::Cleanup, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &RunAiPreset, window, cx| {
+                this.open_ai_preset(action.0, window, cx)
+            }))
             .on_action(cx.listener(|this, _: &DownloadMetadata, window, cx| {
                 this.open_online_metadata(window, cx)
             }))

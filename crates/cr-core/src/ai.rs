@@ -1,5 +1,7 @@
 //! Opt-in OpenRouter chat and book metadata suggestions.
 
+use std::io::{BufRead, BufReader, Read};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -11,11 +13,59 @@ const SERVICE: &str = "OpenRouter";
 const API: &str = "https://openrouter.ai/api/v1";
 const EXCERPT_LIMIT: usize = 12_000;
 
+mod studio;
+pub use studio::*;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Model {
     pub id: String,
     pub name: String,
     pub context_length: Option<u64>,
+    pub pricing: Option<Pricing>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Pricing {
+    pub prompt: Option<String>,
+    pub completion: Option<String>,
+}
+
+impl Pricing {
+    pub fn rates(&self) -> Option<(f64, f64)> {
+        let parse = |value: &Option<String>| {
+            value
+                .as_ref()?
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite() && *n >= 0.)
+        };
+        Some((parse(&self.prompt)?, parse(&self.completion)?))
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    pub cost: Option<f64>,
+}
+
+impl Usage {
+    pub fn estimated_cost(&self, pricing: Option<&Pricing>) -> Option<f64> {
+        self.cost.filter(|n| n.is_finite() && *n >= 0.).or_else(|| {
+            let (input, output) = pricing?.rates()?;
+            Some(self.prompt_tokens as f64 * input + self.completion_tokens as f64 * output)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatReply {
+    pub text: String,
+    pub model: Option<String>,
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -121,29 +171,56 @@ impl OpenRouter {
     }
 
     pub fn chat(&self, messages: &[Message]) -> Result<String> {
-        self.completion(messages, false)
+        self.completion(messages, false, 1200)
     }
 
-    fn completion(&self, messages: &[Message], structured: bool) -> Result<String> {
+    fn request(
+        &self,
+        messages: &[Message],
+        structured: bool,
+        stream: bool,
+        max_tokens: u32,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         if messages.is_empty() {
             return Err(Error::Other("Enter a message first".into()));
         }
         let mut payload = json!({
             "model": self.model,
             "messages": messages,
-            "max_tokens": 1200,
-            "stream": false
+            "max_tokens": max_tokens,
+            "stream": stream
         });
+        if stream {
+            payload["stream_options"] = json!({"include_usage": true});
+        }
         if structured {
             payload["response_format"] = json!({"type": "json_object"});
         }
+        self.agent
+            .post(format!("{}/chat/completions", self.base))
+            .header("Authorization", self.authorization()?)
+            .header("Content-Type", "application/json")
+            .header(
+                "Accept",
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+            )
+            .send(payload.to_string())
+            .map_err(|error| network::response_error(SERVICE, error))
+    }
+
+    fn completion(
+        &self,
+        messages: &[Message],
+        structured: bool,
+        max_tokens: u32,
+    ) -> Result<String> {
         let response: Value = network::json(
             SERVICE,
-            self.agent
-                .post(format!("{}/chat/completions", self.base))
-                .header("Authorization", self.authorization()?)
-                .header("Content-Type", "application/json")
-                .send(payload.to_string()),
+            Ok(self.request(messages, structured, false, max_tokens)?),
         )?;
         if response["choices"][0]["finish_reason"].as_str() == Some("length") {
             return Err(Error::Other(
@@ -158,12 +235,73 @@ impl OpenRouter {
             .ok_or_else(|| Error::Other("OpenRouter: the model did not return text".into()))
     }
 
+    pub fn chat_stream(
+        &self,
+        messages: &[Message],
+        mut delta: impl FnMut(&str) -> Result<()>,
+    ) -> Result<ChatReply> {
+        let mut response = self.request(messages, false, true, 1600)?;
+        let mut reader = BufReader::new(response.body_mut().as_reader().take(2 * 1024 * 1024));
+        let mut reply = ChatReply {
+            text: String::new(),
+            model: None,
+            usage: None,
+        };
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .map_err(|_| Error::Other("OpenRouter: stream interrupted".into()))?
+                == 0
+            {
+                return Err(Error::Other(
+                    "OpenRouter: stream ended before completion".into(),
+                ));
+            }
+            let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            let event: Value = serde_json::from_str(data)
+                .map_err(|_| Error::Other("OpenRouter: invalid streaming response".into()))?;
+            if !event["error"].is_null() {
+                return Err(Error::Other(
+                    "OpenRouter: the model stopped before completing its response".into(),
+                ));
+            }
+            if let Some(model) = event["model"].as_str() {
+                reply.model = Some(model.to_owned());
+            }
+            if let Ok(usage) = serde_json::from_value(event["usage"].clone()) {
+                reply.usage = Some(usage);
+            }
+            if let Some(text) = event["choices"][0]["delta"]["content"].as_str() {
+                delta(text)?;
+                reply.text.push_str(text);
+            }
+            if event["choices"][0]["finish_reason"].as_str() == Some("length") {
+                return Err(Error::Other(
+                    "OpenRouter: the model's response was truncated".into(),
+                ));
+            }
+        }
+        if reply.text.trim().is_empty() {
+            return Err(Error::Other(
+                "OpenRouter: the model did not return text".into(),
+            ));
+        }
+        Ok(reply)
+    }
+
     pub fn suggest(&self, context: &BookContext) -> Result<Suggestion> {
         let messages = [
             context.system_message(),
             Message::new(Role::User, "Suggest a short book description and up to 12 useful library tags. Return a JSON object with a plain text description string and a tags array of strings. Do not invent details; use an empty description if there is insufficient information."),
         ];
-        let response = self.completion(&messages, true)?;
+        let response = self.completion(&messages, true, 1200)?;
         let mut suggestion: Suggestion = serde_json::from_str(&response).map_err(|_| {
             Error::Other(
                 "OpenRouter: the model returned invalid suggestions; try another model".into(),
@@ -231,6 +369,69 @@ mod tests {
     use super::*;
     use crate::network::test::serve;
     use crate::Chapter;
+
+    #[test]
+    fn openrouter_stream_rejects_truncation_and_missing_end_marker() {
+        for (body, expected) in [
+            (
+                r#"data: {"choices":[{"finish_reason":"length"}]}"#,
+                "response was truncated",
+            ),
+            (
+                r#"data: {"choices":[{"delta":{"content":"partial result"}}]}"#,
+                "stream ended before completion",
+            ),
+        ] {
+            let (base, server) = serve("200 OK", body, |_, _| ());
+            let client = OpenRouter {
+                base,
+                ..OpenRouter::new(Some("test-only"), "p/m")
+            };
+            let error = client
+                .chat_stream(&[Message::new(Role::User, "hi")], |_| Ok(()))
+                .unwrap_err();
+            assert!(error.to_string().contains(expected));
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn openrouter_stream_delivers_text_and_usage() {
+        let body = [
+            ": OPENROUTER PROCESSING",
+            r#"data: {"model":"p/m","choices":[{"delta":{"content":"Hello"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":" reader"}}]}"#,
+            r#"data: {"usage":{"prompt_tokens":20,"completion_tokens":2,"cost":0.002}}"#,
+            "data: [DONE]",
+        ]
+        .join("\n\n");
+        let (base, server) = serve("200 OK", body, |headers, body| {
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("accept: text/event-stream"));
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        });
+        let client = OpenRouter {
+            base,
+            ..OpenRouter::new(Some("test-only"), "p/m")
+        };
+        let mut parts = Vec::new();
+        let reply = client
+            .chat_stream(&[Message::new(Role::User, "hi")], |part| {
+                parts.push(part.to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(parts, ["Hello", " reader"]);
+        assert_eq!(reply.text, "Hello reader");
+        assert_eq!(reply.model.as_deref(), Some("p/m"));
+        let usage = reply.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 20);
+        assert_eq!(usage.estimated_cost(None), Some(0.002));
+        server.join().unwrap();
+    }
 
     #[test]
     fn openrouter_sends_model_key_and_explicit_book_context() {

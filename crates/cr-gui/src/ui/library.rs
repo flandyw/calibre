@@ -310,6 +310,16 @@ fn list_header(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .child(count),
         )
         .child(div().flex_1())
+        .child(
+            Button::new("ai-library-studio")
+                .outline()
+                .small()
+                .label("AI Studio")
+                .disabled(app.job.is_some())
+                .on_click(cx.listener(|app, _, window, cx| {
+                    app.open_studio(crate::studio::Mode::Librarian, false, window, cx)
+                })),
+        )
         .when(!recent, |this| {
             this.child(
                 Button::new("sort-menu")
@@ -613,6 +623,16 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .menu("Edit Metadata…", Box::new(EditMetadata))
         .menu_with_disabled("Ask AI…", app.job.is_some(), Box::new(AskAi))
         .menu_with_disabled(
+            "Read Next from This Book…",
+            app.job.is_some(),
+            Box::new(AiReadNext),
+        )
+        .menu_with_disabled(
+            "AI Metadata Cleanup…",
+            app.job.is_some(),
+            Box::new(AiCleanup),
+        )
+        .menu_with_disabled(
             "Download Metadata…",
             app.job.is_some(),
             Box::new(DownloadMetadata),
@@ -628,6 +648,13 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .separator()
         .menu("Copy Title and Author", Box::new(CopyBookInfo))
         .menu("Export…", Box::new(ExportSelected));
+    for (index, preset) in app.settings.ai_presets.iter().enumerate() {
+        menu = menu.menu_with_disabled(
+            format!("AI: {}…", preset.name),
+            app.job.is_some(),
+            Box::new(RunAiPreset(index)),
+        );
+    }
     if !app.devices.is_empty() {
         let mut send = NativeMenu::new();
         for (index, device) in app.devices.iter().enumerate() {

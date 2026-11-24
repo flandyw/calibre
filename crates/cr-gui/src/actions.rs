@@ -56,6 +56,9 @@ actions!(
         AttachFormats,
         EditMetadata,
         AskAi,
+        AiStudio,
+        AiReadNext,
+        AiCleanup,
         DownloadMetadata,
         ChangeCover,
         CropCover,
@@ -127,6 +130,10 @@ pub enum FormatCommand {
 #[derive(Clone, PartialEq, Debug, Action)]
 #[action(namespace = calibre, no_json)]
 pub struct BookFormatAction(pub FormatCommand, pub String);
+
+#[derive(Clone, PartialEq, Debug, Action)]
+#[action(namespace = calibre, no_json)]
+pub struct RunAiPreset(pub usize);
 
 /// Key context of the main window. Its bindings work everywhere in the window
 /// unless a focused text field claims the same keystroke.
@@ -377,6 +384,7 @@ pub fn app_menus(settings: &Settings) -> Vec<Menu> {
         MenuItem::action("Read", ReadBook),
         MenuItem::action("Edit Metadata…", EditMetadata),
         MenuItem::action("Ask AI…", AskAi),
+        MenuItem::action("AI Library Studio…", AiStudio),
         MenuItem::action("Download Metadata…", DownloadMetadata),
         MenuItem::action("Attach Formats…", AttachFormats),
         MenuItem::separator(),

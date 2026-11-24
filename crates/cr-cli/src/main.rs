@@ -1,6 +1,7 @@
 //! `cr` — the calibre-rust command line interface.
 
 mod online;
+mod studio;
 
 use std::collections::BTreeMap;
 use std::fs;

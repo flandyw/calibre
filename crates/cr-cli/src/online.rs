@@ -1,3 +1,4 @@
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
@@ -40,6 +41,10 @@ enum AiCommand {
         #[arg(long, value_enum, value_delimiter = ',')]
         apply: Vec<AiField>,
     },
+    /// Ask your library, translate searches, and preview organization suggestions
+    Library(crate::studio::LibraryArgs),
+    /// Get a recap, characters, discussion questions, translation, or reading time
+    Book(crate::studio::BookArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -80,12 +85,29 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
             }
             let library = Library::open(path)?;
             let context = context(&library, id, excerpt)?;
-            let answer =
-                client.chat(&[context.system_message(), Message::new(Role::User, question)])?;
+            let answer = client.chat_stream(
+                &[context.system_message(), Message::new(Role::User, question)],
+                |text| {
+                    if !json_output {
+                        print!("{text}");
+                        io::stdout().flush()?;
+                    }
+                    Ok(())
+                },
+            )?;
             if json_output {
-                println!("{}", json!({"id": id, "answer": answer}));
+                println!(
+                    "{}",
+                    json!({"id": id, "answer": answer.text, "model": answer.model, "usage": answer.usage})
+                );
             } else {
-                println!("{answer}");
+                println!();
+                if let Some(usage) = answer.usage {
+                    eprintln!(
+                        "{} input + {} output tokens",
+                        usage.prompt_tokens, usage.completion_tokens
+                    );
+                }
             }
         }
         AiCommand::Suggest { id, excerpt, apply } => {
@@ -123,6 +145,8 @@ pub fn ai(args: AiArgs, path: &Path, json_output: bool) -> Result<()> {
                 }
             }
         }
+        AiCommand::Library(args) => crate::studio::library(args, &client, path, json_output)?,
+        AiCommand::Book(args) => crate::studio::book(args, &client, path, json_output)?,
     }
     Ok(())
 }

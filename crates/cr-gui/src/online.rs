@@ -1,9 +1,13 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use cr_core::ai::{BookContext, Message, Model, OpenRouter, Role, Suggestion};
+use cr_core::ai::{
+    reading_minutes, recap_messages, BookAction, BookContext, ChatReply, Message, Model,
+    OpenRouter, Role, Suggestion,
+};
 use cr_core::online_metadata::{Candidate, Catalog, Field, Query, Source};
 use cr_core::{BookUpdate, Error, Library, Metadata};
+use futures::StreamExt as _;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::*;
 use gpui_kit::*;
@@ -20,8 +24,14 @@ pub struct Online {
     pub author: Entity<InputState>,
     pub isbn: Entity<InputState>,
     pub question: Entity<InputState>,
+    pub chapter: Entity<InputState>,
+    pub language: Entity<InputState>,
+    pub preset_name: Entity<InputState>,
+    pub preset_prompt: Entity<InputState>,
+    pub preset_edit: Option<usize>,
     pub metadata: Option<MetadataSession>,
     pub ai: Option<AiSession>,
+    pub studio: crate::studio::Studio,
 }
 
 impl Online {
@@ -40,14 +50,21 @@ impl Online {
             author: text_input("Author", window, cx),
             isbn: text_input("ISBN (optional)", window, cx),
             question: text_input("Ask a question about this book", window, cx),
+            chapter: text_input("Chapter #", window, cx),
+            language: text_input("Target language", window, cx),
+            preset_name: text_input("Action name", window, cx),
+            preset_prompt: text_input("Prompt template", window, cx),
+            preset_edit: None,
             metadata: None,
             ai: None,
+            studio: crate::studio::Studio::new(window, cx),
         }
     }
 
     pub fn clear_dialogs(&mut self) {
         self.metadata = None;
         self.ai = None;
+        self.studio.session = None;
     }
 }
 
@@ -84,6 +101,20 @@ pub struct AiSession {
     pub suggestion: Option<Suggestion>,
     pub fields: Vec<Field>,
     pub status: String,
+    pub streaming: String,
+    pub usage: String,
+    pub local_result: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BookTask {
+    Chat,
+    Suggest,
+    Characters,
+    Discussion,
+    Translate,
+    Recap,
+    ReadingTime,
 }
 
 fn picture(bytes: &[u8]) -> Arc<Image> {
@@ -91,7 +122,7 @@ fn picture(bytes: &[u8]) -> Arc<Image> {
 }
 
 impl CalibreApp {
-    fn openrouter(&self, cx: &App) -> OpenRouter {
+    pub(crate) fn openrouter(&self, cx: &App) -> OpenRouter {
         let key = self.online.key.read(cx).value();
         OpenRouter::new(Some(key.as_ref()), &self.settings.openrouter_model)
     }
@@ -400,6 +431,8 @@ impl CalibreApp {
             return;
         };
         set_input(&self.online.question, String::new(), window, cx);
+        set_input(&self.online.chapter, String::new(), window, cx);
+        set_input(&self.online.language, String::new(), window, cx);
         self.online.ai = Some(AiSession {
             id,
             current,
@@ -408,6 +441,9 @@ impl CalibreApp {
             suggestion: None,
             fields: Vec::new(),
             status: String::new(),
+            streaming: String::new(),
+            usage: String::new(),
+            local_result: String::new(),
         });
         let weak = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -430,8 +466,121 @@ impl CalibreApp {
         });
     }
 
+    pub fn open_ai_preset(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(preset) = self.settings.ai_presets.get(index).cloned() else {
+            return;
+        };
+        self.open_ai(window, cx);
+        if let Some(session) = &self.online.ai {
+            set_input(
+                &self.online.question,
+                preset.render(&session.current),
+                window,
+                cx,
+            );
+        }
+    }
+
+    pub fn edit_ai_preset(
+        &mut self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.online.preset_edit = index;
+        let (name, prompt) = index
+            .and_then(|index| self.settings.ai_presets.get(index))
+            .map(|preset| (preset.name.clone(), preset.prompt.clone()))
+            .unwrap_or_default();
+        set_input(&self.online.preset_name, name, window, cx);
+        set_input(&self.online.preset_prompt, prompt, window, cx);
+        cx.notify();
+    }
+
+    pub fn save_ai_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.online.preset_name.read(cx).value().trim().to_owned();
+        let prompt = self.online.preset_prompt.read(cx).value().trim().to_owned();
+        let index = self.online.preset_edit;
+        if name.is_empty()
+            || prompt.is_empty()
+            || name.chars().count() > 80
+            || prompt.chars().count() > 4000
+        {
+            self.announce(
+                "Enter a preset name (up to 80 characters) and a prompt (up to 4,000).",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        if self
+            .settings
+            .ai_presets
+            .iter()
+            .enumerate()
+            .any(|(i, preset)| Some(i) != index && preset.name.eq_ignore_ascii_case(&name))
+        {
+            self.announce(
+                "That AI preset name is already in use.",
+                Tone::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.update_preferences(
+            |settings| {
+                let preset = cr_core::ai::PromptPreset { name, prompt };
+                if let Some(item) = index.and_then(|index| settings.ai_presets.get_mut(index)) {
+                    *item = preset;
+                } else {
+                    settings.ai_presets.push(preset);
+                }
+            },
+            cx,
+        );
+        self.edit_ai_preset(None, window, cx);
+    }
+
+    pub fn delete_ai_preset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .online
+            .preset_edit
+            .filter(|&i| i < self.settings.ai_presets.len())
+        {
+            self.update_preferences(
+                |settings| {
+                    settings.ai_presets.remove(index);
+                },
+                cx,
+            );
+            self.edit_ai_preset(None, window, cx);
+        }
+    }
+
     pub fn run_ai(&mut self, suggest: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_book_task(
+            if suggest {
+                BookTask::Suggest
+            } else {
+                BookTask::Chat
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub fn run_book_task(&mut self, task: BookTask, window: &mut Window, cx: &mut Context<Self>) {
+        if self.job.is_some() {
+            return;
+        }
         let client = self.openrouter(cx);
+        let models = self.online.models.clone();
+        let model = self.settings.openrouter_model.clone();
         let Some(session) = self.online.ai.as_mut() else {
             return;
         };
@@ -439,61 +588,189 @@ impl CalibreApp {
             return;
         };
         let prompt = self.online.question.read(cx).value().trim().to_string();
-        if !suggest && prompt.is_empty() {
-            session.status = "Enter a question first.".into();
+        let chapter = self
+            .online
+            .chapter
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<usize>()
+            .ok();
+        let language = self.online.language.read(cx).value().trim().to_string();
+        if task == BookTask::Chat && prompt.is_empty()
+            || task == BookTask::Recap && !chapter.is_some_and(|chapter| chapter > 0)
+            || task == BookTask::Translate
+                && (language.is_empty() || session.current.comments.is_none())
+        {
+            session.status = match task {
+                BookTask::Recap => "Enter the number of the last chapter you've read.",
+                BookTask::Translate => "Enter a target language for a book with a description.",
+                _ => "Enter a question first.",
+            }
+            .into();
             cx.notify();
             return;
         }
-        let excerpt = session.excerpt;
+        let excerpt = session.excerpt
+            && !matches!(
+                task,
+                BookTask::Recap | BookTask::ReadingTime | BookTask::Translate
+            );
         let root = library.root().to_path_buf();
         let (id, metadata) = (session.id, session.current.clone());
         let history = session.history.clone();
-        session.status = "Waiting for OpenRouter…".into();
-        if suggest {
+        session.status = if task == BookTask::ReadingTime {
+            "Counting words locally…"
+        } else {
+            "Waiting for OpenRouter…"
+        }
+        .into();
+        session.streaming.clear();
+        session.usage.clear();
+        session.local_result.clear();
+        if task == BookTask::Suggest {
             session.suggestion = None;
             session.fields.clear();
         }
+        let (sender, mut receiver) = futures::channel::mpsc::unbounded::<String>();
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(part) = receiver.next().await {
+                let _ = this.update(cx, |app, cx| {
+                    if let Some(session) = app
+                        .online
+                        .ai
+                        .as_mut()
+                        .filter(|session| session.id == id && app.job.is_some())
+                    {
+                        session.streaming.push_str(&part);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
         self.run_job(
-            "Asking OpenRouter",
+            if task == BookTask::ReadingTime {
+                "Estimating reading time"
+            } else {
+                "Asking OpenRouter"
+            },
             window,
             cx,
             move |job| {
-                let excerpt = excerpt
+                let needs_book = excerpt || matches!(task, BookTask::Recap | BookTask::ReadingTime);
+                let text = needs_book
                     .then(|| Library::open(&root)?.read_book(id, None))
                     .transpose()?;
                 job.check()?;
-                let context = BookContext::new(&metadata, excerpt.as_ref());
-                if suggest {
-                    client.suggest(&context).map(AiReply::Suggestion)
-                } else {
-                    let mut messages = vec![context.system_message()];
-                    messages.extend(history.into_iter().map(|mut message| {
-                        message.content = message.content.chars().take(4_000).collect();
-                        message
-                    }));
-                    messages.push(Message::new(Role::User, &prompt));
-                    client
-                        .chat(&messages)
-                        .map(|answer| AiReply::Answer(prompt, answer))
-                }
+                let context = BookContext::new(&metadata, text.as_ref().filter(|_| excerpt));
+                let (label, messages) = match task {
+                    BookTask::Suggest => return client.suggest(&context).map(AiReply::Suggestion),
+                    BookTask::ReadingTime => {
+                        let minutes = text.as_ref().map_or(0, reading_minutes);
+                        return Ok(AiReply::Local(format!(
+                            "About {minutes} minutes at 230 words per minute (computed locally)."
+                        )));
+                    }
+                    BookTask::Recap => {
+                        let chapter = chapter
+                            .ok_or_else(|| Error::Other("Enter a chapter number.".into()))?;
+                        let text = text
+                            .as_ref()
+                            .ok_or_else(|| Error::Other("No readable book text.".into()))?;
+                        (
+                            format!("Recap through chapter {chapter}"),
+                            recap_messages(&metadata, text, chapter)?,
+                        )
+                    }
+                    _ => {
+                        let (label, ask) = match task {
+                            BookTask::Characters => {
+                                ("Character list".into(), BookAction::Characters.prompt())
+                            }
+                            BookTask::Discussion => (
+                                "Discussion questions".into(),
+                                BookAction::Discussion.prompt(),
+                            ),
+                            BookTask::Translate => (
+                                format!("Translate description to {language}"),
+                                BookAction::Translate(&language).prompt(),
+                            ),
+                            _ => (prompt.clone(), prompt),
+                        };
+                        let mut messages = vec![context.system_message()];
+                        if task == BookTask::Chat {
+                            messages.extend(history.into_iter().map(|mut message| {
+                                message.content = message.content.chars().take(4_000).collect();
+                                message
+                            }));
+                        }
+                        messages.push(Message::new(Role::User, ask));
+                        (label, messages)
+                    }
+                };
+                let reply = client.chat_stream(&messages, |part| {
+                    job.check()?;
+                    let _ = sender.unbounded_send(part.to_owned());
+                    Ok(())
+                })?;
+                let usage = reply
+                    .usage
+                    .as_ref()
+                    .map(|usage| {
+                        let model = reply.model.as_deref().unwrap_or(&model);
+                        let pricing = models
+                            .iter()
+                            .find(|item| item.id == model)
+                            .and_then(|item| item.pricing.clone());
+                        let pricing = if pricing.is_none()
+                            && usage.estimated_cost(None).is_none()
+                            && job.check().is_ok()
+                        {
+                            client.models().ok().and_then(|models| {
+                                models.into_iter().find(|item| item.id == model)?.pricing
+                            })
+                        } else {
+                            pricing
+                        };
+                        let cost = usage
+                            .estimated_cost(pricing.as_ref())
+                            .map(|cost| format!(" · about ${cost:.6} USD"))
+                            .unwrap_or_default();
+                        format!(
+                            "{} input + {} output tokens{cost}",
+                            usage.prompt_tokens, usage.completion_tokens
+                        )
+                    })
+                    .unwrap_or_default();
+                Ok(AiReply::Answer(label, reply, usage))
             },
-            |app, result, window, cx| {
+            move |app, result, window, cx| {
                 let Some(session) = app.online.ai.as_mut() else {
                     return;
                 };
                 session.status.clear();
+                session.streaming.clear();
                 match result {
                     Ok(AiReply::Suggestion(suggestion)) => {
                         session.suggestion = Some(suggestion);
                     }
-                    Ok(AiReply::Answer(prompt, answer)) => {
+                    Ok(AiReply::Answer(prompt, answer, usage)) => {
+                        session.usage = usage;
+                        if task != BookTask::Chat {
+                            session.local_result = format!("{prompt}\n{}", answer.text);
+                            return;
+                        }
                         if session.history.len() >= 12 {
                             session.history.drain(..2);
                         }
                         session.history.push(Message::new(Role::User, prompt));
-                        session.history.push(Message::new(Role::Assistant, answer));
+                        session
+                            .history
+                            .push(Message::new(Role::Assistant, answer.text));
                         set_input(&app.online.question, String::new(), window, cx);
                     }
+                    Ok(AiReply::Local(answer)) => session.local_result = answer,
                     Err(error) => session.status = error.to_string(),
                 }
             },
@@ -566,6 +843,7 @@ impl CalibreApp {
 }
 
 enum AiReply {
-    Answer(String, String),
+    Answer(String, ChatReply, String),
+    Local(String),
     Suggestion(Suggestion),
 }
