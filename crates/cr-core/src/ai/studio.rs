@@ -367,7 +367,11 @@ impl CleanupDraft {
                 format!(
                     "{} #{}",
                     self.series.as_ref()?,
-                    self.series_index.unwrap_or(1.0)
+                    self.series_index.unwrap_or(if book.series.is_some() {
+                        book.series_index
+                    } else {
+                        1.0
+                    })
                 ),
             ),
             CleanupField::Tags => (
@@ -398,7 +402,10 @@ impl CleanupDraft {
                 has(CleanupField::Authors) && authors.len() == current.authors.len()
             }),
             series: series.map(|series| Some(series.clone())),
-            series_index: series.map(|_| self.series_index.unwrap_or(1.0)),
+            series_index: series.and_then(|_| {
+                self.series_index
+                    .or_else(|| current.series.is_none().then_some(1.0))
+            }),
             tags: has(CleanupField::Tags)
                 .then(|| self.merged_tags(&current.tags))
                 .flatten(),
@@ -674,6 +681,31 @@ mod tests {
             .save(&mut library, "double feature", true)
             .is_err());
         mock.join().unwrap();
+    }
+
+    #[test]
+    fn cleanup_series_name_keeps_unspecified_volume_number() {
+        let (_dir, mut library, _) = catalog();
+        library
+            .update_book(
+                1,
+                &BookUpdate {
+                    series: Some(Some("Corrected seris".into())),
+                    series_index: Some(7.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let draft: CleanupDraft =
+            serde_json::from_value(json!({"id":1,"series":"Corrected Series"})).unwrap();
+        let (_, proposed) = draft
+            .values(&library.get_summary(1).unwrap(), CleanupField::Series)
+            .unwrap();
+        assert_eq!(proposed, "Corrected Series #7");
+        let update = draft.update(&library.get_metadata(1).unwrap(), &[CleanupField::Series]);
+        assert_eq!(update.series_index, None);
+        library.update_book(1, &update).unwrap();
+        assert_eq!(library.get_summary(1).unwrap().series_index, 7.0);
     }
 
     #[test]
