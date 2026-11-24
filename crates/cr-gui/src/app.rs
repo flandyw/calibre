@@ -293,6 +293,7 @@ pub struct CalibreApp {
     pub list_scroll: UniformListScrollHandle,
     pub grid_scroll: ScrollHandle,
     pub reader_scroll: ScrollHandle,
+    pub focus_reveal: crate::ui::reveal::FocusReveal,
     /// Width of the cover grid from the last layout, for keyboard navigation.
     pub grid_width: Rc<Cell<f32>>,
     last_window_title: String,
@@ -511,6 +512,7 @@ impl CalibreApp {
             list_scroll: UniformListScrollHandle::new(),
             grid_scroll: ScrollHandle::new(),
             reader_scroll: ScrollHandle::new(),
+            focus_reveal: Default::default(),
             grid_width: Rc::new(Cell::new(0.0)),
             last_window_title: String::new(),
             last_window_document: None,

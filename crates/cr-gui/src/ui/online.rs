@@ -16,6 +16,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 
 use super::ai;
+use super::reveal::{FollowFocus as _, RevealOnFocus as _};
 use crate::app::CalibreApp;
 use crate::online::{AiCopySource, BookTask, StatusTone};
 
@@ -190,6 +191,7 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                             }
                         })),
                 )
+                .reveal_on_focus()
         })
         .collect::<Vec<_>>();
     let show_openrouter = matches!(selected, Provider::OpenRouter | Provider::Auto);
@@ -266,7 +268,13 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
         .child(
             v_flex()
                 .gap_1p5()
-                .child(h_flex().flex_wrap().gap_1().children(provider_buttons))
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(provider_buttons)
+                        .reveal_on_focus(),
+                )
                 .child(div().text_xs().text_color(muted).child(provider_note)),
         )
         .when(show_openrouter, |this| {
@@ -357,7 +365,8 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                                 app.load_ai_models(window, cx);
                             })),
                     )
-                }),
+                })
+                .reveal_on_focus(),
         )
         .when_some(app.online.connection.clone(), |this, status| {
             this.child(match app.online.connection_ok {
@@ -384,6 +393,7 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                     .border_1()
                     .border_color(theme.border)
                     .overflow_y_scroll()
+                    .follow_focus(&app.focus_reveal.scroll("ai-models"))
                     .child(v_flex().children(model_rows)),
             )
         })
@@ -411,7 +421,7 @@ fn preset_editor(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> Div {
         .child(div().font_weight(FontWeight::SEMIBOLD).child("Book action presets"))
         .child(div().text_sm().text_color(cx.theme().muted_foreground)
             .child("Create reusable prompts for the book context menu. Variables: {title}, {authors}, {description}, {series}, {tags}, {publisher}, {language}."))
-        .child(h_flex().gap_2().flex_wrap().children(rows))
+        .child(h_flex().gap_2().flex_wrap().children(rows).reveal_on_focus())
         .child(field("Action name", Input::new(&app.online.preset_name).w_full()))
         .child(field("Prompt template", Input::new(&app.online.preset_prompt).w_full()))
         .child(h_flex().gap_2()
@@ -422,7 +432,8 @@ fn preset_editor(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> Div {
                 .child(Button::new("ai-cancel-preset").ghost().small().label("Cancel Edit")
                     .on_click(cx.listener(|app, _, window, cx| app.edit_ai_preset(None, window, cx))))
                 .child(Button::new("ai-delete-preset").ghost().small().label("Delete Preset")
-                    .on_click(cx.listener(|app, _, window, cx| app.delete_ai_preset(window, cx))))))
+                    .on_click(cx.listener(|app, _, window, cx| app.delete_ai_preset(window, cx)))))
+            .reveal_on_focus())
 }
 
 pub fn metadata_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
@@ -490,6 +501,7 @@ pub fn metadata_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEle
                             app.preview_online_candidate(index, window, cx)
                         })),
                 )
+                .reveal_on_focus()
         })
         .collect::<Vec<_>>();
     let comparison = session.preview.as_ref().map(|preview| {
@@ -585,6 +597,7 @@ pub fn metadata_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEle
                             .flex_shrink_0()
                             .max_h(px(322.))
                             .overflow_y_scroll()
+                            .follow_focus(&app.focus_reveal.scroll("online-search-results"))
                             .pr_2()
                             .border_r_1()
                             .border_color(cx.theme().border)
@@ -599,6 +612,7 @@ pub fn metadata_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEle
                             .min_w_0()
                             .max_h(px(322.))
                             .overflow_y_scroll()
+                            .follow_focus(&app.focus_reveal.scroll("online-metadata-comparison"))
                             .child(comparison),
                     )
                 }),
@@ -783,7 +797,8 @@ pub fn ai_dialog(
                                         cx.notify();
                                     }
                                 })),
-                        ),
+                        )
+                        .reveal_on_focus(),
                 ),
             cx,
         )
@@ -801,7 +816,8 @@ pub fn ai_dialog(
                             format!("Description in {language}"),
                             cx,
                         )
-                        .child(copy_button("copy-ai-translation", translated.clone(), cx)),
+                        .child(copy_button("copy-ai-translation", translated.clone(), cx))
+                        .reveal_on_focus(),
                     )
                     .when(*truncated, |card| {
                         card.child(ai::status_line(
@@ -840,7 +856,8 @@ pub fn ai_dialog(
                                             cx.notify();
                                         }
                                     })),
-                            ),
+                            )
+                            .reveal_on_focus(),
                     ),
                 cx,
             )
@@ -855,11 +872,9 @@ pub fn ai_dialog(
             "ai-local-result",
             ai::card(cx)
                 .child(
-                    ai::card_title(icon, session.local_title.clone(), cx).child(copy_button(
-                        "copy-ai-local",
-                        session.local_copy_text(),
-                        cx,
-                    )),
+                    ai::card_title(icon, session.local_title.clone(), cx)
+                        .child(copy_button("copy-ai-local", session.local_copy_text(), cx))
+                        .reveal_on_focus(),
                 )
                 .child(ai::markdown("ai-local-text", session.local_result.clone())),
             cx,
@@ -884,11 +899,15 @@ pub fn ai_dialog(
                 v_flex()
                     .gap_1()
                     .child(ai::markdown(("chat-text", index), message.content.clone()))
-                    .child(copy_button(
-                        ("copy-chat", index),
-                        message.content.clone(),
-                        cx,
-                    )),
+                    .child(
+                        h_flex()
+                            .child(copy_button(
+                                ("copy-chat", index),
+                                message.content.clone(),
+                                cx,
+                            ))
+                            .reveal_on_focus(),
+                    ),
                 cx,
             ),
             _ => ai::user_turn(("chat-message", index), message.content.clone(), cx),
@@ -921,7 +940,7 @@ pub fn ai_dialog(
         .border_1()
         .border_color(theme.border)
         .overflow_y_scroll()
-        .track_scroll(&session.scroll)
+        .follow_focus(&session.scroll)
         .map(|area| {
             if turns.is_empty() {
                 let starters =
@@ -951,7 +970,8 @@ pub fn ai_dialog(
                             .justify_center()
                             .gap_2()
                             .pt_1()
-                            .children(starters),
+                            .children(starters)
+                            .reveal_on_focus(),
                     ),
                 )
             } else {
@@ -1304,6 +1324,7 @@ fn field(title: &'static str, content: impl IntoElement) -> Div {
         .gap_1()
         .child(div().text_sm().child(title))
         .child(content)
+        .reveal_on_focus()
 }
 
 fn comparison_header(cx: &App) -> Div {
@@ -1328,6 +1349,7 @@ fn comparison_row(selector: Checkbox, current: AnyElement, proposed: AnyElement,
         .child(div().w(px(112.)).flex_shrink_0().child(selector))
         .child(div().flex_1().min_w_0().child(current))
         .child(div().flex_1().min_w_0().child(proposed))
+        .reveal_on_focus()
 }
 
 fn cell(value: Option<String>, cx: &App) -> AnyElement {

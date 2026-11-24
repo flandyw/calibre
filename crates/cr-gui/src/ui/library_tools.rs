@@ -6,6 +6,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::reveal::{revealed, RevealOnFocus as _};
 use crate::app::CalibreApp;
 use crate::library_tools::CATALOG_FORMATS;
 use crate::settings::ImportDuplicates;
@@ -56,9 +57,16 @@ pub fn catalog_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElemen
                         .on_click(cx.listener(|app, _, window, cx| {
                             app.use_library_query_for_catalog(window, cx)
                         })),
-                ),
+                )
+                .reveal_on_focus(),
         )
-        .child(h_flex().gap_2().flex_wrap().children(formats))
+        .child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .children(formats)
+                .reveal_on_focus(),
+        )
         .child(
             h_flex()
                 .gap_2()
@@ -80,7 +88,8 @@ pub fn catalog_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElemen
                             .label(crate::actions::reveal_label())
                             .on_click(move |_, _, cx| cx.reveal_path(&path)),
                     )
-                }),
+                })
+                .reveal_on_focus(),
         )
         .into_any_element()
 }
@@ -134,7 +143,8 @@ pub fn full_text_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElem
                             report.indexed, report.unchanged, report.removed, report.failed.len()),
                         cx,
                     ))
-                }),
+                })
+                .reveal_on_focus(),
         )
         .children(failures)
         .when(indexed, |pane| {
@@ -157,7 +167,8 @@ pub fn full_text_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElem
                             .label("Clear")
                             .disabled(busy)
                             .on_click(cx.listener(|app, _, window, cx| app.clear_text_search(window, cx))),
-                    ),
+                    )
+                    .reveal_on_focus(),
             )
         })
         .when_some(state.text_hits.as_ref(), |pane, results| {
@@ -187,7 +198,8 @@ pub fn full_text_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElem
                                 .on_click(cx.listener(move |app, _, window, cx| app.read_library_book(id, None, Some(&selected_hit), window, cx))))
                             .child(Button::new(("show-hit", index)).ghost().small()
                                 .label("Show Book in Library")
-                                .on_click(cx.listener(move |app, _, window, cx| app.show_text_hit_in_library(id, window, cx)))),
+                                .on_click(cx.listener(move |app, _, window, cx| app.show_text_hit_in_library(id, window, cx))))
+                            .reveal_on_focus(),
                     )
             }))
         })
@@ -273,14 +285,15 @@ pub fn transfer_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEleme
                 )
                 .when_some(state.transfer_target.as_ref(), |row, path| {
                     row.child(detail(path.display().to_string(), cx))
-                }),
+                })
+                .reveal_on_focus(),
         )
         .when(!recent.is_empty(), |pane| {
             pane.child(detail("Recent libraries", cx))
-                .child(h_flex().gap_2().flex_wrap().children(recent))
+                .child(h_flex().gap_2().flex_wrap().children(recent).reveal_on_focus())
         })
         .child(detail("When the destination already has a matching book", cx))
-        .child(h_flex().gap_2().children(duplicates))
+        .child(h_flex().gap_2().children(duplicates).reveal_on_focus())
         .when(state.transfer_duplicates == ImportDuplicates::Merge, |pane| {
             pane.child(detail("Merging is available when copying books.", cx))
         })
@@ -291,7 +304,8 @@ pub fn transfer_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEleme
                     .on_click(cx.listener(|app, _, window, cx| app.start_transfer(false, window, cx))))
                 .child(Button::new("move-transfer").outline().small().label("Move Books…")
                     .disabled(!ready || !writable || state.transfer_duplicates == ImportDuplicates::Merge)
-                    .on_click(cx.listener(|app, _, window, cx| app.start_transfer(true, window, cx)))),
+                    .on_click(cx.listener(|app, _, window, cx| app.start_transfer(true, window, cx))))
+                .reveal_on_focus(),
         )
         .when_some(state.transfer_report.as_ref(), |pane, report| {
             let title = if report.cancelled { "Transfer stopped" } else { "Transfer complete" };
@@ -301,9 +315,9 @@ pub fn transfer_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEleme
                     report.merged, report.skipped, report.failures.len()), cx))
                 .children(report.failures.iter().take(20).cloned().map(|failure| detail(failure, cx)))
                 .when_some(state.transfer_target.clone(), |pane, path| {
-                    pane.child(Button::new("open-transfer-target").ghost().small().label("Open Destination Library")
+                    pane.child(revealed(Button::new("open-transfer-target").ghost().small().label("Open Destination Library")
                         .disabled(busy)
-                        .on_click(cx.listener(move |app, _, window, cx| { app.open_library(path.clone(), window, cx); })))
+                        .on_click(cx.listener(move |app, _, window, cx| { app.open_library(path.clone(), window, cx); }))))
                 })
         })
         .into_any_element()

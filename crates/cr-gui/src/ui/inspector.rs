@@ -13,6 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::library::book_context_menu;
+use super::reveal::{FollowFocus as _, RevealOnFocus as _};
 use super::widgets::{chip, cover_thumb, detail_row, empty_state, field, section_label, stars};
 use super::INSPECTOR_WIDTH;
 use crate::actions::*;
@@ -39,6 +40,7 @@ pub fn inspector(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
         .h_full()
         .flex_shrink_0()
         .overflow_y_scroll()
+        .follow_focus(&app.focus_reveal.scroll("inspector"))
         .bg(theme.sidebar)
         .border_l_1()
         .border_color(theme.sidebar_border)
@@ -160,7 +162,8 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                     book_context_menu(this).show(event.position(), window, cx);
                 })),
-        );
+        )
+        .reveal_on_focus();
 
     let mut header = v_flex().items_center().gap_3().child(cover).child(
         v_flex()
@@ -223,7 +226,8 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(DownloadMetadata), cx)
                     }),
-            ),
+            )
+            .reveal_on_focus(),
     );
 
     // Details table.
@@ -463,7 +467,8 @@ fn edit_form(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         .on_click(|_, window, cx| {
                             window.dispatch_action(Box::new(SaveChanges), cx)
                         }),
-                ),
+                )
+                .reveal_on_focus(),
         )
         .child(input("Title", &app.title_input, cx))
         .child(input("Authors", &app.authors_input, cx))

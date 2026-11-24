@@ -8,6 +8,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::reveal::{revealed, RevealOnFocus as _};
 use super::widgets::field;
 use crate::app::{set_textarea, CalibreApp};
 
@@ -74,6 +75,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .gap_2()
                 .flex_wrap()
                 .children(columns)
+                .reveal_on_focus()
                 .into_any_element()
         });
 
@@ -124,7 +126,8 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                             .on_click(cx.listener(|app, _, window, cx| {
                                 app.prompt_delete_custom_column(window, cx)
                             })),
-                    ),
+                    )
+                    .reveal_on_focus(),
             )
             .when(app.selected.is_some(), |body| {
                 body.child(field(
@@ -137,7 +140,13 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     body.child(div().text_sm().text_color(muted).child(help))
                 })
                 .when(!values.is_empty(), |body| {
-                    body.child(h_flex().gap_2().flex_wrap().children(values))
+                    body.child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .children(values)
+                            .reveal_on_focus(),
+                    )
                 })
                 .child(
                     h_flex()
@@ -160,7 +169,8 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                 .on_click(cx.listener(|app, _, window, cx| {
                                     app.load_custom_columns(window, cx)
                                 })),
-                        ),
+                        )
+                        .reveal_on_focus(),
                 )
             });
     }
@@ -191,9 +201,15 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         cx,
                     ))),
             )
-            .child(h_flex().gap_2().flex_wrap().children(types))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .children(types)
+                    .reveal_on_focus(),
+            )
             .when(state.datatype == "text", |section| {
-                section.child(
+                section.child(revealed(
                     Checkbox::new("custom-multiple")
                         .label("Allow multiple values")
                         .checked(state.multiple)
@@ -201,7 +217,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                             app.custom_columns.multiple = *checked;
                             cx.notify();
                         })),
-                )
+                ))
             })
             .when(state.datatype == "enumeration", |section| {
                 section.child(field(
@@ -210,7 +226,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     cx,
                 ))
             })
-            .child(
+            .child(revealed(
                 Button::new("create-custom-column")
                     .primary()
                     .small()
@@ -219,7 +235,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .on_click(
                         cx.listener(|app, _, window, cx| app.create_custom_column(window, cx)),
                     ),
-            ),
+            )),
     )
     .into_any_element()
 }

@@ -12,6 +12,7 @@ use cr_core::formats::reading::{Block, BlockKind, Book, Style};
 use cr_core::library::AnnotationKind;
 use gpui_kit::component::input::Input;
 
+use super::reveal::{FollowFocus as _, RevealOnFocus as _};
 use super::widgets::{empty_state, section_label};
 use crate::actions::*;
 use crate::app::{CalibreApp, ReaderPanel};
@@ -275,6 +276,7 @@ pub fn reader_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                                     .id("chapter-scroll")
                                     .flex_1()
                                     .overflow_y_scroll()
+                                    .follow_focus(&app.focus_reveal.scroll("chapter-scroll"))
                                     .px_2()
                                     .pb_3()
                                     .when(panel_rows.is_empty(), |this| {
@@ -360,6 +362,7 @@ fn panel_row(
                     )
                 }),
         )
+        .reveal_on_focus()
 }
 
 /// Flatten overlapping style spans, highlights and search matches into the

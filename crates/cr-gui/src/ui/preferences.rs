@@ -5,6 +5,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::*;
 use gpui_kit::*;
 
+use super::reveal::{revealed, FollowFocus as _, RevealOnFocus as _};
 use crate::actions::ClearRecentLibraries;
 use crate::app::CalibreApp;
 use crate::settings::{
@@ -155,6 +156,7 @@ pub fn preferences_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEl
         .id("preferences-scroll")
         .size_full()
         .overflow_y_scroll()
+        .follow_focus(&app.focus_reveal.scroll("preferences-scroll"))
         .child(
             v_flex()
                 .w_full()
@@ -299,7 +301,8 @@ pub fn preferences_body(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEl
                                         .on_click(cx.listener(|app, _, window, cx| {
                                             app.reset_preferences(window, cx)
                                         })),
-                                ),
+                                )
+                                .reveal_on_focus(),
                         ),
                 ),
         )
@@ -323,6 +326,7 @@ fn row(label: &'static str, control: impl IntoElement) -> Div {
         .text_sm()
         .child(label)
         .child(control)
+        .reveal_on_focus()
 }
 
 fn choices<T: Copy + Eq + 'static, const N: usize>(
@@ -357,11 +361,13 @@ fn toggle(
     checked: bool,
     set: fn(&mut Settings, bool),
     cx: &mut Context<CalibreApp>,
-) -> Checkbox {
-    Checkbox::new(id)
-        .label(label)
-        .checked(checked)
-        .on_click(cx.listener(move |app, value: &bool, _, cx| {
-            app.update_preferences(|settings| set(settings, *value), cx);
-        }))
+) -> Div {
+    revealed(
+        Checkbox::new(id)
+            .label(label)
+            .checked(checked)
+            .on_click(cx.listener(move |app, value: &bool, _, cx| {
+                app.update_preferences(|settings| set(settings, *value), cx);
+            })),
+    )
 }
