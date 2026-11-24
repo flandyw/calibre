@@ -545,12 +545,20 @@ impl CalibreApp {
                             .and_then(|idx| reader_chapter_text(book, idx, excerpt_limit))
                             .map(|(t, body)| (Some(t), Some(body)))
                             .unwrap_or_else(|| {
+                                let next_anchor_block = book
+                                    .toc
+                                    .iter()
+                                    .find(|entry| entry.target > locator)
+                                    .filter(|entry| entry.target.section == self.section_index)
+                                    .map(|entry| entry.target.block);
                                 let body = book
                                     .sections
                                     .get(self.section_index)
                                     .map(|section| {
+                                        let limit_blocks =
+                                            next_anchor_block.unwrap_or(section.blocks.len());
                                         let mut out = String::new();
-                                        for block in &section.blocks {
+                                        for block in section.blocks.iter().take(limit_blocks) {
                                             if matches!(block.kind, BlockKind::Image(_) | BlockKind::Rule) {
                                                 continue;
                                             }
