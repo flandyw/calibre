@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use cr_core::library::{BookSort, Collision, DuplicatePolicy, ExportOptions};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 const MAX_RECENT_LIBRARIES: usize = 10;
 pub const DEFAULT_READER_FONT_SIZE: f32 = 17.0;
@@ -227,17 +228,39 @@ impl Settings {
     }
 
     fn read_from(path: &Path) -> io::Result<Self> {
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(err) => return Err(err),
+        let mut fields = Self::read_fields(path)?;
+        let mut settings: Self = match serde_json::from_value(Value::Object(fields.clone())) {
+            Ok(settings) => settings,
+            Err(_) => {
+                // Settings fields are independent. Decode each on its own
+                // before falling back to its default, keeping valid neighbors.
+                fields.retain(|key, value| {
+                    let field = Map::from_iter([(key.clone(), value.clone())]);
+                    serde_json::from_value::<Self>(Value::Object(field)).is_ok()
+                });
+                serde_json::from_value(Value::Object(fields))?
+            }
         };
-        let mut settings: Self = serde_json::from_reader(io::BufReader::new(file))?;
         settings.reader_font_size = settings
             .reader_font_size
             .clamp(MIN_READER_FONT_SIZE, MAX_READER_FONT_SIZE);
         settings.recent_libraries.truncate(MAX_RECENT_LIBRARIES);
         Ok(settings)
+    }
+
+    fn read_fields(path: &Path) -> io::Result<Map<String, Value>> {
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Map::new()),
+            Err(err) => return Err(err),
+        };
+        match serde_json::from_reader(io::BufReader::new(file))? {
+            Value::Object(fields) => Ok(fields),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Expected a JSON object",
+            )),
+        }
     }
 
     pub fn save(&self, previous: &Self, reset_preferences: bool) -> Result<(), String> {
@@ -256,7 +279,7 @@ impl Settings {
             .ok_or("The settings path has no parent folder.")?;
         let write = || -> Result<(), Box<dyn std::error::Error>> {
             let previous = serde_json::to_value(previous)?;
-            let serde_json::Value::Object(mut changes) = serde_json::to_value(self)? else {
+            let Value::Object(mut changes) = serde_json::to_value(self)? else {
                 unreachable!("Settings serialize as a JSON object");
             };
             changes.retain(|key, value| {
@@ -276,21 +299,18 @@ impl Settings {
                 .truncate(false)
                 .open(parent.join("settings.lock"))?;
             lock.lock()?;
-            let latest = match Self::read_from(path) {
+            let mut merged = match Self::read_fields(path) {
                 Err(err)
                     if matches!(
                         err.kind(),
                         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
                     ) =>
                 {
-                    Self::default()
+                    Map::new()
                 }
                 settings => settings?,
             };
-            let mut merged = serde_json::to_value(latest)?;
-            for (key, value) in changes {
-                merged[key] = value;
-            }
+            merged.extend(changes);
             let mut file = tempfile::NamedTempFile::new_in(parent)?;
             serde_json::to_writer_pretty(&mut file, &merged)?;
             file.write_all(b"\n")?;
@@ -456,12 +476,34 @@ mod tests {
         };
         for broken in [r#"{"theme":"sepia"}"#, r#"{"theme":"#] {
             std::fs::write(&path, broken).unwrap();
-            assert!(Settings::read_from(&path).is_err());
             updated.write_changes(&path, &defaults, false).unwrap();
             assert_eq!(
                 Settings::read_from(&path).unwrap().theme,
                 ThemePreference::Dark
             );
         }
+    }
+
+    #[core::prelude::v1::test]
+    fn routine_saves_keep_valid_fields_beside_an_invalid_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"theme":"sepia","view":"grid","recent_libraries":["Books"]}"#,
+        )
+        .unwrap();
+        let initial = Settings::read_from(&path).unwrap();
+        assert_eq!(initial.theme, ThemePreference::System);
+        let updated = Settings {
+            export_cover: true,
+            ..initial.clone()
+        };
+        updated.write_changes(&path, &initial, false).unwrap();
+        let saved = Settings::read_from(&path).unwrap();
+        assert_eq!(saved.view, ViewMode::Grid);
+        assert_eq!(saved.recent_libraries, [PathBuf::from("Books")]);
+        assert!(saved.export_cover);
+        assert_eq!(Settings::read_fields(&path).unwrap()["theme"], "sepia");
     }
 }
