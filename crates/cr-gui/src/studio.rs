@@ -599,11 +599,18 @@ fn cites(app: &CalibreApp, rows: &[Citation], busy: bool, cx: &mut Context<Calib
                             )
                         }),
                 )
+                // A real button, so the row can also be reached with Tab.
                 .child(
-                    Icon::new(Lucide::ArrowRight)
-                        .size_4()
-                        .flex_shrink_0()
-                        .text_color(theme.muted_foreground),
+                    ai::icon_action(
+                        format!("studio-open-{id}"),
+                        Lucide::ArrowRight,
+                        "Show in library",
+                    )
+                    .disabled(busy)
+                    .on_click(cx.listener(move |app, _, window, cx| {
+                        cx.stop_propagation();
+                        app.studio_book(id, window, cx)
+                    })),
                 )
         })
         .collect::<Vec<_>>();

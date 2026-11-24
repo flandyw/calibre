@@ -111,6 +111,7 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                         )
                     }
                 });
+            let use_id = id.clone();
             h_flex()
                 .id(("ai-model-row", index))
                 .w_full()
@@ -173,6 +174,22 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                             .child(context),
                     )
                 })
+                // A real button, so a model can also be chosen with Tab.
+                .child(
+                    Button::new(("ai-model-use", index))
+                        .ghost()
+                        .xsmall()
+                        .label(if current { "In Use" } else { "Use" })
+                        .disabled(current)
+                        .on_click(cx.listener(move |app, _, window, cx| {
+                            cx.stop_propagation();
+                            if local_mode {
+                                app.save_local_model(use_id.clone(), window, cx);
+                            } else {
+                                app.save_openrouter_model(use_id.clone(), window, cx);
+                            }
+                        })),
+                )
         })
         .collect::<Vec<_>>();
     let show_openrouter = matches!(selected, Provider::OpenRouter | Provider::Auto);
