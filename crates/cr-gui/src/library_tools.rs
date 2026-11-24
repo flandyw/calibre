@@ -466,21 +466,21 @@ pub fn locate_text_hit(book: &Book, hit: &FtsHit) -> Option<Locator> {
             return None;
         }
         return only(
-            book.toc
+            book.sections
                 .iter()
-                .filter(|entry| normalize_text(&entry.title) == title)
-                .map(|entry| entry.target),
+                .enumerate()
+                .filter(|(_, section)| normalize_text(&section.title) == title)
+                .map(|(section, _)| Locator {
+                    section,
+                    ..Default::default()
+                }),
         )
         .or_else(|| {
             only(
-                book.sections
+                book.toc
                     .iter()
-                    .enumerate()
-                    .filter(|(_, section)| normalize_text(&section.title) == title)
-                    .map(|(section, _)| Locator {
-                        section,
-                        ..Default::default()
-                    }),
+                    .filter(|entry| normalize_text(&entry.title) == title)
+                    .map(|entry| entry.target),
             )
         })
         .or_else(|| {
@@ -586,6 +586,7 @@ fn write_catalog(
 #[cfg(test)]
 mod tests {
     use cr_core::formats::document::{Document, Section};
+    use cr_core::formats::reading::TocEntry;
     use cr_core::library::FtsPassage;
 
     use super::*;
@@ -731,5 +732,41 @@ A silver lantern glowed.
             book.block(target).unwrap().text,
             "The sailor watched the silver"
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn a_title_hit_prefers_a_section_heading_to_an_unrelated_contents_label() {
+        let mut book = Book::from_document(Document {
+            sections: vec![
+                Section {
+                    title: "Departure".into(),
+                    html: "<p>The ship left.</p>".into(),
+                },
+                Section {
+                    title: "Arrival".into(),
+                    html: "<p>The ship docked.</p>".into(),
+                },
+            ],
+            ..Default::default()
+        });
+        book.toc = vec![TocEntry {
+            title: "Arrival".into(),
+            level: 1,
+            target: Locator::default(),
+        }];
+        let hit = FtsHit {
+            book: 1,
+            title: "The crossing".into(),
+            chapter: 2,
+            chapter_title: "Arrival".into(),
+            snippet: "[Arrival]".into(),
+            passage: Some(FtsPassage {
+                before: String::new(),
+                matched: "Arrival".into(),
+                after: String::new(),
+                in_title: true,
+            }),
+        };
+        assert_eq!(locate_text_hit(&book, &hit).unwrap().section, 1);
     }
 }
