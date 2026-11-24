@@ -121,7 +121,39 @@ pub struct AiSession {
     pub streaming: String,
     pub usage: String,
     pub local_result: String,
-    pub last_copyable: Option<String>,
+    pub last_copyable: Option<(AiCopySource, String)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AiCopySource {
+    Chat,
+    Local,
+    Translation,
+}
+
+impl AiSession {
+    pub fn sync_copyable_after_removal(&mut self, removed: AiCopySource) {
+        if self
+            .last_copyable
+            .as_ref()
+            .is_some_and(|(source, _)| *source == removed)
+        {
+            self.last_copyable = if !self.local_result.trim().is_empty() {
+                Some((AiCopySource::Local, self.local_result.clone()))
+            } else if let Some(last) = self
+                .history
+                .iter()
+                .rev()
+                .find(|m| matches!(m.role, Role::Assistant))
+            {
+                Some((AiCopySource::Chat, last.content.clone()))
+            } else if let Some((_, translation, _)) = &self.translation {
+                Some((AiCopySource::Translation, translation.clone()))
+            } else {
+                None
+            };
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -779,7 +811,7 @@ impl CalibreApp {
         let Some(session) = &self.online.ai else {
             return;
         };
-        let Some(text) = session.last_copyable.clone() else {
+        let Some((_, text)) = session.last_copyable.clone() else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -818,6 +850,7 @@ impl CalibreApp {
                     session.current = current;
                 }
                 session.translation = None;
+                session.sync_copyable_after_removal(AiCopySource::Translation);
                 session.status = format!("Applied {language} description.");
             }
         }
@@ -1083,7 +1116,8 @@ impl CalibreApp {
                         session.usage = usage;
                         if task == BookTask::Translate {
                             let text = answer.text.trim().to_string();
-                            session.last_copyable = (!text.is_empty()).then_some(text.clone());
+                            session.last_copyable = (!text.is_empty())
+                                .then_some((AiCopySource::Translation, text.clone()));
                             session.translation = Some((
                                 translate_lang.clone(),
                                 text,
@@ -1093,14 +1127,16 @@ impl CalibreApp {
                         }
                         if task != BookTask::Chat {
                             let formatted = format!("{prompt}\n\n{}", answer.text);
-                            session.last_copyable = Some(formatted.clone());
+                            session.last_copyable =
+                                Some((AiCopySource::Local, formatted.clone()));
                             session.local_result = formatted;
                             return;
                         }
                         if session.history.len() >= 12 {
                             session.history.drain(..2);
                         }
-                        session.last_copyable = Some(answer.text.clone());
+                        session.last_copyable =
+                            Some((AiCopySource::Chat, answer.text.clone()));
                         session.history.push(Message::new(Role::User, prompt));
                         session
                             .history
@@ -1108,7 +1144,7 @@ impl CalibreApp {
                         set_input(&app.online.question, String::new(), window, cx);
                     }
                     Ok(AiReply::Local(answer)) => {
-                        session.last_copyable = Some(answer.clone());
+                        session.last_copyable = Some((AiCopySource::Local, answer.clone()));
                         session.local_result = answer;
                     }
                     Err(error) => session.status = error.to_string(),
