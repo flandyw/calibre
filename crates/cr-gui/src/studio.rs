@@ -14,7 +14,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::{set_input, text_input, CalibreApp, Screen, Shelf, Tone};
-use crate::online::StatusTone;
+use crate::online::{until_stopped, StatusTone};
 use crate::ui::ai;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -316,9 +316,8 @@ impl CalibreApp {
             window,
             cx,
             move |job| {
-                let reply = (|| -> cr_core::Result<Reply> {
+                until_stopped(job, move || -> cr_core::Result<Reply> {
                     let library = Library::open(&root)?;
-                    job.check()?;
                     if mode == Mode::Search {
                         return client.draft_search(&library, &prompt).map(Reply::Search);
                     }
@@ -397,10 +396,7 @@ impl CalibreApp {
                         client.librarian(&catalog, &history)?
                     };
                     Ok(Reply::Answer(answer, included, total))
-                })()?;
-                // A reply that arrives after Stop is not shown.
-                job.check()?;
-                Ok(reply)
+                })
             },
             move |app, result, window, cx| {
                 let Some(session) = app.online.studio.session.as_mut() else {

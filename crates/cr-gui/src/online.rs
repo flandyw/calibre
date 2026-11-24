@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cr_core::ai::{
     reader_chapter_text, reading_minutes, recap_reader_messages_with_budget, AiClient, AiConfig,
@@ -7,6 +9,7 @@ use cr_core::ai::{
     DEFAULT_LOCAL_MODEL, DEFAULT_LOCAL_URL, READING_CJK_CHARS_PER_MINUTE, READING_WORDS_PER_MINUTE,
 };
 use cr_core::formats::reading::BlockKind;
+use cr_core::jobs::JobContext;
 use cr_core::online_metadata::{Candidate, Catalog, Field, Query, Source};
 use cr_core::{BookUpdate, Error, Library, Metadata};
 use futures::StreamExt as _;
@@ -134,6 +137,34 @@ pub struct AiSession {
     /// When each card was last produced, to order cards at the same place.
     pub card_seq: [u32; 3],
     pub scroll: ScrollHandle,
+}
+
+/// Runs a provider call that cannot be interrupted on a thread of its own,
+/// so Stop takes effect at once. An abandoned call finishes in the
+/// background and what it returns, a reply or an error, is dropped.
+pub(crate) fn until_stopped<T: Send + 'static>(
+    job: &JobContext,
+    work: impl FnOnce() -> cr_core::Result<T> + Send + 'static,
+) -> cr_core::Result<T> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("ai-request".into())
+        .spawn(move || {
+            let _ = sender.send(work());
+        })?;
+    loop {
+        job.check()?;
+        match receiver.recv_timeout(Duration::from_millis(40)) {
+            Ok(result) => {
+                job.check()?;
+                return result;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Error::Other("The AI request ended unexpectedly.".into()));
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1146,10 +1177,8 @@ impl CalibreApp {
                 };
                 let (label, messages) = match task {
                     BookTask::Suggest => {
-                        let suggestion = client.suggest(&context)?;
-                        // A reply that arrives after Stop is not shown.
-                        job.check()?;
-                        return Ok(AiReply::Suggestion(suggestion));
+                        return until_stopped(job, move || client.suggest(&context))
+                            .map(AiReply::Suggestion);
                     }
                     BookTask::ReadingTime => {
                         let minutes = text.as_ref().map_or(0, reading_minutes);
@@ -1429,6 +1458,36 @@ mod tests {
             card_seq: [0; 3],
             scroll: ScrollHandle::new(),
         }
+    }
+
+    #[core::prelude::v1::test]
+    fn stop_does_not_wait_for_the_provider_or_show_its_error() {
+        let (release, blocked) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel();
+        let handle = cr_core::jobs::spawn("ask", move |job| {
+            until_stopped(job, move || -> cr_core::Result<()> {
+                started.send(()).ok();
+                // Stands in for a provider that answers late, with an error.
+                blocked.recv().ok();
+                Err(Error::Other("provider failed".into()))
+            })
+        })
+        .unwrap();
+        running.recv().unwrap();
+        handle.cancel();
+        // The provider is still blocked, so this only returns if Stop won.
+        assert!(matches!(handle.join(), Err(Error::Cancelled)));
+        drop(release);
+    }
+
+    #[core::prelude::v1::test]
+    fn a_finished_provider_call_passes_its_result_through() {
+        let job = JobContext::detached();
+        assert_eq!(until_stopped(&job, || Ok(7)).unwrap(), 7);
+        let failed = until_stopped(&job, || -> cr_core::Result<()> {
+            Err(Error::Other("provider failed".into()))
+        });
+        assert!(matches!(failed, Err(Error::Other(message)) if message == "provider failed"));
     }
 
     #[core::prelude::v1::test]
