@@ -375,8 +375,9 @@ app icon and file associations ("Open With" for ebooks, and for folders so a
 calibre library can be opened from Finder). It is signed ad hoc, which is
 enough to run it on the Mac that built it; copy it to `/Applications` to keep
 it. Sharing it with other Macs needs a Developer ID signature and
-notarization. The icon is drawn by `packaging/macos/make-icon.swift`; pass
-`--redraw-icon` to regenerate `icon-1024.png` after editing it.
+notarization. The icon's source is `packaging/macos/icon.svg`; pass
+`--redraw-icon` to regenerate `icon-1024.png` after editing it (this needs
+`rsvg-convert`, from `brew install librsvg`).
 
 ## Quick start
 

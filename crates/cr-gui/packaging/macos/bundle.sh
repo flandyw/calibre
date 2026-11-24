@@ -4,7 +4,7 @@
 #   crates/cr-gui/packaging/macos/bundle.sh [--debug] [--redraw-icon] [--open]
 #
 #   --debug         bundle a debug build instead of an optimised release build
-#   --redraw-icon   re-render icon-1024.png from make-icon.swift first
+#   --redraw-icon   re-render icon-1024.png from icon.svg first (needs rsvg-convert)
 #   --open          launch the app when the bundle is ready
 #
 # The bundle is written to <target dir>/<profile>/bundle/calibre-rust.app and
@@ -48,7 +48,11 @@ fi
 # --- Icon -------------------------------------------------------------------
 if [[ $redraw_icon -eq 1 || ! -f "$here/icon-1024.png" ]]; then
     echo "==> Drawing the app icon"
-    swift "$here/make-icon.swift" "$here/icon-1024.png"
+    if ! command -v rsvg-convert >/dev/null; then
+        echo "rendering the icon needs rsvg-convert (brew install librsvg)" >&2
+        exit 1
+    fi
+    rsvg-convert -w 1024 -h 1024 "$here/icon.svg" -o "$here/icon-1024.png"
 fi
 
 # --- Binary -----------------------------------------------------------------
