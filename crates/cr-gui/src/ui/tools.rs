@@ -614,7 +614,7 @@ fn devices_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 "Connect a Kindle or Kobo, or mount a reader's storage, then rescan.",
                 cx,
             ))
-            .child(h_flex().child(rescan))
+            .child(h_flex().child(rescan).reveal_on_focus())
             .child(empty_state(
                 IconName::Inbox,
                 "No e-reader connected",
