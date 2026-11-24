@@ -61,6 +61,16 @@ fn online_commands_require_explicit_input_and_apply_target() {
 }
 
 #[test]
+fn google_books_credentials_are_not_accepted_on_the_command_line() {
+    let output = cr()
+        .args(["fetch-metadata", "--google-books-api-key", "test-only"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+}
+
+#[test]
 fn ai_studio_requires_search_text_and_recap_chapter() {
     for (args, expected) in [
         (vec!["ai", "library", "search"], "<REQUEST>"),

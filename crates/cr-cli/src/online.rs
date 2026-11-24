@@ -206,9 +206,6 @@ pub struct MetadataArgs {
     /// Catalog to search
     #[arg(long, value_enum, default_value = "open-library")]
     source: Provider,
-    /// Optional Google Books API key (falls back to GOOGLE_BOOKS_API_KEY)
-    #[arg(long, hide_env_values = true)]
-    google_books_api_key: Option<String>,
     /// Candidate ID returned by a previous search
     #[arg(long)]
     result: Option<String>,
@@ -244,7 +241,7 @@ pub fn metadata(args: MetadataArgs, path: &Path, json_output: bool) -> Result<()
         Provider::OpenLibrary => Source::OpenLibrary,
         Provider::GoogleBooks => Source::GoogleBooks,
     };
-    let catalog = Catalog::default().with_google_books_key(args.google_books_api_key.as_deref());
+    let catalog = Catalog::default();
     let results = catalog.search(source, &query)?;
     let Some(result) = args.result else {
         if json_output {

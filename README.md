@@ -101,8 +101,8 @@ rewrites `metadata.opf`, exactly as calibre expects.
 
 The desktop **Download Metadata…** action searches Open Library or Google
 Books by title, author, or ISBN. For Google Books quota or rate limits, set
-`GOOGLE_BOOKS_API_KEY`, enter a session key in **Preferences → Online
-metadata**, or pass `--google-books-api-key` on the CLI. Choose a result to compare
+`GOOGLE_BOOKS_API_KEY` in your environment or enter a session key in
+**Preferences → Online metadata**. Choose a result to compare
 its metadata and cover against the current book. Check only the fields you
 want to keep. For a multi-selection, the dialog reviews each book in turn;
 skip any book or end the review at any point.
