@@ -709,6 +709,7 @@ impl CalibreApp {
                         (label, messages)
                     }
                 };
+                job.check()?;
                 let reply = client.chat_stream(&messages, |part| {
                     job.check()?;
                     let _ = sender.unbounded_send(part.to_owned());
