@@ -115,7 +115,7 @@ pub struct AiSession {
     pub excerpt: bool,
     pub history: Vec<Message>,
     pub suggestion: Option<Suggestion>,
-    pub translation: Option<(String, String)>,
+    pub translation: Option<(String, String, bool)>,
     pub fields: Vec<Field>,
     pub status: String,
     pub streaming: String,
@@ -777,7 +777,7 @@ impl CalibreApp {
         let Some(session) = &self.online.ai else {
             return;
         };
-        let text = if let Some((_, translation)) = &session.translation {
+        let text = if let Some((_, translation, _)) = &session.translation {
             translation.clone()
         } else if !session.local_result.trim().is_empty() {
             session.local_result.clone()
@@ -802,9 +802,12 @@ impl CalibreApp {
         let Some(session) = &self.online.ai else {
             return;
         };
-        let Some((language, text)) = session.translation.clone() else {
+        let Some((language, text, truncated)) = session.translation.clone() else {
             return;
         };
+        if truncated {
+            return;
+        }
         let id = session.id;
         let suggestion = Suggestion {
             description: text,
@@ -925,6 +928,11 @@ impl CalibreApp {
         })
         .detach();
         let translate_lang = language.clone();
+        let translation_truncated = session
+            .current
+            .comments
+            .as_deref()
+            .is_some_and(|comments| comments.chars().count() > 4000.min(budget.excerpt_chars));
         self.run_job(
             if task == BookTask::ReadingTime {
                 "Estimating reading time".to_string()
@@ -1066,8 +1074,11 @@ impl CalibreApp {
                     Ok(AiReply::Answer(prompt, answer, usage)) => {
                         session.usage = usage;
                         if task == BookTask::Translate {
-                            session.translation =
-                                Some((translate_lang.clone(), answer.text.trim().to_string()));
+                            session.translation = Some((
+                                translate_lang.clone(),
+                                answer.text.trim().to_string(),
+                                translation_truncated,
+                            ));
                             return;
                         }
                         if task != BookTask::Chat {

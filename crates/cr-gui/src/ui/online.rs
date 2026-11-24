@@ -556,47 +556,55 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     .on_click(cx.listener(|app, _, window, cx| app.apply_ai_metadata(window, cx))),
             )
     });
-    let translation = session.translation.as_ref().map(|(language, translated)| {
-        v_flex()
-            .gap_2()
-            .p_2()
-            .rounded_md()
-            .bg(cx.theme().muted)
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(format!("Translated description ({language})")),
-            )
-            .child(div().text_sm().child(translated.clone()))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("apply-ai-translation")
-                            .primary()
-                            .small()
-                            .label("Apply to Description")
-                            .disabled(busy || !app.can_write())
-                            .on_click(cx.listener(|app, _, window, cx| {
-                                app.apply_ai_translation(window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("dismiss-ai-translation")
-                            .ghost()
-                            .small()
-                            .label("Dismiss")
-                            .disabled(busy)
-                            .on_click(cx.listener(|app, _, _, cx| {
-                                if let Some(session) = app.online.ai.as_mut() {
-                                    session.translation = None;
-                                    cx.notify();
-                                }
-                            })),
-                    ),
-            )
-    });
+    let translation = session
+        .translation
+        .as_ref()
+        .map(|(language, translated, truncated)| {
+            v_flex()
+                .gap_2()
+                .p_2()
+                .rounded_md()
+                .bg(cx.theme().muted)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Translated description ({language})")),
+                )
+                .when(*truncated, |box_el| {
+                    box_el.child(div().text_xs().text_color(muted).child(
+                        "Only the opening 4,000 characters were sent for translation. Apply is disabled to avoid overwriting the rest of the description.",
+                    ))
+                })
+                .child(div().text_sm().child(translated.clone()))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("apply-ai-translation")
+                                .primary()
+                                .small()
+                                .label("Apply to Description")
+                                .disabled(busy || *truncated || !app.can_write())
+                                .on_click(cx.listener(|app, _, window, cx| {
+                                    app.apply_ai_translation(window, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("dismiss-ai-translation")
+                                .ghost()
+                                .small()
+                                .label("Dismiss")
+                                .disabled(busy)
+                                .on_click(cx.listener(|app, _, _, cx| {
+                                    if let Some(session) = app.online.ai.as_mut() {
+                                        session.translation = None;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                )
+        });
     let preset_chips = app
         .settings
         .ai_presets
