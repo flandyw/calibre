@@ -372,11 +372,21 @@ impl Catalog {
     }
 
     pub fn enrich(&self, candidate: &mut Candidate) -> Result<()> {
+        self.enrich_fields(candidate, &[Field::Authors, Field::Description])
+    }
+
+    pub fn enrich_fields(&self, candidate: &mut Candidate, fields: &[Field]) -> Result<()> {
         if candidate.source != Source::OpenLibrary {
             return Ok(());
         }
+        let need_description =
+            fields.contains(&Field::Description) && candidate.description.is_none();
+        let need_authors = fields.contains(&Field::Authors) && candidate.authors.is_empty();
+        if !need_description && !need_authors {
+            return Ok(());
+        }
         if open_library_id(&candidate.id, 'W') {
-            if candidate.description.is_none() {
+            if need_description {
                 candidate.description =
                     open_library_description(&self.open_library_record("works", &candidate.id)?);
             }
@@ -396,7 +406,7 @@ impl Catalog {
         let Some(links) = &candidate.edition_links else {
             return Ok(());
         };
-        let description = if candidate.description.is_none() {
+        let description = if need_description && candidate.description.is_none() {
             links
                 .work
                 .as_deref()
@@ -411,7 +421,7 @@ impl Catalog {
         if let Ok(Some(Some(description))) = &description {
             candidate.description = Some(description.clone());
         }
-        if candidate.authors.is_empty() {
+        if need_authors {
             if let Some(authors) = &links.authors {
                 candidate.authors = authors
                     .iter()
@@ -898,11 +908,11 @@ mod tests {
                     "/isbn/9780140328721.json",
                     r#"{"key":"/books/OL12M","title":"Edition","authors":[{"key":"/authors/OL42A"},{"name":"Second Author"}],"works":[{"key":"/works/OL3W"}]}"#,
                 ),
+                ("/authors/OL42A.json", r#"{"name":"Linked Author"}"#),
                 (
                     "/works/OL3W.json",
                     r#"{"description":{"value":"Work description"}}"#,
                 ),
-                ("/authors/OL42A.json", r#"{"name":"Linked Author"}"#),
             ] {
                 let (mut socket, _) = listener.accept().unwrap();
                 socket
@@ -937,8 +947,12 @@ mod tests {
                 },
             )
             .unwrap();
-        catalog.enrich(&mut candidates[0]).unwrap();
+        catalog
+            .enrich_fields(&mut candidates[0], &[Field::Authors])
+            .unwrap();
         assert_eq!(candidates[0].authors, ["Linked Author", "Second Author"]);
+        assert!(candidates[0].description.is_none());
+        catalog.enrich(&mut candidates[0]).unwrap();
         assert_eq!(
             candidates[0].description.as_deref(),
             Some("Work description")

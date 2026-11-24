@@ -292,8 +292,10 @@ pub fn metadata(args: MetadataArgs, path: &Path, json_output: bool) -> Result<()
         .find(|candidate| candidate.id == result)
         .ok_or_else(|| anyhow!("candidate {result} is not in these search results"))?;
     let fields: Vec<_> = args.apply.into_iter().map(Field::from).collect();
-    if fields.is_empty() || fields.contains(&Field::Description) {
+    if fields.is_empty() {
         catalog.enrich(&mut candidate)?;
+    } else {
+        catalog.enrich_fields(&mut candidate, &fields)?;
     }
     let cover = if args.cover.is_some() || fields.contains(&Field::Cover) {
         Some(
