@@ -209,6 +209,7 @@ pub struct CalibreApp {
     saved_settings: Settings,
     pub library_tools: LibraryTools,
     pub custom_columns: CustomColumns,
+    pub online: crate::online::Online,
     preferences_return: Screen,
     pending_opens: VecDeque<(Vec<PathBuf>, bool)>,
     pub job: Option<RunningJob>,
@@ -237,6 +238,7 @@ pub struct CalibreApp {
     pub selected_path: Option<String>,
     pub book: Option<Rc<Book>>,
     pub reader_book_id: Option<i64>,
+    pub(crate) reader_library_format: Option<(i64, String)>,
     pub reader_return: Screen,
     reader_file: Option<PathBuf>,
     pub section_index: usize,
@@ -348,8 +350,19 @@ impl CalibreApp {
 
         let tools = crate::tools::Tools::new(window, cx);
         let library_tools = LibraryTools::new(window, cx);
+        let online = crate::online::Online::new(window, cx);
 
         let subscriptions = vec![
+            cx.subscribe_in(&online.model, window, |_, _, event, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
+            cx.subscribe_in(&online.question, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) && this.job.is_none() {
+                    this.run_ai(false, window, cx);
+                }
+            }),
             cx.subscribe_in(
                 &library_tools.text_query,
                 window,
@@ -426,6 +439,7 @@ impl CalibreApp {
             settings,
             library_tools,
             custom_columns: CustomColumns::new(window, cx),
+            online,
             preferences_return: Screen::Library,
             pending_opens: VecDeque::new(),
             job: None,
@@ -448,6 +462,7 @@ impl CalibreApp {
             selected_path: None,
             book: None,
             reader_book_id: None,
+            reader_library_format: None,
             reader_return: Screen::Library,
             reader_file: None,
             section_index: 0,
@@ -753,6 +768,12 @@ impl CalibreApp {
         }
         self.preferences_return = self.screen;
         self.screen = Screen::Preferences;
+        set_input(
+            &self.online.model,
+            self.settings.openrouter_model.clone(),
+            window,
+            cx,
+        );
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -788,6 +809,13 @@ impl CalibreApp {
                         ..Settings::default()
                     };
                     this.chapter_list_visible = this.settings.reader_contents;
+                    set_input(
+                        &this.online.model,
+                        this.settings.openrouter_model.clone(),
+                        window,
+                        cx,
+                    );
+                    set_input(&this.online.key, String::new(), window, cx);
                     this.apply_theme(window, cx);
                     this.reload();
                     this.save_settings(true);
@@ -1273,6 +1301,9 @@ impl CalibreApp {
         self.tools.trash.clear();
         self.library_tools.clear_results();
         self.custom_columns.clear();
+        if self.online.clear_dialogs() {
+            window.close_dialog(cx);
+        }
         self.library = Some(library);
         self.screen = Screen::Library;
         self.shelf = Shelf::All;
@@ -2384,6 +2415,7 @@ impl CalibreApp {
             }
         };
         self.reader_file = library.format_path(id, chosen).ok().flatten();
+        self.reader_library_format = Some((id, chosen.to_owned()));
         let location = text_hit.and_then(|hit| crate::library_tools::locate_text_hit(&book, hit));
         // Reading state uses locators in the preferred format's layout.
         if !preferred
@@ -2638,6 +2670,7 @@ impl CalibreApp {
     fn clear_reader(&mut self) {
         self.book = None;
         self.reader_book_id = None;
+        self.reader_library_format = None;
         self.reader_file = None;
         self.reader_images.clear();
         self.reader_fonts.clear();
@@ -3605,6 +3638,22 @@ impl CalibreApp {
             }))
             .on_action(cx.listener(|this, _: &ClosePreferences, window, cx| {
                 this.close_preferences(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AskAi, window, cx| this.open_ai(window, cx)))
+            .on_action(cx.listener(|this, _: &AiStudio, window, cx| {
+                this.open_studio(crate::studio::Mode::Librarian, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AiReadNext, window, cx| {
+                this.open_studio(crate::studio::Mode::Next, true, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AiCleanup, window, cx| {
+                this.open_studio(crate::studio::Mode::Cleanup, false, window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &RunAiPreset, window, cx| {
+                this.open_ai_preset(action.0, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DownloadMetadata, window, cx| {
+                this.open_online_metadata(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| {
                 this.show_shortcuts = !this.show_shortcuts;

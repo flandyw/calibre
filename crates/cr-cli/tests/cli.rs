@@ -36,6 +36,53 @@ fn make_book(dir: &Path) -> PathBuf {
 }
 
 #[test]
+fn online_commands_require_explicit_input_and_apply_target() {
+    let temp = tempdir().unwrap();
+    let library = temp.path().join("nonexistent-library");
+    let output = cr().args(["ai", "ask", "1"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("enter a question"));
+
+    let output = cr()
+        .args(["fetch-metadata", "--apply", "tags"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--result"));
+
+    let output = cr()
+        .arg("-l")
+        .arg(library)
+        .arg("fetch-ebook-metadata")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Enter a title, author, or ISBN"));
+}
+
+#[test]
+fn google_books_credentials_are_not_accepted_on_the_command_line() {
+    let output = cr()
+        .args(["fetch-metadata", "--google-books-api-key", "test-only"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument"));
+}
+
+#[test]
+fn ai_studio_requires_search_text_and_recap_chapter() {
+    for (args, expected) in [
+        (vec!["ai", "library", "search"], "<REQUEST>"),
+        (vec!["ai", "book", "recap", "1"], "--through"),
+    ] {
+        let output = cr().args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(expected));
+    }
+}
+
+#[test]
 fn cli_workflow() {
     let temp = tempdir().unwrap();
     let library = temp.path().join("library");

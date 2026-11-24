@@ -15,12 +15,15 @@
 //! # }
 //! ```
 
+pub mod ai;
 pub mod device;
 pub mod error;
 pub mod formats;
 pub mod jobs;
 pub mod library;
 pub mod metadata;
+mod network;
+pub mod online_metadata;
 pub mod opf;
 pub mod server;
 pub mod text;

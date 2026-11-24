@@ -1,5 +1,8 @@
 //! `cr` — the calibre-rust command line interface.
 
+mod online;
+mod studio;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -187,6 +190,11 @@ enum Command {
     Show { id: i64 },
     /// Edit book metadata
     Set(SetArgs),
+    /// Browse OpenRouter models, ask about a book, or suggest metadata
+    Ai(online::AiArgs),
+    /// Search online book catalogs and preview or apply metadata
+    #[command(visible_alias = "fetch-ebook-metadata")]
+    FetchMetadata(online::MetadataArgs),
     /// Remove books from the library
     #[command(name = "rm", alias = "remove")]
     Remove {
@@ -544,6 +552,8 @@ fn main() {
 fn run(cli: Cli) -> Result<()> {
     let library_path = cli.library.unwrap_or_else(default_library_path);
     match cli.command {
+        Command::Ai(args) => online::ai(args, &library_path, cli.json)?,
+        Command::FetchMetadata(args) => online::metadata(args, &library_path, cli.json)?,
         Command::Init { path } => {
             let path = path.unwrap_or(library_path);
             let library = Library::create(&path)?;

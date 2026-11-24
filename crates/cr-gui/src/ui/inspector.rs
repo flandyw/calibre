@@ -204,7 +204,26 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     if let Some(rating) = metadata.rating.filter(|rating| *rating > 0) {
         header = header.child(stars(rating, 14., cx));
     }
-    header = header.child(actions);
+    header = header.child(actions).child(
+        h_flex()
+            .gap_2()
+            .child(
+                Button::new("inspector-ai")
+                    .outline()
+                    .small()
+                    .label("Ask AI…")
+                    .on_click(|_, window, cx| window.dispatch_action(Box::new(AskAi), cx)),
+            )
+            .child(
+                Button::new("inspector-online")
+                    .outline()
+                    .small()
+                    .label("Download Metadata…")
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(DownloadMetadata), cx)
+                    }),
+            ),
+    );
 
     // Details table.
     let mut rows: Vec<AnyElement> = Vec::new();

@@ -7,6 +7,7 @@ mod epub;
 mod inspector;
 mod library;
 mod library_tools;
+pub(crate) mod online;
 mod preferences;
 mod reader;
 mod tools;
