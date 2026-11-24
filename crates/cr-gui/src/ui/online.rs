@@ -487,12 +487,7 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     };
     let has_reader_context =
         session.reader_chapter_text.is_some() || session.reader_passage.is_some();
-    let has_copyable = session.translation.is_some()
-        || !session.local_result.trim().is_empty()
-        || session
-            .history
-            .iter()
-            .any(|m| matches!(m.role, Role::Assistant));
+    let has_copyable = session.last_copyable.is_some();
     let messages = session
         .history
         .iter()

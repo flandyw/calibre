@@ -121,6 +121,7 @@ pub struct AiSession {
     pub streaming: String,
     pub usage: String,
     pub local_result: String,
+    pub last_copyable: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -625,6 +626,7 @@ impl CalibreApp {
             streaming: String::new(),
             usage: String::new(),
             local_result: String::new(),
+            last_copyable: None,
         });
         let title = format!("Ask AI · {}", client.provider_name());
         let weak = cx.entity().downgrade();
@@ -777,18 +779,7 @@ impl CalibreApp {
         let Some(session) = &self.online.ai else {
             return;
         };
-        let text = if let Some((_, translation, _)) = &session.translation {
-            translation.clone()
-        } else if !session.local_result.trim().is_empty() {
-            session.local_result.clone()
-        } else if let Some(last) = session
-            .history
-            .iter()
-            .rev()
-            .find(|m| matches!(m.role, Role::Assistant))
-        {
-            last.content.clone()
-        } else {
+        let Some(text) = session.last_copyable.clone() else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -1085,27 +1076,35 @@ impl CalibreApp {
                     Ok(AiReply::Answer(prompt, answer, usage)) => {
                         session.usage = usage;
                         if task == BookTask::Translate {
+                            let text = answer.text.trim().to_string();
+                            session.last_copyable = (!text.is_empty()).then_some(text.clone());
                             session.translation = Some((
                                 translate_lang.clone(),
-                                answer.text.trim().to_string(),
+                                text,
                                 translation_truncated,
                             ));
                             return;
                         }
                         if task != BookTask::Chat {
-                            session.local_result = format!("{prompt}\n\n{}", answer.text);
+                            let formatted = format!("{prompt}\n\n{}", answer.text);
+                            session.last_copyable = Some(formatted.clone());
+                            session.local_result = formatted;
                             return;
                         }
                         if session.history.len() >= 12 {
                             session.history.drain(..2);
                         }
+                        session.last_copyable = Some(answer.text.clone());
                         session.history.push(Message::new(Role::User, prompt));
                         session
                             .history
                             .push(Message::new(Role::Assistant, answer.text));
                         set_input(&app.online.question, String::new(), window, cx);
                     }
-                    Ok(AiReply::Local(answer)) => session.local_result = answer,
+                    Ok(AiReply::Local(answer)) => {
+                        session.last_copyable = Some(answer.clone());
+                        session.local_result = answer;
+                    }
                     Err(error) => session.status = error.to_string(),
                 }
             },
