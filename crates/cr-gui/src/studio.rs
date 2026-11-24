@@ -16,7 +16,7 @@ use gpui_kit::*;
 use crate::app::{set_input, text_input, CalibreApp, Screen, Shelf, Tone};
 use crate::online::{until_stopped, StatusTone};
 use crate::ui::ai;
-use crate::ui::reveal::{FollowFocus as _, RevealOnFocus as _};
+use crate::ui::reveal::{revealed_each, FollowFocus as _, RevealOnFocus as _};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -1090,8 +1090,7 @@ pub(crate) fn body(
                             .justify_center()
                             .gap_2()
                             .pt_1()
-                            .children(examples)
-                            .reveal_on_focus(),
+                            .children(revealed_each(examples)),
                     ),
                 )
             } else {

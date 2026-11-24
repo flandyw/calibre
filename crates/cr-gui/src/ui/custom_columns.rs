@@ -8,7 +8,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::reveal::{revealed, RevealOnFocus as _};
+use super::reveal::{revealed, revealed_each, RevealOnFocus as _};
 use super::widgets::field;
 use crate::app::{set_textarea, CalibreApp};
 
@@ -74,8 +74,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             h_flex()
                 .gap_2()
                 .flex_wrap()
-                .children(columns)
-                .reveal_on_focus()
+                .children(revealed_each(columns))
                 .into_any_element()
         });
 
@@ -140,13 +139,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                     body.child(div().text_sm().text_color(muted).child(help))
                 })
                 .when(!values.is_empty(), |body| {
-                    body.child(
-                        h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .children(values)
-                            .reveal_on_focus(),
-                    )
+                    body.child(h_flex().gap_2().flex_wrap().children(revealed_each(values)))
                 })
                 .child(
                     h_flex()
@@ -201,13 +194,7 @@ pub fn pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                         cx,
                     ))),
             )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .flex_wrap()
-                    .children(types)
-                    .reveal_on_focus(),
-            )
+            .child(h_flex().gap_2().flex_wrap().children(revealed_each(types)))
             .when(state.datatype == "text", |section| {
                 section.child(revealed(
                     Checkbox::new("custom-multiple")

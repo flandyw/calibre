@@ -51,6 +51,15 @@ pub fn revealed(control: impl IntoElement) -> Div {
     v_flex().child(control).reveal_on_focus()
 }
 
+/// Marks each control of a wrapping group on its own. A group of any length
+/// can grow taller than its scroll area, and a block that tall is only shown
+/// from its top.
+pub fn revealed_each<E: IntoElement>(
+    controls: impl IntoIterator<Item = E>,
+) -> impl Iterator<Item = Div> {
+    controls.into_iter().map(revealed)
+}
+
 /// A scroll area that scrolls to the block holding the keyboard focus.
 pub trait FollowFocus: StatefulInteractiveElement + Sized {
     fn follow_focus(self, handle: &ScrollHandle) -> Self {

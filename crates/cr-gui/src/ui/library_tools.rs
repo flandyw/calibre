@@ -6,7 +6,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::reveal::{revealed, RevealOnFocus as _};
+use super::reveal::{revealed, revealed_each, RevealOnFocus as _};
 use crate::app::CalibreApp;
 use crate::library_tools::CATALOG_FORMATS;
 use crate::settings::ImportDuplicates;
@@ -64,8 +64,7 @@ pub fn catalog_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElemen
             h_flex()
                 .gap_2()
                 .flex_wrap()
-                .children(formats)
-                .reveal_on_focus(),
+                .children(revealed_each(formats)),
         )
         .child(
             h_flex()
@@ -290,7 +289,7 @@ pub fn transfer_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyEleme
         )
         .when(!recent.is_empty(), |pane| {
             pane.child(detail("Recent libraries", cx))
-                .child(h_flex().gap_2().flex_wrap().children(recent).reveal_on_focus())
+                .child(h_flex().gap_2().flex_wrap().children(revealed_each(recent)))
         })
         .child(detail("When the destination already has a matching book", cx))
         .child(h_flex().gap_2().children(duplicates).reveal_on_focus())

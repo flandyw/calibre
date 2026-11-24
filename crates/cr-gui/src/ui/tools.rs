@@ -11,7 +11,7 @@ use gpui_kit::component::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::reveal::{revealed, FollowFocus as _, RevealOnFocus as _};
+use super::reveal::{revealed, revealed_each, FollowFocus as _, RevealOnFocus as _};
 use super::widgets::{empty_state, field, section_label};
 use crate::app::{format_size, CalibreApp};
 use crate::tools::{named_search, Join, TermMatch, ToolPane, PROFILES, SEARCH_FIELDS, TEXT_FIELDS};
@@ -274,7 +274,7 @@ fn bulk_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 )),
         )
         .child(section_label("Search and replace", cx))
-        .child(h_flex().gap_1().flex_wrap().children(field_choices).reveal_on_focus())
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(field_choices)))
         .child(
             h_flex()
                 .gap_3()
@@ -360,9 +360,9 @@ fn convert_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             cx,
         ))
         .child(section_label("Convert to", cx))
-        .child(h_flex().gap_1().flex_wrap().children(targets).reveal_on_focus())
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(targets)))
         .child(section_label("Device profile", cx))
-        .child(h_flex().gap_1().flex_wrap().children(profiles).reveal_on_focus())
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(profiles)))
         .child(note(
             "Images larger than the profile's screen are scaled down. Generic keeps them as they are.",
             cx,
@@ -527,8 +527,8 @@ fn search_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 .reveal_on_focus(),
         )
         .child(section_label("Add a term", cx))
-        .child(h_flex().gap_1().flex_wrap().children(fields).reveal_on_focus())
-        .child(h_flex().gap_1().flex_wrap().children(kinds).reveal_on_focus())
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(fields)))
+        .child(h_flex().gap_1().flex_wrap().children(revealed_each(kinds)))
         .when(needs_value, |this| {
             this.child(field("Value", input(&tools.term_value), cx))
         })
@@ -712,10 +712,9 @@ fn devices_pane(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             h_flex()
                 .gap_1()
                 .flex_wrap()
-                .children(device_choices)
+                .children(revealed_each(device_choices))
                 .child(div().flex_1())
-                .child(rescan)
-                .reveal_on_focus(),
+                .child(revealed(rescan)),
         )
         .child(
             h_flex()

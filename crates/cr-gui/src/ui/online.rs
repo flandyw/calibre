@@ -16,7 +16,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 
 use super::ai;
-use super::reveal::{FollowFocus as _, RevealOnFocus as _};
+use super::reveal::{revealed_each, FollowFocus as _, RevealOnFocus as _};
 use crate::app::CalibreApp;
 use crate::online::{AiCopySource, BookTask, StatusTone};
 
@@ -272,8 +272,7 @@ pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement
                     h_flex()
                         .flex_wrap()
                         .gap_1()
-                        .children(provider_buttons)
-                        .reveal_on_focus(),
+                        .children(revealed_each(provider_buttons)),
                 )
                 .child(div().text_xs().text_color(muted).child(provider_note)),
         )
@@ -421,7 +420,7 @@ fn preset_editor(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> Div {
         .child(div().font_weight(FontWeight::SEMIBOLD).child("Book action presets"))
         .child(div().text_sm().text_color(cx.theme().muted_foreground)
             .child("Create reusable prompts for the book context menu. Variables: {title}, {authors}, {description}, {series}, {tags}, {publisher}, {language}."))
-        .child(h_flex().gap_2().flex_wrap().children(rows).reveal_on_focus())
+        .child(h_flex().gap_2().flex_wrap().children(revealed_each(rows)))
         .child(field("Action name", Input::new(&app.online.preset_name).w_full()))
         .child(field("Prompt template", Input::new(&app.online.preset_prompt).w_full()))
         .child(h_flex().gap_2()
@@ -970,8 +969,7 @@ pub fn ai_dialog(
                             .justify_center()
                             .gap_2()
                             .pt_1()
-                            .children(starters)
-                            .reveal_on_focus(),
+                            .children(revealed_each(starters)),
                     ),
                 )
             } else {
