@@ -1129,7 +1129,12 @@ impl CalibreApp {
                     )
                 };
                 let (label, messages) = match task {
-                    BookTask::Suggest => return client.suggest(&context).map(AiReply::Suggestion),
+                    BookTask::Suggest => {
+                        let suggestion = client.suggest(&context)?;
+                        // A reply that arrives after Stop is not shown.
+                        job.check()?;
+                        return Ok(AiReply::Suggestion(suggestion));
+                    }
                     BookTask::ReadingTime => {
                         let minutes = text.as_ref().map_or(0, reading_minutes);
                         return Ok(AiReply::Local(format!(

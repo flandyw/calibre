@@ -316,85 +316,91 @@ impl CalibreApp {
             window,
             cx,
             move |job| {
-                let library = Library::open(&root)?;
-                job.check()?;
-                if mode == Mode::Search {
-                    return client.draft_search(&library, &prompt).map(Reply::Search);
-                }
-                if mode == Mode::Cleanup {
-                    if selected.is_empty() || selected.len() > CLEANUP_LIMIT {
-                        return Err(Error::Other(format!(
-                            "Select 1–{CLEANUP_LIMIT} books for cleanup."
-                        )));
+                let reply = (|| -> cr_core::Result<Reply> {
+                    let library = Library::open(&root)?;
+                    job.check()?;
+                    if mode == Mode::Search {
+                        return client.draft_search(&library, &prompt).map(Reply::Search);
                     }
-                    let books = selected
-                        .iter()
-                        .map(|id| library.get_summary(*id))
-                        .collect::<cr_core::Result<Vec<_>>>()?;
-                    let drafts = client.cleanup(&books)?;
-                    return Ok(Reply::Cleanup(
-                        drafts
-                            .into_iter()
-                            .filter_map(|draft| {
-                                let book = books.iter().find(|book| book.id == draft.id)?.clone();
-                                CleanupField::ALL
-                                    .into_iter()
-                                    .any(|field| draft.values(&book, field).is_some())
-                                    .then_some(CleanupReview {
-                                        draft,
-                                        book,
-                                        fields: Vec::new(),
-                                    })
-                            })
-                            .collect(),
-                    ));
-                }
-                let books = if mode == Mode::Shelves && selected_only {
-                    selected
-                        .iter()
-                        .map(|id| library.get_summary(*id))
-                        .collect::<cr_core::Result<Vec<_>>>()?
-                } else {
-                    library.list_books(&ListOptions::default())?
-                };
-                let recent = if mode == Mode::Next && seed.is_none() {
-                    library.recent_read_ids(12)?
-                } else if mode == Mode::Librarian {
-                    cited_ids
-                } else {
-                    Vec::new()
-                };
-                let prior_query = if mode == Mode::Librarian && !history.is_empty() {
-                    history
-                        .iter()
-                        .filter(|m| matches!(m.role, Role::User))
-                        .map(|m| m.content.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                } else {
-                    String::new()
-                };
-                let catalog = CatalogContext::for_conversation(
-                    &books,
-                    &recent,
-                    seed.filter(|_| mode == Mode::Next),
-                    &prompt,
-                    &prior_query,
-                    budget,
-                );
-                let (included, total) = (catalog.included(), catalog.total);
-                if mode == Mode::Shelves {
-                    return client
-                        .shelves(&catalog, &prompt)
-                        .map(|rows| Reply::Shelves(rows, included, total));
-                }
-                let answer = if mode == Mode::Next {
-                    client.recommend(&catalog, &prompt)?
-                } else {
-                    history.push(Message::new(Role::User, prompt));
-                    client.librarian(&catalog, &history)?
-                };
-                Ok(Reply::Answer(answer, included, total))
+                    if mode == Mode::Cleanup {
+                        if selected.is_empty() || selected.len() > CLEANUP_LIMIT {
+                            return Err(Error::Other(format!(
+                                "Select 1–{CLEANUP_LIMIT} books for cleanup."
+                            )));
+                        }
+                        let books = selected
+                            .iter()
+                            .map(|id| library.get_summary(*id))
+                            .collect::<cr_core::Result<Vec<_>>>()?;
+                        let drafts = client.cleanup(&books)?;
+                        return Ok(Reply::Cleanup(
+                            drafts
+                                .into_iter()
+                                .filter_map(|draft| {
+                                    let book =
+                                        books.iter().find(|book| book.id == draft.id)?.clone();
+                                    CleanupField::ALL
+                                        .into_iter()
+                                        .any(|field| draft.values(&book, field).is_some())
+                                        .then_some(CleanupReview {
+                                            draft,
+                                            book,
+                                            fields: Vec::new(),
+                                        })
+                                })
+                                .collect(),
+                        ));
+                    }
+                    let books = if mode == Mode::Shelves && selected_only {
+                        selected
+                            .iter()
+                            .map(|id| library.get_summary(*id))
+                            .collect::<cr_core::Result<Vec<_>>>()?
+                    } else {
+                        library.list_books(&ListOptions::default())?
+                    };
+                    let recent = if mode == Mode::Next && seed.is_none() {
+                        library.recent_read_ids(12)?
+                    } else if mode == Mode::Librarian {
+                        cited_ids
+                    } else {
+                        Vec::new()
+                    };
+                    let prior_query = if mode == Mode::Librarian && !history.is_empty() {
+                        history
+                            .iter()
+                            .filter(|m| matches!(m.role, Role::User))
+                            .map(|m| m.content.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    } else {
+                        String::new()
+                    };
+                    let catalog = CatalogContext::for_conversation(
+                        &books,
+                        &recent,
+                        seed.filter(|_| mode == Mode::Next),
+                        &prompt,
+                        &prior_query,
+                        budget,
+                    );
+                    let (included, total) = (catalog.included(), catalog.total);
+                    if mode == Mode::Shelves {
+                        return client
+                            .shelves(&catalog, &prompt)
+                            .map(|rows| Reply::Shelves(rows, included, total));
+                    }
+                    let answer = if mode == Mode::Next {
+                        client.recommend(&catalog, &prompt)?
+                    } else {
+                        history.push(Message::new(Role::User, prompt));
+                        client.librarian(&catalog, &history)?
+                    };
+                    Ok(Reply::Answer(answer, included, total))
+                })()?;
+                // A reply that arrives after Stop is not shown.
+                job.check()?;
+                Ok(reply)
             },
             move |app, result, window, cx| {
                 let Some(session) = app.online.studio.session.as_mut() else {
