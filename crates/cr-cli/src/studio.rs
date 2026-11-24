@@ -4,7 +4,8 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use cr_core::ai::{
     reading_minutes, recap_reader_messages, BookAction, BookContext, CatalogContext, CleanupField,
-    LibraryAnswer, Message, OpenRouter, Role, CLEANUP_LIMIT,
+    LibraryAnswer, Message, OpenRouter, Role, CLEANUP_LIMIT, READING_CJK_CHARS_PER_MINUTE,
+    READING_WORDS_PER_MINUTE,
 };
 use cr_core::{Library, ListOptions};
 use serde_json::json;
@@ -215,10 +216,10 @@ pub fn book(args: BookArgs, client: &OpenRouter, path: &Path, machine: bool) -> 
             if machine {
                 println!(
                     "{}",
-                    json!({"id":id,"minutes":minutes,"words_per_minute":230})
+                    json!({"id":id,"minutes":minutes,"words_per_minute":READING_WORDS_PER_MINUTE,"cjk_chars_per_minute":READING_CJK_CHARS_PER_MINUTE})
                 );
             } else {
-                println!("About {minutes} minutes at 230 words per minute (computed locally).");
+                println!("About {minutes} minutes (local estimate: {READING_WORDS_PER_MINUTE} words or {READING_CJK_CHARS_PER_MINUTE} CJK characters per minute).");
             }
             return Ok(());
         }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use cr_core::ai::{
     reading_minutes, recap_reader_messages, BookAction, BookContext, ChatReply, Message, Model,
-    OpenRouter, Role, Suggestion,
+    OpenRouter, Role, Suggestion, READING_CJK_CHARS_PER_MINUTE, READING_WORDS_PER_MINUTE,
 };
 use cr_core::online_metadata::{Candidate, Catalog, Field, Query, Source};
 use cr_core::{BookUpdate, Error, Library, Metadata};
@@ -671,7 +671,7 @@ impl CalibreApp {
                     BookTask::ReadingTime => {
                         let minutes = text.as_ref().map_or(0, reading_minutes);
                         return Ok(AiReply::Local(format!(
-                            "About {minutes} minutes at 230 words per minute (computed locally)."
+                            "About {minutes} minutes (local estimate: {READING_WORDS_PER_MINUTE} words or {READING_CJK_CHARS_PER_MINUTE} CJK characters per minute)."
                         )));
                     }
                     BookTask::Recap => {

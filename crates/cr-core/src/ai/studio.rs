@@ -13,20 +13,40 @@ pub const CLEANUP_LIMIT: usize = 12;
 const CLEANUP_AUTHOR_LIMIT: usize = 12;
 const CATALOG_LIMIT: usize = 180;
 const CATALOG_BYTES: usize = 32_000;
+pub const READING_WORDS_PER_MINUTE: usize = 230;
+pub const READING_CJK_CHARS_PER_MINUTE: usize = 500;
 
 fn bounded(value: &str, limit: usize) -> String {
     value.trim().chars().take(limit).collect()
 }
 
-fn words(book: &BookText) -> usize {
-    book.chapters
-        .iter()
-        .map(|chapter| chapter.text.split_whitespace().count())
-        .sum()
+fn cjk_letter(c: char) -> bool {
+    matches!(c,
+        '\u{3041}'..='\u{30ff}' | '\u{31f0}'..='\u{31ff}' |
+        '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}' |
+        '\u{ac00}'..='\u{d7af}' | '\u{f900}'..='\u{faff}' |
+        '\u{20000}'..='\u{323af}'
+    ) && c.is_alphabetic()
 }
 
 pub fn reading_minutes(book: &BookText) -> usize {
-    words(book).div_ceil(230)
+    let (mut words, mut cjk) = (0, 0);
+    for chapter in &book.chapters {
+        let mut in_word = false;
+        for c in chapter.text.chars() {
+            if cjk_letter(c) {
+                cjk += 1;
+                in_word = false;
+            } else if c.is_whitespace() {
+                in_word = false;
+            } else if !in_word && c.is_alphanumeric() {
+                words += 1;
+                in_word = true;
+            }
+        }
+    }
+    (words * READING_CJK_CHARS_PER_MINUTE + cjk * READING_WORDS_PER_MINUTE)
+        .div_ceil(READING_WORDS_PER_MINUTE * READING_CJK_CHARS_PER_MINUTE)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -835,6 +855,25 @@ mod tests {
         assert_eq!(matches.iter().map(|book| book.id).collect::<Vec<_>>(), [2]);
         assert_eq!(draft.note, "No page data");
         mock.join().unwrap();
+    }
+
+    #[test]
+    fn reading_time_measures_unspaced_cjk_text_by_character() {
+        let estimate = |text: String| {
+            reading_minutes(&BookText {
+                chapters: vec![Chapter {
+                    title: "Chapter".into(),
+                    text,
+                }],
+            })
+        };
+        assert_eq!(estimate("漢字".repeat(600)), 3);
+        assert_eq!(estimate("かな".repeat(600)), 3);
+        assert_eq!(estimate("word ".repeat(460)), 2);
+        assert_eq!(
+            estimate(format!("{}{}", "word ".repeat(230), "字".repeat(500))),
+            2
+        );
     }
 
     #[test]
