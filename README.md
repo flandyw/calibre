@@ -305,7 +305,26 @@ default (`--no-replace` to keep it separate). This is the beginning of the
 - EPUB-to-AZW3 and Kindle-to-EPUB conversion from the selected book's Formats
   row, with a save dialog;
 - device discovery and one-click send;
-- light/dark theme switching.
+- light/dark theme switching;
+- a Tools screen (the wrench button, or the Tools menu):
+  - **Edit Metadata in Bulk** — set authors, publisher, series (with
+    numbering), rating and languages, add/remove tags, and search and
+    replace in one field, for every selected book;
+  - **Convert Books** — convert the selected books to EPUB, AZW3, MOBI,
+    HTMLZ or TXT with a device profile; the new file is added to each book;
+  - **Search Tools** — build a search term by term, and save, show or
+    delete saved searches and virtual libraries;
+  - **Devices** — what is on the connected reader and how it matches the
+    library, its reading progress and highlights, delete books from it, and
+    send the selection;
+  - **Content Server** — start and stop the web library (address, port and
+    optional login) and open it in a browser;
+  - **Trash** — restore or permanently delete removed books and formats;
+  - **Library Maintenance** — check the library, repair what is safe to
+    repair, and rebuild `metadata.db` from the `metadata.opf` files;
+- in the book editor, a Search panel (find and replace across the whole
+  book, plain or regex) and a Contents panel (rebuild the table of contents
+  from headings; rename, move, nest and remove entries).
 
 The GUI is a separate package (excluded from the root workspace) because it
 pulls in GPUI and native windowing libraries. `cargo test --workspace` still
@@ -542,18 +561,18 @@ The engine covers the core; the surrounding calibre product is much larger.
 Currently missing:
 
 - **GUI polish** — the GPUI front end has a basic text-based EPUB editor, but
-  no visual editor, bulk metadata dialog, trash browser or cover-generation
-  tools yet (bulk edits, trash and library transfers are CLI-only).
-- The desktop app does not yet show custom columns, the category browser,
-  saved searches or full-text results (its search box does accept the whole
-  search language); these are CLI-only.
+  no visual editor or cover-generation tools yet; copying and moving books
+  between libraries is CLI-only.
+- The desktop app does not yet show custom columns, the category browser or
+  full-text results (its search box does accept the whole search language);
+  these are CLI-only.
 - Format conversion outside the EPUB and Kindle paths above.
 - Page-faithful PDF viewing, PDF metadata stored in compressed object streams
   or XMP, and RAR/7z comic archives (CBR/CB7).
 - Downloading metadata and covers from online sources.
 - Notes on authors/series/tags, composite (template) custom columns, and
   custom values in `metadata.opf` (calibre rewrites them there itself).
-- calibre's plugin system, content server/OPDS and annotations.
+- calibre's plugin system.
 - Live preview and spell check in the editor, cover cropping and
   thumbnail generation, DRM.
 - Opening libraries older than schema 28 without an upgrade step.

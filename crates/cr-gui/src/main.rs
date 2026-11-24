@@ -3,6 +3,7 @@ mod app;
 mod assets;
 mod files;
 mod settings;
+mod tools;
 mod ui;
 
 use std::path::PathBuf;

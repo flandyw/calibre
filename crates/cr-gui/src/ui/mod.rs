@@ -6,6 +6,7 @@ mod epub;
 mod inspector;
 mod library;
 mod reader;
+mod tools;
 mod widgets;
 
 use gpui_kit::component::*;
@@ -39,6 +40,7 @@ impl Render for CalibreApp {
             Screen::Reader => reader::reader_body(self, cx),
             Screen::Epub => epub::epub_body(self, cx),
             Screen::Crop => crop::crop_body(self, cx),
+            Screen::Tools => tools::tools_body(self, cx),
         };
 
         let root = div()

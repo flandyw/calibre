@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -110,6 +110,31 @@ struct State {
     authorization: Option<String>,
     opened: Mutex<Opened>,
     connections: AtomicUsize,
+    stopping: AtomicBool,
+}
+
+/// Stops a [`Server`] that is running on another thread.
+#[derive(Clone)]
+pub struct Stopper {
+    state: Arc<State>,
+    address: Option<SocketAddr>,
+}
+
+impl Stopper {
+    /// Make [`Server::run`] return. Requests already being answered finish.
+    pub fn stop(&self) {
+        self.state.stopping.store(true, Ordering::SeqCst);
+        // `run` is waiting for a connection: give it one to notice.
+        if let Some(mut address) = self.address {
+            if address.ip().is_unspecified() {
+                address.set_ip(match address {
+                    SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            let _ = TcpStream::connect_timeout(&address, Duration::from_secs(2));
+        }
+    }
 }
 
 impl Server {
@@ -131,6 +156,7 @@ impl Server {
                 authorization,
                 opened: Mutex::new(None),
                 connections: AtomicUsize::new(0),
+                stopping: AtomicBool::new(false),
             }),
         })
     }
@@ -144,9 +170,20 @@ impl Server {
         self.state.respond(target, authorization)
     }
 
-    /// Serve until the process ends.
+    /// A handle that ends [`Server::run`] from another thread.
+    pub fn stopper(&self) -> Stopper {
+        Stopper {
+            state: Arc::clone(&self.state),
+            address: self.listener.local_addr().ok(),
+        }
+    }
+
+    /// Serve until the process ends or a [`Stopper`] is used.
     pub fn run(&self) -> Result<()> {
         for stream in self.listener.incoming() {
+            if self.state.stopping.load(Ordering::SeqCst) {
+                break;
+            }
             let Ok(stream) = stream else {
                 continue;
             };

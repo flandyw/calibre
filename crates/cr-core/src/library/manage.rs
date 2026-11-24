@@ -534,6 +534,19 @@ impl Library {
         Ok(removed)
     }
 
+    /// Permanently delete one entry of the trash: a trashed book, or the
+    /// formats removed from a book that is still in the library.
+    pub fn purge_trash_entry(&mut self, id: i64, is_book: bool) -> Result<()> {
+        self.writable()?;
+        let kind = if is_book { "b" } else { "f" };
+        let directory = self.root.join(TRASH_DIR).join(kind).join(id.to_string());
+        if !directory.is_dir() {
+            return Err(Error::Other(format!("book {id} is not in the trash")));
+        }
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Extra data files
     // -----------------------------------------------------------------------

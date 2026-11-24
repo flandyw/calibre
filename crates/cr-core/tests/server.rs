@@ -160,7 +160,8 @@ fn password_and_sockets() {
     );
 
     let address = server.local_addr().unwrap();
-    std::thread::spawn(move || server.run());
+    let stopper = server.stopper();
+    let running = std::thread::spawn(move || server.run());
     let request = |text: &str| {
         let mut stream = TcpStream::connect(address).unwrap();
         stream.write_all(text.as_bytes()).unwrap();
@@ -181,6 +182,16 @@ fn password_and_sockets() {
     assert!(head.ends_with("\r\n\r\n"));
     assert!(request("POST / HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 405"));
     assert!(request("nonsense\r\n\r\n").starts_with("HTTP/1.1 400"));
+
+    // Stopping ends `run` and frees the port for another server.
+    stopper.stop();
+    running.join().unwrap().unwrap();
+    let options = ServerOptions {
+        bind: address.to_string(),
+        credentials: None,
+    };
+    let again = Server::bind(library.root(), &options).unwrap();
+    assert_eq!(again.local_addr().unwrap(), address);
 }
 
 #[test]
