@@ -1014,10 +1014,21 @@ impl CalibreApp {
                         };
                         let mut messages = vec![context.system_message()];
                         if task == BookTask::Chat {
-                            messages.extend(history.into_iter().map(|mut message| {
-                                message.content = message.content.chars().take(4_000).collect();
-                                message
-                            }));
+                            let turn_cap = (budget.excerpt_chars / 2).clamp(500, 4_000);
+                            let mut remaining = budget.excerpt_chars;
+                            let mut bounded_history = Vec::new();
+                            for mut message in history.into_iter().rev() {
+                                message.content =
+                                    message.content.chars().take(turn_cap).collect();
+                                let len = message.content.chars().count();
+                                if len > remaining {
+                                    break;
+                                }
+                                remaining -= len;
+                                bounded_history.push(message);
+                            }
+                            bounded_history.reverse();
+                            messages.extend(bounded_history);
                         }
                         messages.push(Message::new(Role::User, ask));
                         (label, messages)
