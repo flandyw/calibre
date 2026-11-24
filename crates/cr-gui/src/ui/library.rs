@@ -314,7 +314,9 @@ fn list_header(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
             Button::new("ai-library-studio")
                 .outline()
                 .small()
+                .icon(Lucide::Sparkles)
                 .label("AI Studio")
+                .tooltip("Ask about your library, draft searches, get recommendations, build shelves and tidy metadata")
                 .disabled(app.job.is_some())
                 .on_click(cx.listener(|app, _, window, cx| {
                     app.open_studio(crate::studio::Mode::Librarian, false, window, cx)
@@ -611,6 +613,23 @@ fn book_interactions(
 pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
     let has_epub = crate::app::editable_format(&app.selected_formats).is_some();
     let has_files = !app.selected_formats.is_empty();
+    let mut ai_tools = NativeMenu::new()
+        .menu_with_disabled(
+            "Read Next from This Book…",
+            app.job.is_some(),
+            Box::new(AiReadNext),
+        )
+        .menu_with_disabled("Metadata Cleanup…", app.job.is_some(), Box::new(AiCleanup));
+    if !app.settings.ai_presets.is_empty() {
+        ai_tools = ai_tools.separator();
+    }
+    for (index, preset) in app.settings.ai_presets.iter().enumerate() {
+        ai_tools = ai_tools.menu_with_disabled(
+            format!("{}…", preset.name),
+            app.job.is_some(),
+            Box::new(RunAiPreset(index)),
+        );
+    }
     let mut menu = NativeMenu::new()
         .menu_with_disabled("Read", !has_files, Box::new(ReadBook))
         .menu_with_disabled(
@@ -621,17 +640,6 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .menu(reveal_label(), Box::new(RevealInFileManager))
         .separator()
         .menu("Edit Metadata…", Box::new(EditMetadata))
-        .menu_with_disabled("Ask AI…", app.job.is_some(), Box::new(AskAi))
-        .menu_with_disabled(
-            "Read Next from This Book…",
-            app.job.is_some(),
-            Box::new(AiReadNext),
-        )
-        .menu_with_disabled(
-            "AI Metadata Cleanup…",
-            app.job.is_some(),
-            Box::new(AiCleanup),
-        )
         .menu_with_disabled(
             "Download Metadata…",
             app.job.is_some(),
@@ -646,15 +654,11 @@ pub fn book_context_menu(app: &CalibreApp) -> NativeMenu {
         .menu_with_disabled("Crop Cover…", app.cover_path.is_none(), Box::new(CropCover))
         .menu_with_disabled("Edit Book…", !has_epub, Box::new(EditEpub))
         .separator()
+        .menu_with_disabled("Ask AI…", app.job.is_some(), Box::new(AskAi))
+        .submenu("AI Tools", ai_tools)
+        .separator()
         .menu("Copy Title and Author", Box::new(CopyBookInfo))
         .menu("Export…", Box::new(ExportSelected));
-    for (index, preset) in app.settings.ai_presets.iter().enumerate() {
-        menu = menu.menu_with_disabled(
-            format!("AI: {}…", preset.name),
-            app.job.is_some(),
-            Box::new(RunAiPreset(index)),
-        );
-    }
     if !app.devices.is_empty() {
         let mut send = NativeMenu::new();
         for (index, device) in app.devices.iter().enumerate() {

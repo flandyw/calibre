@@ -116,8 +116,10 @@ arrive, with token counts and estimated cost when available. Ask for characters,
 discussion questions, a translated description, or a recap through a chapter
 you choose. Recap sends bounded excerpts only through that chapter; ordinary
 chat sends no book text unless you enable the opening excerpt. Reading Time
-counts words locally. Preferences lets you add named prompt presets such as
-`Suggest discussion starters for {title} by {authors}` to the book context menu.
+counts words locally. **Stop** ends a reply early and keeps what had arrived.
+Preferences lets you add named prompt presets such as
+`Suggest discussion starters for {title} by {authors}`; they appear in Ask AI
+and under **AI Tools** in the book context menu.
 
 **AI Studio** can answer library questions with clickable book references,
 suggest what to read next, draft editable calibre searches, and preview smart

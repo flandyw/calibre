@@ -358,6 +358,15 @@ impl CalibreApp {
                     cx.notify();
                 }
             }),
+            cx.subscribe_in(
+                &online.studio.prompt,
+                window,
+                |this, _, event, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        this.run_studio(window, cx);
+                    }
+                },
+            ),
             cx.subscribe_in(&online.question, window, |this, _, event, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) && this.job.is_none() {
                     this.run_ai(false, window, cx);

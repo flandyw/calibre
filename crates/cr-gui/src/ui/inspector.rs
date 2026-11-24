@@ -211,6 +211,7 @@ fn details(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                 Button::new("inspector-ai")
                     .outline()
                     .small()
+                    .icon(Lucide::Sparkles)
                     .label("Ask AI…")
                     .on_click(|_, window, cx| window.dispatch_action(Box::new(AskAi), cx)),
             )
