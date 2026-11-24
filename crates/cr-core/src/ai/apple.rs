@@ -65,7 +65,9 @@ pub(crate) fn split_system_and_prompt(messages: &[Message]) -> (String, String) 
         }
     }
     let system = system_parts.join("\n\n");
-    let prompt = if turns.len() == 1 && matches!(turns[0].0, Role::User) {
+    let prompt = if turns.is_empty() && !system.is_empty() {
+        "Respond according to the instructions.".to_owned()
+    } else if turns.len() == 1 && matches!(turns[0].0, Role::User) {
         turns[0].1.to_owned()
     } else {
         turns
