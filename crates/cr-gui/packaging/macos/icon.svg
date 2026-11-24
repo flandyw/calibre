@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The calibre-rust app icon: three glass books on a deep blue tile.
+
+  This file is the source for icon-1024.png. After editing it, re-render with
+      rsvg-convert -w 1024 -h 1024 icon.svg -o icon-1024.png
+  (`bundle.sh` does this when asked to redraw the icon).
+
+  The artwork follows the macOS icon grid: an 824 pt continuous-corner square
+  centred on a 1024 pt canvas, leaving room for the drop shadow.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <path id="tile" d="M383.4 100L640.6 100C722.2 100 763 100 806.9 113.9C854.9 131.3 892.7 169.1 910.1 217.1C924 261 924 301.8 924 383.4L924 640.6C924 722.2 924 763 910.1 806.9C892.7 854.9 854.9 892.7 806.9 910.1C763 924 722.2 924 640.6 924L383.4 924C301.8 924 261 924 217.1 910.1C169.1 892.7 131.3 854.9 113.9 806.9C100 763 100 722.2 100 640.6L100 383.4C100 301.8 100 261 113.9 217.1C131.3 169.1 169.1 131.3 217.1 113.9C261 100 301.8 100 383.4 100Z"/>
+    <clipPath id="tile-clip"><use href="#tile"/></clipPath>
+
+    <!-- Three books of one width and one height, evenly spaced and centred on the
+         tile. The third leans on the second: its length is chosen so that, tilted,
+         it still reaches from the shared baseline to the shared top line. -->
+    <rect id="book-a" x="282.1" y="296" width="108" height="432" rx="30"/>
+    <rect id="book-b" x="420.1" y="296" width="108" height="432" rx="30"/>
+    <rect id="book-c" x="641.9" y="303.5" width="108" height="430.1" rx="30" transform="rotate(-12 641.9 733.6)"/>
+    <clipPath id="clip-a"><use href="#book-a"/></clipPath>
+    <clipPath id="clip-b"><use href="#book-b"/></clipPath>
+    <clipPath id="clip-c"><use href="#book-c"/></clipPath>
+
+    <linearGradient id="sky" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2f62c8"/>
+      <stop offset="1" stop-color="#122566"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="512" cy="60" r="520" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="tile-rim" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.5"/>
+      <stop offset="0.35" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="0.8" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.14"/>
+    </linearGradient>
+
+    <!-- Glass: brighter where the light enters at the top. -->
+    <linearGradient id="glass" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.46"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.2"/>
+    </linearGradient>
+    <linearGradient id="glass-rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0.85"/>
+      <stop offset="0.5" stop-color="#fff" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0.4"/>
+    </linearGradient>
+
+    <!-- Shadows fall around the books, not under the glass. -->
+    <mask id="around-books" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024">
+      <rect width="1024" height="1024" fill="#fff"/>
+      <use href="#book-a" fill="#000"/>
+      <use href="#book-b" fill="#000"/>
+      <use href="#book-c" fill="#000"/>
+    </mask>
+
+    <filter id="tile-shadow" color-interpolation-filters="sRGB" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <filter id="book-shadow" color-interpolation-filters="sRGB" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+    <filter id="glow" color-interpolation-filters="sRGB" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="7"/>
+    </filter>
+  </defs>
+
+  <g opacity="0.28"><use href="#tile" y="10" fill="#000" filter="url(#tile-shadow)"/></g>
+
+  <g clip-path="url(#tile-clip)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#sky)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#sheen)"/>
+
+    <g mask="url(#around-books)" opacity="0.4">
+      <g fill="#070f38" filter="url(#book-shadow)">
+        <use href="#book-a" y="12"/>
+        <use href="#book-b" y="12"/>
+        <use href="#book-c" y="12"/>
+      </g>
+    </g>
+
+    <g>
+      <use href="#book-a" fill="url(#glass)"/>
+      <g clip-path="url(#clip-a)">
+        <use href="#book-a" fill="none" stroke="#fff" stroke-opacity="0.35" stroke-width="8" filter="url(#glow)"/>
+        <use href="#book-a" fill="none" stroke="url(#glass-rim)" stroke-width="5"/>
+      </g>
+      <rect x="312.1" y="344" width="48" height="12" rx="6" fill="#fff" fill-opacity="0.82"/>
+    </g>
+    <g>
+      <use href="#book-b" fill="url(#glass)"/>
+      <g clip-path="url(#clip-b)">
+        <use href="#book-b" fill="none" stroke="#fff" stroke-opacity="0.35" stroke-width="8" filter="url(#glow)"/>
+        <use href="#book-b" fill="none" stroke="url(#glass-rim)" stroke-width="5"/>
+      </g>
+      <rect x="450.1" y="344" width="48" height="12" rx="6" fill="#fff" fill-opacity="0.82"/>
+    </g>
+    <g>
+      <use href="#book-c" fill="url(#glass)"/>
+      <g clip-path="url(#clip-c)">
+        <use href="#book-c" fill="none" stroke="#fff" stroke-opacity="0.35" stroke-width="8" filter="url(#glow)"/>
+        <use href="#book-c" fill="none" stroke="url(#glass-rim)" stroke-width="5"/>
+      </g>
+      <rect x="671.9" y="351.5" width="48" height="12" rx="6" fill="#fff" fill-opacity="0.82" transform="rotate(-12 641.9 733.6)"/>
+    </g>
+  </g>
+
+  <g clip-path="url(#tile-clip)">
+    <use href="#tile" fill="none" stroke="url(#tile-rim)" stroke-width="6"/>
+  </g>
+</svg>
