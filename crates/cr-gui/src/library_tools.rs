@@ -102,7 +102,8 @@ impl CalibreApp {
             let Ok(Ok(Some(mut output))) = receiver.await else {
                 return;
             };
-            if output.extension().is_none() {
+            let replace = output.extension().is_some();
+            if !replace {
                 output.set_extension(extension);
             }
             let _ = app.update_in(cx, |app, window, cx| {
@@ -131,7 +132,7 @@ impl CalibreApp {
                     window,
                     cx,
                     move |_| {
-                        write_catalog(&Library::open(&root)?, &query, extension, &output)?;
+                        write_catalog(&Library::open(&root)?, &query, extension, &output, replace)?;
                         Ok(output)
                     },
                     |app, result, window, cx| match result {
@@ -517,22 +518,18 @@ fn write_catalog(
     query: &str,
     extension: &str,
     output: &Path,
+    replace: bool,
 ) -> cr_core::Result<()> {
-    let parent = output
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    if extension == "epub" {
-        library.catalog_epub(query, file.as_file_mut())?;
-    } else {
-        let format = CatalogFormat::parse(extension)
-            .ok_or_else(|| cr_core::Error::UnsupportedFormat(extension.to_string()))?;
-        file.write_all(library.catalog(query, format)?.as_bytes())?;
-    }
-    file.as_file().sync_all()?;
-    file.persist(output).map_err(|error| error.error)?;
-    Ok(())
+    crate::files::write_atomic(output, replace, |file| {
+        if extension == "epub" {
+            library.catalog_epub(query, file)?;
+        } else {
+            let format = CatalogFormat::parse(extension)
+                .ok_or_else(|| cr_core::Error::UnsupportedFormat(extension.to_string()))?;
+            file.write_all(library.catalog(query, format)?.as_bytes())?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

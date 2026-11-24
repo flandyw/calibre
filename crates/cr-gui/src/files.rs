@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// File extensions calibre-rust can add to a library.
@@ -176,6 +177,27 @@ fn launch_path(arg: OsString) -> Result<PathBuf, String> {
     }
 }
 
+pub fn write_atomic(
+    output: &Path,
+    replace: bool,
+    write: impl FnOnce(&mut File) -> cr_core::Result<()>,
+) -> cr_core::Result<()> {
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    write(file.as_file_mut())?;
+    file.as_file().sync_all()?;
+    if replace {
+        file.persist(output)
+    } else {
+        file.persist_noclobber(output)
+    }
+    .map_err(|error| error.error)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +262,23 @@ mod tests {
         let dropped = classify([dir.path().to_path_buf(), book.clone(), nested.clone()]);
         assert_eq!(dropped.books, vec![book]);
         assert_eq!(dropped.library, Some(nested));
+    }
+
+    #[core::prelude::v1::test]
+    fn failed_write_preserves_an_existing_export() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("book.epub");
+        std::fs::write(&path, b"existing book").unwrap();
+        let result = write_atomic(&path, true, |file| {
+            file.write_all(b"partial copy")?;
+            Err(cr_core::Error::Other("interrupted".into()))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing book");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert!(write_atomic(&path, false, |file| Ok(file.write_all(b"new")?)).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing book");
     }
 }
