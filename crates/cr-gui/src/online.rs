@@ -1007,19 +1007,25 @@ impl CalibreApp {
                         if task == BookTask::Chat {
                             let turn_cap = (budget.excerpt_chars / 2).clamp(500, 4_000);
                             let mut remaining = budget.excerpt_chars;
-                            let mut bounded_history = Vec::new();
-                            for mut message in history.into_iter().rev() {
-                                message.content =
-                                    message.content.chars().take(turn_cap).collect();
-                                let len = message.content.chars().count();
-                                if len > remaining {
+                            let mut bounded_pairs = Vec::new();
+                            for pair in history.chunks(2).rev() {
+                                let mut truncated_pair = Vec::with_capacity(pair.len());
+                                let mut pair_len = 0;
+                                for message in pair {
+                                    let mut msg = message.clone();
+                                    msg.content = msg.content.chars().take(turn_cap).collect();
+                                    pair_len += msg.content.chars().count();
+                                    truncated_pair.push(msg);
+                                }
+                                if pair_len > remaining {
                                     break;
                                 }
-                                remaining -= len;
-                                bounded_history.push(message);
+                                remaining -= pair_len;
+                                bounded_pairs.push(truncated_pair);
                             }
-                            bounded_history.reverse();
-                            messages.extend(bounded_history);
+                            for pair in bounded_pairs.into_iter().rev() {
+                                messages.extend(pair);
+                            }
                         }
                         messages.push(Message::new(Role::User, ask));
                         (label, messages)
