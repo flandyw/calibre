@@ -175,6 +175,7 @@ impl Candidate {
 
 pub struct Catalog {
     agent: ureq::Agent,
+    google_books_key: Option<String>,
     open_library: String,
     google_books: String,
     open_library_covers: String,
@@ -185,6 +186,7 @@ impl Default for Catalog {
     fn default() -> Self {
         Self {
             agent: network::agent(3),
+            google_books_key: None,
             open_library: "https://openlibrary.org".into(),
             google_books: "https://www.googleapis.com".into(),
             open_library_covers: "https://covers.openlibrary.org".into(),
@@ -194,6 +196,14 @@ impl Default for Catalog {
 }
 
 impl Catalog {
+    pub fn with_google_books_key(mut self, key: Option<&str>) -> Self {
+        self.google_books_key = key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
+        self
+    }
+
     pub fn search(&self, source: Source, query: &Query) -> Result<Vec<Candidate>> {
         let title = query.title.trim();
         let author = query.author.trim();
@@ -235,15 +245,7 @@ impl Catalog {
                 } else {
                     format!("isbn:{isbn}")
                 };
-                network::json(
-                    "Google Books",
-                    self.agent
-                        .get(format!("{}/books/v1/volumes", self.google_books))
-                        .query("maxResults", "8")
-                        .query("printType", "books")
-                        .query("q", &query)
-                        .call(),
-                )?
+                self.google_books_search(&query)?
             }
         };
         let (results, parse): (&Value, fn(&Value) -> Option<Candidate>) = match source {
@@ -255,6 +257,70 @@ impl Catalog {
             .as_array()
             .ok_or_else(|| Error::Other(format!("{source}: missing search results in response")))?;
         Ok(results.iter().filter_map(parse).take(8).collect())
+    }
+
+    fn google_books_search(&self, query: &str) -> Result<Value> {
+        let env_key = std::env::var("GOOGLE_BOOKS_API_KEY").ok();
+        let key = self.google_books_key.as_deref().or_else(|| {
+            env_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+        });
+        let mut request = self
+            .agent
+            .get(format!("{}/books/v1/volumes", self.google_books))
+            .query("maxResults", "8")
+            .query("printType", "books")
+            .query("q", query);
+        if let Some(key) = key {
+            request = request.query("key", key);
+        }
+        let response = request
+            .config()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build()
+            .call()
+            .map_err(|error| network::response_error("Google Books", error))?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            return network::json("Google Books", Ok(response));
+        }
+        let quota = status == 429
+            || (status == 403
+                && network::json::<Value>("Google Books", Ok(response)).is_ok_and(|body| {
+                    body["error"]["status"] == "RESOURCE_EXHAUSTED"
+                        || body["error"]["errors"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|error| {
+                                matches!(
+                                    error["reason"].as_str(),
+                                    Some(
+                                        "quotaExceeded"
+                                            | "dailyLimitExceeded"
+                                            | "rateLimitExceeded"
+                                            | "userRateLimitExceeded"
+                                    )
+                                )
+                            })
+                }));
+        if quota {
+            let advice = if key.is_some() {
+                "check the key's Google Cloud quota or try again later"
+            } else {
+                "set GOOGLE_BOOKS_API_KEY, supply a key, or try again later"
+            };
+            return Err(Error::Other(format!(
+                "Google Books: quota or rate limit exceeded (HTTP {status}); {advice}"
+            )));
+        }
+        Err(network::response_error(
+            "Google Books",
+            ureq::Error::StatusCode(status),
+        ))
     }
 
     fn open_library_isbn(&self, isbn: &str) -> Result<Vec<Candidate>> {
@@ -662,6 +728,47 @@ mod tests {
         assert_eq!(candidate.published.as_deref(), Some("1988-10-01"));
         assert!(matches!(candidate.cover, Some(CoverId::OpenLibrary(42))));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn google_books_key_is_used_on_search_and_quota_errors_are_sanitized() {
+        for (status, body) in [
+            (
+                "429 Too Many Requests",
+                r#"{"error":{"message":"test-only-key"}}"#,
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":{"errors":[{"reason":"dailyLimitExceeded"}],"message":"test-only-key"}}"#,
+            ),
+        ] {
+            let (google_books, server) = serve(status, body, |headers, _| {
+                assert!(headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .contains("key=test-only-key"));
+            });
+            let catalog = Catalog {
+                google_books,
+                ..Default::default()
+            }
+            .with_google_books_key(Some(" test-only-key "));
+            let error = catalog
+                .search(
+                    Source::GoogleBooks,
+                    &Query {
+                        title: "Book".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("quota or rate limit exceeded"));
+            assert!(error.contains(&status[..3]));
+            assert!(!error.contains("test-only-key"));
+            server.join().unwrap();
+        }
     }
 
     #[test]

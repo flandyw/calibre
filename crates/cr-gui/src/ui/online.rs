@@ -13,6 +13,17 @@ use gpui_kit::*;
 
 use crate::app::CalibreApp;
 
+pub fn metadata_preferences(app: &CalibreApp, cx: &App) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .child(field("Google Books API key", Input::new(&app.online.google_books_key).w_full()
+            .content_type(InputContentType::Password)))
+        .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+            "Optional. A key typed here lasts until you close the app. Set GOOGLE_BOOKS_API_KEY to reuse it across launches.",
+        ))
+        .into_any_element()
+}
+
 pub fn preferences(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
     let muted = cx.theme().muted_foreground;
     let busy = app.job.is_some();

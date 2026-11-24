@@ -12,6 +12,7 @@ use crate::app::{set_input, text_input, CalibreApp, Screen, Tone};
 
 pub struct Online {
     pub key: Entity<InputState>,
+    pub google_books_key: Entity<InputState>,
     pub model: Entity<InputState>,
     pub models: Vec<Model>,
     pub connection: Option<String>,
@@ -27,8 +28,11 @@ impl Online {
     pub fn new(window: &mut Window, cx: &mut Context<CalibreApp>) -> Self {
         let key = text_input("OPENROUTER_API_KEY or session key", window, cx);
         key.update(cx, |input, cx| input.set_masked(true, window, cx));
+        let google_books_key = text_input("GOOGLE_BOOKS_API_KEY or session key", window, cx);
+        google_books_key.update(cx, |input, cx| input.set_masked(true, window, cx));
         Self {
             key,
+            google_books_key,
             model: text_input("Model ID", window, cx),
             models: Vec::new(),
             connection: None,
@@ -242,8 +246,9 @@ impl CalibreApp {
             author: self.online.author.read(cx).value().to_string(),
             isbn: self.online.isbn.read(cx).value().to_string(),
         };
+        let catalog = Catalog::default()
+            .with_google_books_key(Some(self.online.google_books_key.read(cx).value().as_ref()));
         self.run_job("Searching book catalogs", window, cx, move |job| {
-            let catalog = Catalog::default();
             let candidates = catalog.search(source, &query)?;
             job.check()?;
             std::thread::scope(|scope| {
