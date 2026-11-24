@@ -12,7 +12,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::app::CalibreApp;
-use crate::online::BookTask;
+use crate::online::{AiCopySource, BookTask};
 
 pub fn metadata_preferences(app: &CalibreApp, cx: &App) -> AnyElement {
     v_flex()
@@ -594,6 +594,9 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                 .on_click(cx.listener(|app, _, _, cx| {
                                     if let Some(session) = app.online.ai.as_mut() {
                                         session.translation = None;
+                                        session.sync_copyable_after_removal(
+                                            AiCopySource::Translation,
+                                        );
                                         cx.notify();
                                     }
                                 })),
@@ -719,6 +722,7 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                             session.excerpt = *checked;
                             if !has_reader_context {
                                 session.history.clear();
+                                session.sync_copyable_after_removal(AiCopySource::Chat);
                             }
                         }
                         cx.notify();
@@ -843,6 +847,7 @@ pub fn ai_dialog(app: &CalibreApp, cx: &mut Context<CalibreApp>) -> AnyElement {
                                     .on_click(cx.listener(|app, _, _, cx| {
                                         if let Some(session) = app.online.ai.as_mut() {
                                             session.history.clear();
+                                            session.sync_copyable_after_removal(AiCopySource::Chat);
                                             cx.notify();
                                         }
                                     })),
