@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  The calibre-rust app icon: three glass books on a soft blue tile.
+  The calibre-rust app icon: three glass books on a deep blue tile.
 
   This file is the source for icon-1024.png. After editing it, re-render with
       rsvg-convert -w 1024 -h 1024 icon.svg -o icon-1024.png
@@ -25,8 +25,8 @@
     <clipPath id="clip-c"><use href="#book-c"/></clipPath>
 
     <linearGradient id="sky" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#8dbcf3"/>
-      <stop offset="1" stop-color="#3f68c6"/>
+      <stop offset="0" stop-color="#2f62c8"/>
+      <stop offset="1" stop-color="#122566"/>
     </linearGradient>
     <radialGradient id="sheen" cx="512" cy="60" r="520" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#fff" stop-opacity="0.16"/>
@@ -75,8 +75,8 @@
     <rect x="100" y="100" width="824" height="824" fill="url(#sky)"/>
     <rect x="100" y="100" width="824" height="824" fill="url(#sheen)"/>
 
-    <g mask="url(#around-books)" opacity="0.26">
-      <g fill="#1b2f78" filter="url(#book-shadow)">
+    <g mask="url(#around-books)" opacity="0.4">
+      <g fill="#070f38" filter="url(#book-shadow)">
         <use href="#book-a" y="12"/>
         <use href="#book-b" y="12"/>
         <use href="#book-c" y="12"/>
